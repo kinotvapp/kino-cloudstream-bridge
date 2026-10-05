@@ -10,6 +10,8 @@ import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.TvType
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Dispatch of the wire ops; the service only depends on [run] and [helloPlugins]. The provider ops live in
@@ -31,19 +33,17 @@ object Ops {
 
     /**
      * Runs one op and returns its `done` JSON. [emit] sends `event` JSON and says whether it left the process. May throw;
-     * the service maps throwables to errors. Every op that can run plugin code (install's load(), remove's beforeUnload(),
-     * the provider ops) runs on the plugin pool ([PluginWork]) and is answered `timeout` "busy" at once for a plugin with
-     * too many tasks stuck in blocking code; listPlugins runs no plugin code.
+     * the service maps throwables to errors. Plugin code never runs on the caller's thread: provider ops run on the
+     * plugin pool and are answered `timeout` "busy" at once for a plugin with too many tasks stuck in blocking code
+     * ([PluginWork]); install and remove run on the registry's own threads and are never refused for a busy plugin (they
+     * skip its `beforeUnload()` instead). listPlugins runs no plugin code.
      */
     suspend fun run(context: Context, req: CsWire.OpRequest, payload: ParcelFileDescriptor?, emit: (String) -> Boolean): String = try {
         val reg = registry(context)
         when (req.op) {
             CsWire.Op.LIST -> JSONObject().put("plugins", CsWire.helloPluginsToJson(reg.stored())).toString()
-            CsWire.Op.INSTALL ->
-                if (PluginWork.busy(req.pluginId)) ProviderOps.BUSY else PluginWork.run(req.pluginId) { install(reg, req, payload) }
-            CsWire.Op.REMOVE -> if (PluginWork.busy(req.pluginId)) ProviderOps.BUSY else PluginWork.run(req.pluginId) {
-                reg.remove(req.pluginId); JSONObject().put("ok", true).toString()
-            }
+            CsWire.Op.INSTALL -> install(reg, req, payload)
+            CsWire.Op.REMOVE -> remove(reg, req.pluginId)
             in ProviderOps.OPS -> ProviderOps.run(req, emit) { reg.providers(req.pluginId) }
             else -> CsWire.error(CsWire.Err.BAD_REQUEST, "op")
         }
@@ -51,9 +51,44 @@ object Ops {
         CsWire.error(e.code, e.message ?: e.code)
     }
 
-    private fun install(reg: PluginRegistry, req: CsWire.OpRequest, payload: ParcelFileDescriptor?): String {
+    /** Per plugin: one install, remove or rollback at a time, and how many installs and removes have started. */
+    private val mutationLocks = ConcurrentHashMap<String, Any>()
+    private val mutationSeq = ConcurrentHashMap<String, AtomicLong>()
+    private fun lockOf(id: String) = mutationLocks.computeIfAbsent(id) { Any() }
+    private fun seqOf(id: String) = mutationSeq.computeIfAbsent(id) { AtomicLong() }
+
+    private suspend fun remove(reg: PluginRegistry, id: String): String {
+        seqOf(id).incrementAndGet()
+        val stuck = PluginWork.busy(id)
+        return PluginWork.run(id, on = PluginWork.registryDispatcher) {
+            synchronized(lockOf(id)) { reg.remove(id, beforeUnload = !stuck) }
+            JSONObject().put("ok", true).toString()
+        }
+    }
+
+    /**
+     * Installs on the registry's threads, from a dup of the payload that the work owns: the service closes its own fd
+     * when the op ends, and a late install never reads a closed (or reused) descriptor. An install that lands after Kino
+     * stopped waiting (deadline, cancel) is rolled back, unless a newer install or remove of the same plugin has started
+     * since, so Kino is never told "failed" about a plugin that stays installed.
+     */
+    private suspend fun install(reg: PluginRegistry, req: CsWire.OpRequest, payload: ParcelFileDescriptor?): String {
         val pfd = payload ?: return CsWire.error(CsWire.Err.BAD_REQUEST, "payload")
-        val res = ParcelFileDescriptor.AutoCloseInputStream(pfd).use { reg.install(req.pluginId, it, req.args.optString("sha256")) }
+        val id = req.pluginId
+        val mine = seqOf(id).incrementAndGet()
+        val stuck = PluginWork.busy(id)
+        val own = pfd.dup()
+        val rollback: (Pair<String, Boolean>) -> Unit = { (_, stored) ->
+            if (stored) synchronized(lockOf(id)) { if (seqOf(id).get() == mine) reg.remove(id) }
+        }
+        return PluginWork.run(id, on = PluginWork.registryDispatcher, onLateResult = rollback) {
+            synchronized(lockOf(id)) { installLocked(reg, req, own, beforeUnload = !stuck) }
+        }.first
+    }
+
+    /** The answer and whether a new version was stored. */
+    private fun installLocked(reg: PluginRegistry, req: CsWire.OpRequest, pfd: ParcelFileDescriptor, beforeUnload: Boolean): Pair<String, Boolean> {
+        val res = ParcelFileDescriptor.AutoCloseInputStream(pfd).use { reg.install(req.pluginId, it, req.args.optString("sha256"), beforeUnload) }
         // Provider getters are plugin code: if one throws, the plugin does not stay half-answered and installed.
         val providers = try {
             JSONArray().apply { res.providers.forEach { put(providerJson(it)) } }
@@ -61,8 +96,9 @@ object Ops {
             reg.remove(req.pluginId)
             throw t
         }
-        return JSONObject().put("name", res.name).put("version", res.version).put("providers", providers)
+        val json = JSONObject().put("name", res.name).put("version", res.version).put("providers", providers)
             .put("missingSymbols", JSONArray(res.missingSymbols.take(MAX_MISSING).map { it.take(300) })).toString()
+        return json to res.missingSymbols.isEmpty()
     }
 
     /** PROTOCOL.md Provider. Torrent is not a type Kino can play from the bridge, so it is never advertised. */

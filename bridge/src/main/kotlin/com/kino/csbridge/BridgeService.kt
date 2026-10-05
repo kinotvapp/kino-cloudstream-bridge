@@ -18,12 +18,14 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asContextElement
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.job
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.coroutineContext
 
@@ -36,11 +38,11 @@ class BridgeService : Service() {
         { req, payload, emit -> Ops.run(this, req, payload, emit) }
 
     /**
-     * Op bodies and replies. Plugin code never runs here (it runs on PluginWork's own pool), so stuck plugins cannot take
-     * these threads; a view of IO with its own limit, apart from the plugin pool's.
+     * Op bodies and replies, on this service's own threads (never Dispatchers.IO, which plugin code may fill). Plugin code
+     * never runs here (it runs on PluginWork's pool or the registry's threads), so stuck plugins cannot take them.
      */
-    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(SERVICE_THREADS))
+    private val executor = Executors.newFixedThreadPool(SERVICE_THREADS) { r -> Thread(r, "bridge-ops").apply { isDaemon = true } }
+    private val scope = CoroutineScope(SupervisorJob() + executor.asCoroutineDispatcher())
     /** Deadline timers: never blocked by anything, so a deadline always fires. */
     private val timers = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     internal val jobs = ConcurrentHashMap<String, Job>()
@@ -121,6 +123,7 @@ class BridgeService : Service() {
     override fun onDestroy() {
         scope.cancel()
         timers.cancel()
+        executor.shutdown()
         super.onDestroy()
     }
 
@@ -158,7 +161,7 @@ class BridgeService : Service() {
          * about 240 KB, so two concurrent dones still fit. Larger results need a pipe (a separate contract task).
          */
         internal const val MAX_RESULT_CHARS = 120_000
-        private const val SERVICE_THREADS = 16
+        private const val SERVICE_THREADS = 4
         private val TOO_LARGE = CsWire.error(CsWire.Err.TOO_LARGE, "result too large")
         private val QUERY_OR_FRAGMENT = Regex("[?#]\\S*")
 

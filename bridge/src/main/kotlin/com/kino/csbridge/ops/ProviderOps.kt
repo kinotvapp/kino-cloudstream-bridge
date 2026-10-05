@@ -31,6 +31,8 @@ internal object ProviderOps {
     const val MAX_SUBTITLE_EVENTS = 100
     /** One event's JSON past this is dropped (and not counted): binder's async space is shared with the `done`. */
     const val MAX_EVENT_CHARS = 16 * 1024
+    /** All events of one op together: past this, events are dropped and not counted. */
+    const val MAX_EVENTS_TOTAL_CHARS = 150_000
     /**
      * A `load` answer longer than this is rebuilt leaner (no episode posters and descriptions, then no names). Below the
      * service's result cap, which keeps a `done` parcel (2 bytes a char) well inside binder's oneway space.
@@ -78,7 +80,7 @@ internal object ProviderOps {
     }
 
     private class Call(val pluginId: String) {
-        suspend fun <T> plugin(block: suspend () -> T): T = PluginWork.run(pluginId, block)
+        suspend fun <T> plugin(block: suspend () -> T): T = PluginWork.run(pluginId, block = block)
 
         /** [block] on the plugin pool, bounded by the provider's [hint] (upstream's clamp); [onTimeout] answers when it runs out. */
         suspend fun timed(hint: Long?, onTimeout: () -> String, block: suspend () -> String): String =
@@ -149,7 +151,7 @@ internal object ProviderOps {
 
     /**
      * Sends link and subtitle events while the op is open, at most [MAX_LINK_EVENTS] / [MAX_SUBTITLE_EVENTS], each at most
-     * [MAX_EVENT_CHARS]. Only an event that left the process counts. Plugins call back from any thread; [close] (before
+     * [MAX_EVENT_CHARS], [MAX_EVENTS_TOTAL_CHARS] in all. Only an event that left the process counts. Plugins call back from any thread; [close] (before
      * `done` is returned) waits for an event being sent and drops every later one. The JSON is built by the caller from a
      * snapshot, never under the lock.
      */
@@ -158,15 +160,23 @@ internal object ProviderOps {
         private var open = true
         val links = AtomicInteger(0)
         private var subtitles = 0
+        private var chars = 0
 
         fun link(json: String) {
             if (json.length > MAX_EVENT_CHARS) return
-            synchronized(lock) { if (open && links.get() < MAX_LINK_EVENTS && emit(json)) links.incrementAndGet() }
+            synchronized(lock) { if (open && links.get() < MAX_LINK_EVENTS && send(json)) links.incrementAndGet() }
         }
 
         fun subtitle(json: String) {
             if (json.length > MAX_EVENT_CHARS) return
-            synchronized(lock) { if (open && subtitles < MAX_SUBTITLE_EVENTS && emit(json)) subtitles++ }
+            synchronized(lock) { if (open && subtitles < MAX_SUBTITLE_EVENTS && send(json)) subtitles++ }
+        }
+
+        /** Under [lock]: within the total budget and sent. */
+        private fun send(json: String): Boolean {
+            if (chars + json.length > MAX_EVENTS_TOTAL_CHARS || !emit(json)) return false
+            chars += json.length
+            return true
         }
 
         fun close() = synchronized(lock) { open = false }

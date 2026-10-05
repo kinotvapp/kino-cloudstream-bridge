@@ -365,4 +365,15 @@ class OpsJsonTest {
         assertEquals(1, link.reads)
         assertEquals("https://cdn.example/a.mp4", JSONObject(events.single()).getString("url"))
     }
+
+    @Test fun `events of one op share a 150K-char budget, and the ones past it are dropped and not counted`() {
+        val api = FakeApi().apply {
+            onLinks = { _, _, cb -> repeat(200) { i -> cb(newExtractorLink("S", "l$i", "https://cdn.example/$i/" + "a".repeat(1500))) }; true }
+        }
+        val done = JSONObject(op(CsWire.Op.LOAD_LINKS, JSONObject().put("provider", 0).put("data", "d"), api))
+        val total = events.sumOf { it.length }
+        assertTrue(total.toString(), total <= ProviderOps.MAX_EVENTS_TOTAL_CHARS)
+        assertEquals(events.size, done.getInt("links"))
+        assertTrue(events.size in 50..199)
+    }
 }

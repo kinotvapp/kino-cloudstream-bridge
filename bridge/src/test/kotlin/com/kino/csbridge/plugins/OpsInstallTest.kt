@@ -7,6 +7,8 @@ import com.kino.csbridge.contract.CsWire
 import com.kino.csbridge.plugins.fixture.FixtureApi
 import com.kino.csbridge.plugins.fixture.FixtureExtractor
 import com.kino.csbridge.plugins.fixture.FixturePlugin
+import com.kino.csbridge.plugins.fixture.BlockingPlugin
+import com.kino.csbridge.ops.PluginWork
 import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.utils.extractorApis
 import kotlinx.coroutines.runBlocking
@@ -90,5 +92,58 @@ class OpsInstallTest {
         assertEquals(CsWire.Err.NOT_INSTALLED, CsWire.errorOf(op(CsWire.Op.SEARCH, JSONObject().put("provider", 1).put("query", "x")))!!.first)
         assertEquals(CsWire.Err.NOT_INSTALLED,
             CsWire.errorOf(op(CsWire.Op.SEARCH, JSONObject().put("provider", 0).put("query", "x"), id = "cloudstream-other"))!!.first)
+    }
+
+    private fun waitUntil(what: String, ms: Long = 5_000, cond: () -> Boolean) {
+        val end = System.nanoTime() + ms * 1_000_000
+        while (!cond()) { assertTrue(what, System.nanoTime() < end); Thread.sleep(20) }
+    }
+
+    @Test fun `a plugin with 3 stuck tasks is still removed at once, without its beforeUnload`() {
+        val f = DexFixtures.cs3(File.createTempFile("fixture", ".cs3"), listOf(DexFixtures.currentEpisodeDex()),
+            DexFixtures.manifest("Cuevana", FixturePlugin::class.java.name, 7))
+        op(CsWire.Op.INSTALL, JSONObject().put("sha256", DexFixtures.sha256(f)), f)
+        val release = java.util.concurrent.CountDownLatch(1)
+        try {
+            runBlocking {
+                repeat(3) {
+                    kotlinx.coroutines.withTimeoutOrNull(50) { PluginWork.run("cloudstream-fx") { release.await(20, java.util.concurrent.TimeUnit.SECONDS) } }
+                }
+            }
+            assertTrue(PluginWork.busy("cloudstream-fx"))
+            val unloadsBefore = FixturePlugin.unloads
+            val t0 = System.nanoTime()
+            assertEquals(true, JSONObject(op(CsWire.Op.REMOVE)).getBoolean("ok"))
+            assertTrue((System.nanoTime() - t0) / 1_000_000 < 1_000)
+            assertEquals(emptyList<CsWire.HelloPlugin>(), Ops.helloPlugins(context))
+            assertEquals(unloadsBefore, FixturePlugin.unloads)
+        } finally {
+            release.countDown()
+            PluginWork.resetForTest()
+        }
+    }
+
+    @Test fun `an install that finishes after Kino stopped waiting is rolled back`() {
+        BlockingPlugin.reset()
+        val f = DexFixtures.cs3(File.createTempFile("blocking", ".cs3"), listOf(DexFixtures.currentEpisodeDex()),
+            DexFixtures.manifest("Lento", BlockingPlugin::class.java.name, 1))
+        val pfd = ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
+        try {
+            val answer = runBlocking {
+                kotlinx.coroutines.withTimeoutOrNull(300) {
+                    val req = CsWire.parseOpRequest(CsWire.opRequest(CsWire.Op.INSTALL, "c1", "cloudstream-slow", 5000,
+                        JSONObject().put("sha256", DexFixtures.sha256(f))))!!
+                    Ops.run(context, req, pfd) { true }
+                }
+            }
+            assertEquals(null, answer) // Kino was told the install did not finish
+            pfd.close() // as the service does when the op ends; the install reads its own dup
+            assertTrue("load() never started", BlockingPlugin.entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            BlockingPlugin.release.countDown()
+            waitUntil("the late install was not rolled back") { BlockingPlugin.unloads.get() == 1 && "cloudstream-slow" !in Ops.instance!!.ids() }
+            assertTrue(APIHolder.allProviders.withLock { APIHolder.allProviders.none { it is FixtureApi } })
+        } finally {
+            BlockingPlugin.release.countDown()
+        }
     }
 }

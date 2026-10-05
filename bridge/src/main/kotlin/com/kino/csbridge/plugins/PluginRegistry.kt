@@ -124,7 +124,7 @@ class PluginRegistry(
      * stays. Plugin throwables propagate after cleanup, so the caller maps them (`incompatible` for linkage errors,
      * `plugin_error` otherwise).
      */
-    fun install(pluginId: String, cs3: InputStream, sha256: String): InstallResult {
+    fun install(pluginId: String, cs3: InputStream, sha256: String, beforeUnload: Boolean = true): InstallResult {
         ensureLoaded()
         val name = SafeNames.fileName(pluginId) ?: throw RegistryException(CsWire.Err.BAD_REQUEST, "plugin id")
         if (!SHA256.matches(sha256)) throw RegistryException(CsWire.Err.BAD_REQUEST, "sha256")
@@ -140,7 +140,7 @@ class PluginRegistry(
             val displayName = manifest.name ?: pluginId
             if (missing.isNotEmpty()) return InstallResult(displayName, manifest.version, emptyList(), missing)
             synchronized(lock) {
-                val l = replaceLocked(pluginId, name, sha256, tmp, manifest)
+                val l = replaceLocked(pluginId, name, sha256, tmp, manifest, beforeUnload)
                 return InstallResult(displayName, manifest.version, l.providers, emptyList())
             }
         } finally {
@@ -149,8 +149,8 @@ class PluginRegistry(
     }
 
     /** Swaps [tmp] in for [pluginId]; the previous version's file and entry come back if the new one does not load. */
-    private fun replaceLocked(pluginId: String, name: String, sha256: String, tmp: File, manifest: Manifest): Loaded {
-        unloadLocked(pluginId)
+    private fun replaceLocked(pluginId: String, name: String, sha256: String, tmp: File, manifest: Manifest, beforeUnload: Boolean): Loaded {
+        unloadLocked(pluginId, beforeUnload)
         val target = File(dir, name)
         val previous = index[pluginId]
         val backup = File(dir, "$TMP$name-previous-${UUID.randomUUID()}").takeIf { previous != null && target.isFile }
@@ -179,12 +179,15 @@ class PluginRegistry(
         }
     }
 
-    /** `beforeUnload()`, then exactly this id's registrations out of CloudStream's lists, then the file. Unknown ids: no-op. */
-    fun remove(pluginId: String) {
+    /**
+     * `beforeUnload()` (unless [beforeUnload] is false: the caller knows the plugin is stuck), then exactly this id's
+     * registrations out of CloudStream's lists, then the file. Unknown ids: no-op.
+     */
+    fun remove(pluginId: String, beforeUnload: Boolean = true) {
         val name = SafeNames.fileName(pluginId) ?: throw RegistryException(CsWire.Err.BAD_REQUEST, "plugin id")
         ensureLoaded()
         synchronized(lock) {
-            unloadLocked(pluginId)
+            unloadLocked(pluginId, beforeUnload)
             val e = index.remove(pluginId)
             deleteFile(File(dir, e?.file ?: name))
             File(dir, "$MARKER$pluginId").delete()
@@ -213,9 +216,18 @@ class PluginRegistry(
         }
     }
 
-    private fun unloadLocked(pluginId: String) {
+    /**
+     * [beforeUnload] runs the plugin's `beforeUnload()` on a fresh daemon thread, waited on at most [BEFORE_UNLOAD_MS]:
+     * plugin code that hangs there never holds a remove or an update (or this lock) longer than that.
+     */
+    private fun unloadLocked(pluginId: String, beforeUnload: Boolean = true) {
         loaded.remove(pluginId)?.let { l ->
-            try { l.plugin.beforeUnload() } catch (_: Throwable) {}
+            if (beforeUnload) {
+                val t = Thread({ try { l.plugin.beforeUnload() } catch (_: Throwable) {} }, "beforeUnload")
+                t.isDaemon = true
+                t.start()
+                t.join(BEFORE_UNLOAD_MS)
+            }
             unregister(l.plugin, l.path, l.providers, l.extractors, l.actions)
         }
     }
@@ -381,6 +393,8 @@ class PluginRegistry(
         private const val TMP = ".tmp-"
         /** Consecutive loads that killed the process before the plugin is disabled until re-installed. */
         const val CRASHES_TO_DISABLE = 2
+        /** The longest a remove or update waits on a plugin's `beforeUnload()`. */
+        const val BEFORE_UNLOAD_MS = 2_000L
         private val SHA256 = Regex("^[0-9a-f]{64}$")
     }
 }

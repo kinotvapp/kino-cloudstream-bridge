@@ -65,9 +65,11 @@ class BlockingPlugin : Plugin() {
         entered.countDown()
         release.await(10, java.util.concurrent.TimeUnit.SECONDS)
     }
+    override fun beforeUnload() { unloads.incrementAndGet() }
     companion object {
         @Volatile var entered = java.util.concurrent.CountDownLatch(1)
         @Volatile var release = java.util.concurrent.CountDownLatch(1)
-        fun reset() { entered = java.util.concurrent.CountDownLatch(1); release = java.util.concurrent.CountDownLatch(1) }
+        val unloads = java.util.concurrent.atomic.AtomicInteger()
+        fun reset() { entered = java.util.concurrent.CountDownLatch(1); release = java.util.concurrent.CountDownLatch(1); unloads.set(0) }
     }
 }

@@ -304,6 +304,12 @@ class BridgeServiceTest {
             com.lagradost.cloudstream3.newSearchResponseList(listOf(newMovieSearchResponse("hit", "https://q.example/1")))
     }
 
+    /** Polls [cond] every 20 ms for at most [ms]; fails with [what] if it never holds. */
+    private fun waitUntil(what: String, ms: Long = 5_000, cond: () -> Boolean) {
+        val end = System.nanoTime() + ms * 1_000_000
+        while (!cond()) { assertTrue(what, System.nanoTime() < end); Thread.sleep(20) }
+    }
+
     private fun search(plugin: String, callId: String, deadline: Long) =
         CsWire.opRequest(CsWire.Op.SEARCH, callId, plugin, deadline, JSONObject().put("provider", 0).put("query", "x"))
 
@@ -328,7 +334,8 @@ class BridgeServiceTest {
             assertTrue((System.nanoTime() - t1) / 1_000_000 < 1_500)
 
             // One plugin with 3 leaked tasks is busy: answered at once, its code not started.
-            release.countDown(); Thread.sleep(300)
+            release.countDown()
+            waitUntil("the first stuck tasks never returned") { (1..6).all { com.kino.csbridge.ops.PluginWork.leakedCount("cloudstream-s$it") == 0 } }
             val release2 = CountDownLatch(1)
             val stuck2 = StuckSearchApi(release2)
             svc.runOp = { req, _, emit -> com.kino.csbridge.ops.ProviderOps.run(req, emit) { listOf(if (req.pluginId == "cloudstream-ok") quick else stuck2) } }
@@ -343,8 +350,8 @@ class BridgeServiceTest {
             val ok = FakeReply(); s.call(search("cloudstream-ok", "h2", 3_000), null, ok)
             assertEquals("hit", JSONObject(ok.await()).getJSONArray("items").getJSONObject(0).getString("name"))
             // Once the stuck code returns, the plugin is no longer busy.
-            release2.countDown(); Thread.sleep(300)
-            assertEquals(0, com.kino.csbridge.ops.PluginWork.leakedCount("cloudstream-b"))
+            release2.countDown()
+            waitUntil("cloudstream-b stayed busy") { com.kino.csbridge.ops.PluginWork.leakedCount("cloudstream-b") == 0 }
         } finally {
             release.countDown()
         }
