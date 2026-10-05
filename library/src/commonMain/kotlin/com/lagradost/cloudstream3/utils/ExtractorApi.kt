@@ -814,6 +814,33 @@ constructor(
         extractorData: String? = null
     ) : this(source, name, url, referer, quality, isM3u8, headers, extractorData, false)
 
+    /**
+     * Kino bridge compat: the primary constructor as it was before audioTracks, which extensions
+     * built against older CloudStream still call. Binary-only: hidden from source.
+     */
+    @Suppress("DEPRECATION")
+    @Deprecated("Kino bridge compat for old extensions", level = DeprecationLevel.HIDDEN)
+    constructor(
+        source: String,
+        name: String,
+        url: String,
+        referer: String,
+        quality: Int,
+        headers: Map<String, String> = mapOf(),
+        extractorData: String? = null,
+        type: ExtractorLinkType,
+    ) : this(
+        source = source,
+        name = name,
+        url = url,
+        referer = referer,
+        quality = quality,
+        headers = headers,
+        extractorData = extractorData,
+        type = type,
+        audioTracks = emptyList(),
+    )
+
     @Suppress("DEPRECATION")
     @Deprecated("Use newExtractorLink", level = DeprecationLevel.ERROR)
     constructor(

@@ -1571,7 +1571,36 @@ constructor(
     override var quality: SearchQuality? = null,
     override var posterHeaders: Map<String, String>? = null,
     override var score: Score? = null,
-) : SearchResponse
+) : SearchResponse {
+    /** Kino bridge compat: the EnumSet constructor (no score) old extensions still call. Binary-only. */
+    @Suppress("DEPRECATION_ERROR")
+    @Deprecated("Kino bridge compat for old extensions", level = DeprecationLevel.HIDDEN)
+    constructor(
+        name: String,
+        url: String,
+        apiName: String,
+        type: TvType? = null,
+        posterUrl: String? = null,
+        year: Int? = null,
+        dubStatus: java.util.EnumSet<DubStatus>? = null,
+        otherName: String? = null,
+        episodes: MutableMap<DubStatus, Int> = mutableMapOf(),
+        id: Int? = null,
+        quality: SearchQuality? = null,
+        posterHeaders: Map<String, String>? = null,
+    ) : this(
+        name = name, url = url, apiName = apiName, type = type, posterUrl = posterUrl, year = year,
+        dubStatus = dubStatus, otherName = otherName, episodes = episodes, id = id,
+        quality = quality, posterHeaders = posterHeaders, score = null,
+    )
+
+    /** Kino bridge compat: old extensions call `setDubStatus(EnumSet)`. Binary-only. */
+    @Deprecated("Kino bridge compat for old extensions", level = DeprecationLevel.HIDDEN)
+    @kotlin.jvm.JvmName("setDubStatus")
+    fun setDubStatusCompat(value: java.util.EnumSet<DubStatus>?) {
+        dubStatus = value
+    }
+}
 
 fun AnimeSearchResponse.addDubStatus(status: DubStatus, episodes: Int? = null) {
     this.dubStatus = dubStatus?.also { it.add(status) } ?: mutableSetOf(status)
@@ -2437,7 +2466,37 @@ constructor(
     override var logoUrl: String? = null,
     override var contentRating: String? = null,
     override var uniqueUrl: String = url
-) : LoadResponse
+) : LoadResponse {
+    /** Kino bridge compat: the pre-Score constructor old extensions still call. Binary-only. */
+    @Suppress("DEPRECATION_ERROR")
+    @Deprecated("Kino bridge compat for old extensions", level = DeprecationLevel.HIDDEN)
+    constructor(
+        name: String,
+        url: String,
+        apiName: String,
+        dataUrl: String,
+        posterUrl: String? = null,
+        year: Int? = null,
+        plot: String? = null,
+        type: TvType = TvType.Live,
+        rating: Int? = null,
+        tags: List<String>? = null,
+        duration: Int? = null,
+        trailers: MutableList<TrailerData> = mutableListOf(),
+        recommendations: List<SearchResponse>? = null,
+        actors: List<ActorData>? = null,
+        comingSoon: Boolean = false,
+        syncData: MutableMap<String, String> = mutableMapOf(),
+        posterHeaders: Map<String, String>? = null,
+        backgroundPosterUrl: String? = null,
+    ) : this(
+        name = name, url = url, apiName = apiName, dataUrl = dataUrl, posterUrl = posterUrl,
+        year = year, plot = plot, type = type, score = Score.fromOld(rating), tags = tags,
+        duration = duration, trailers = trailers, recommendations = recommendations,
+        actors = actors, comingSoon = comingSoon, syncData = syncData,
+        posterHeaders = posterHeaders, backgroundPosterUrl = backgroundPosterUrl,
+    )
+}
 
 suspend fun MainAPI.newLiveStreamLoadResponse(
     name: String,
@@ -2486,7 +2545,37 @@ constructor(
     override var logoUrl: String? = null,
     override var contentRating: String? = null,
     override var uniqueUrl: String = url
-) : LoadResponse
+) : LoadResponse {
+    /** Kino bridge compat: the pre-Score constructor old extensions still call. Binary-only. */
+    @Suppress("DEPRECATION_ERROR")
+    @Deprecated("Kino bridge compat for old extensions", level = DeprecationLevel.HIDDEN)
+    constructor(
+        name: String,
+        url: String,
+        apiName: String,
+        type: TvType,
+        dataUrl: String,
+        posterUrl: String? = null,
+        year: Int? = null,
+        plot: String? = null,
+        rating: Int? = null,
+        tags: List<String>? = null,
+        duration: Int? = null,
+        trailers: MutableList<TrailerData> = mutableListOf(),
+        recommendations: List<SearchResponse>? = null,
+        actors: List<ActorData>? = null,
+        comingSoon: Boolean = false,
+        syncData: MutableMap<String, String> = mutableMapOf(),
+        posterHeaders: Map<String, String>? = null,
+        backgroundPosterUrl: String? = null,
+    ) : this(
+        name = name, url = url, apiName = apiName, type = type, dataUrl = dataUrl,
+        posterUrl = posterUrl, year = year, plot = plot, score = Score.fromOld(rating), tags = tags,
+        duration = duration, trailers = trailers, recommendations = recommendations,
+        actors = actors, comingSoon = comingSoon, syncData = syncData,
+        posterHeaders = posterHeaders, backgroundPosterUrl = backgroundPosterUrl,
+    )
+}
 
 suspend fun <T> MainAPI.newMovieLoadResponse(
     name: String,
@@ -2572,6 +2661,23 @@ constructor(
             this.score = Score.from(value, 100)
         }
         get() = score?.toInt(100)
+
+    /**
+     * Kino bridge compat: the pre-Score constructor (rating Int on a 0-100 scale, no runTime) that
+     * extensions built against older CloudStream still call. Binary-only: hidden from source.
+     */
+    @Suppress("DEPRECATION_ERROR")
+    @Deprecated("Kino bridge compat for old extensions", level = DeprecationLevel.HIDDEN)
+    constructor(
+        data: String,
+        name: String? = null,
+        season: Int? = null,
+        episode: Int? = null,
+        posterUrl: String? = null,
+        rating: Int? = null,
+        description: String? = null,
+        date: Long? = null,
+    ) : this(data, name, season, episode, posterUrl, Score.from(rating, 100), description, date, null)
 }
 
 @OptIn(FormatStringsInDatetimeFormats::class)
@@ -2702,6 +2808,40 @@ constructor(
     override var contentRating: String? = null,
     override var uniqueUrl: String = url
 ) : LoadResponse, EpisodeResponse {
+    /** Kino bridge compat: the pre-Score constructor old extensions still call. Binary-only. */
+    @Suppress("DEPRECATION_ERROR")
+    @Deprecated("Kino bridge compat for old extensions", level = DeprecationLevel.HIDDEN)
+    constructor(
+        name: String,
+        url: String,
+        apiName: String,
+        type: TvType,
+        episodes: List<Episode>,
+        posterUrl: String? = null,
+        year: Int? = null,
+        plot: String? = null,
+        showStatus: ShowStatus? = null,
+        rating: Int? = null,
+        tags: List<String>? = null,
+        duration: Int? = null,
+        trailers: MutableList<TrailerData> = mutableListOf(),
+        recommendations: List<SearchResponse>? = null,
+        actors: List<ActorData>? = null,
+        comingSoon: Boolean = false,
+        syncData: MutableMap<String, String> = mutableMapOf(),
+        posterHeaders: Map<String, String>? = null,
+        nextAiring: NextAiring? = null,
+        seasonNames: List<SeasonData>? = null,
+        backgroundPosterUrl: String? = null,
+    ) : this(
+        name = name, url = url, apiName = apiName, type = type, episodes = episodes,
+        posterUrl = posterUrl, year = year, plot = plot, showStatus = showStatus,
+        score = Score.fromOld(rating), tags = tags, duration = duration, trailers = trailers,
+        recommendations = recommendations, actors = actors, comingSoon = comingSoon,
+        syncData = syncData, posterHeaders = posterHeaders, nextAiring = nextAiring,
+        seasonNames = seasonNames, backgroundPosterUrl = backgroundPosterUrl,
+    )
+
     override fun getLatestEpisodes(): Map<DubStatus, Int?> {
         val maxSeason =
             episodes.maxOfOrNull { it.season ?: Int.MIN_VALUE }.takeUnless { it == Int.MIN_VALUE }
