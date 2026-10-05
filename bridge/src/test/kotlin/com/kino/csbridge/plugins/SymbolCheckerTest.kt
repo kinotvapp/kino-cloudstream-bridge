@@ -2,7 +2,6 @@ package com.kino.csbridge.plugins
 
 import com.android.tools.smali.dexlib2.Opcode
 import com.kino.csbridge.plugins.DexFixtures.EPISODE
-import com.kino.csbridge.plugins.DexFixtures.EPISODE_CTOR_OLD
 import com.kino.csbridge.plugins.DexFixtures.MAIN_API
 import com.kino.csbridge.plugins.DexFixtures.OBJECT
 import com.kino.csbridge.plugins.DexFixtures.STRING
@@ -34,8 +33,8 @@ class SymbolCheckerTest {
 
     @Test fun `current Episode constructor resolves`() = assertEquals(emptyList<String>(), missing(DexFixtures.currentEpisodeDex()))
 
-    @Test fun `old Episode default constructor is reported exactly`() {
-        assertEquals(listOf("$EPISODE-><init>(${EPISODE_CTOR_OLD.joinToString("")})V"), missing(DexFixtures.oldEpisodeDex()))
+    @Test fun `a member that stays refused is reported exactly`() {
+        assertEquals(listOf(DexFixtures.GET_APIS_AS_LIST), missing(DexFixtures.refusedSymbolDex()))
     }
 
     @Test fun `member inherited through an interface resolves`() {

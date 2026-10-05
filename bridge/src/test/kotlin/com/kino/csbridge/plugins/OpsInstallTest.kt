@@ -68,10 +68,10 @@ class OpsInstallTest {
     }
 
     @Test fun `missing symbols come back in the answer and nothing is installed`() {
-        val f = DexFixtures.cs3(File.createTempFile("old", ".cs3"), listOf(DexFixtures.oldEpisodeDex()))
+        val f = DexFixtures.cs3(File.createTempFile("old", ".cs3"), listOf(DexFixtures.refusedSymbolDex()))
         val o = JSONObject(op(CsWire.Op.INSTALL, JSONObject().put("sha256", DexFixtures.sha256(f)), f))
         assertEquals(0, o.getJSONArray("providers").length())
-        assertTrue(o.getJSONArray("missingSymbols").getString(0).startsWith("Lcom/lagradost/cloudstream3/Episode;-><init>("))
+        assertEquals(DexFixtures.GET_APIS_AS_LIST, o.getJSONArray("missingSymbols").getString(0))
         assertEquals(emptyList<CsWire.HelloPlugin>(), Ops.helloPlugins(context))
     }
 

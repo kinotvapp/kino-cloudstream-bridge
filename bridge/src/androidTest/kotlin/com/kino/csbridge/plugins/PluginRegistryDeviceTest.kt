@@ -45,8 +45,7 @@ class PluginRegistryDeviceTest {
         val loader = BridgeApp::class.java.classLoader!!
         assertEquals(emptyList<String>(), SymbolChecker(loader).missing(cs3(DexFixtures.currentEpisodeDex())))
         assertEquals(emptyList<String>(), SymbolChecker(loader).missing(cs3(DexFixtures.pluginDex())))
-        assertEquals(listOf("${DexFixtures.EPISODE}-><init>(${DexFixtures.EPISODE_CTOR_OLD.joinToString("")})V"),
-            SymbolChecker(loader).missing(cs3(DexFixtures.oldEpisodeDex())))
+        assertEquals(listOf(DexFixtures.GET_APIS_AS_LIST), SymbolChecker(loader).missing(cs3(DexFixtures.refusedSymbolDex())))
     }
 
     @Test fun realDexPluginRegistersUnderItsIdAndUnloadsCleanly() {

@@ -127,9 +127,8 @@ class PluginRegistryTest {
 
     @Test fun `missing symbols refuse the plugin before loading it`() {
         val r = registry()
-        val res = r.installFile("cloudstream-old", cs3(dex = DexFixtures.oldEpisodeDex()))
-        assertEquals(1, res.missingSymbols.size)
-        assertTrue(res.missingSymbols.single().startsWith("Lcom/lagradost/cloudstream3/Episode;-><init>("))
+        val res = r.installFile("cloudstream-old", cs3(dex = DexFixtures.refusedSymbolDex()))
+        assertEquals(listOf(DexFixtures.GET_APIS_AS_LIST), res.missingSymbols)
         assertEquals(emptyList<Any>(), res.providers)
         assertEquals("Fixture", res.name)
         assertEquals(emptyList<FixtureApi>(), fixtureProviders())
@@ -140,7 +139,7 @@ class PluginRegistryTest {
     @Test fun `a refused update keeps the installed version`() {
         val r = registry()
         val installed = r.installFile("cloudstream-a", cs3()).providers.single()
-        assertEquals(1, r.installFile("cloudstream-a", cs3(dex = DexFixtures.oldEpisodeDex())).missingSymbols.size)
+        assertEquals(1, r.installFile("cloudstream-a", cs3(dex = DexFixtures.refusedSymbolDex())).missingSymbols.size)
         assertSame(installed, r.providers("cloudstream-a").single())
     }
 

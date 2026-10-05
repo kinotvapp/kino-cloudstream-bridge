@@ -41,9 +41,14 @@ object DexFixtures {
     val EPISODE_CTOR_CURRENT = listOf(STRING, STRING, "Ljava/lang/Integer;", "Ljava/lang/Integer;", STRING,
         "Lcom/lagradost/cloudstream3/Score;", STRING, "Ljava/lang/Long;", "Ljava/lang/Integer;")
 
-    /** The `$default` Episode constructor older plugins were compiled against (rating: Int?): absent at the pinned upstream. */
-    val EPISODE_CTOR_OLD = listOf(STRING, STRING, "Ljava/lang/Integer;", "Ljava/lang/Integer;", STRING,
-        "Ljava/lang/Integer;", STRING, "Ljava/lang/Long;", "I", "Lkotlin/jvm/internal/DefaultConstructorMarker;")
+    const val API_HOLDER = "Lcom/lagradost/cloudstream3/APIHolder;"
+
+    /**
+     * `APIHolder.getApis()` returning `List`, as older plugins call it: upstream returns `AtomicList`, and it stays refused
+     * on purpose (bridge/symbol-allowlist.txt). The missing-member example of the ABI tests. (The old `Episode`
+     * constructor used to be it; the compat constructors restore that one.)
+     */
+    const val GET_APIS_AS_LIST = "$API_HOLDER->getApis()Ljava/util/List;"
 
     fun mref(owner: String, name: String, params: List<String>, ret: String) = ImmutableMethodReference(owner, name, params, ret)
     fun fref(owner: String, name: String, type: String) = ImmutableFieldReference(owner, name, type)
@@ -102,10 +107,10 @@ object DexFixtures {
         invokeRange(Opcode.INVOKE_DIRECT_RANGE, mref(EPISODE, "<init>", EPISODE_CTOR_CURRENT, "V"), 10),
     )))
 
-    /** A dex calling the OLD `$default` Episode constructor: must be refused. */
-    fun oldEpisodeDex(type: String = "Lfixture/Old;"): ByteArray = dex(runner(type, 11, listOf(
-        newInstance(0, EPISODE),
-        invokeRange(Opcode.INVOKE_DIRECT_RANGE, mref(EPISODE, "<init>", EPISODE_CTOR_OLD, "V"), 11),
+    /** A dex calling `APIHolder.INSTANCE.getApis()` as `List` ([GET_APIS_AS_LIST]): must be refused. */
+    fun refusedSymbolDex(type: String = "Lfixture/Refused;"): ByteArray = dex(runner(type, 1, listOf(
+        sget(0, fref(API_HOLDER, "INSTANCE", API_HOLDER)),
+        invoke(Opcode.INVOKE_VIRTUAL, mref(API_HOLDER, "getApis", emptyList(), "Ljava/util/List;"), 0),
     )))
 
     /**
