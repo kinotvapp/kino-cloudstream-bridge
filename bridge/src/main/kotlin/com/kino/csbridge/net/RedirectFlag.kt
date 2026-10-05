@@ -25,10 +25,17 @@ internal object RedirectFlag {
     fun of(chain: Interceptor.Chain): Boolean = read(chain.call()) ?: true
 
     /** The call's client `followRedirects`, or null when it cannot be read. */
-    fun read(call: Call): Boolean? = runCatching {
+    fun read(call: Call): Boolean? = clientOf(call)?.followRedirects
+
+    /**
+     * The client that made [call], or null when the read fails. [IpcInterceptor] also uses it for the client's public
+     * `interceptors` / `networkInterceptors` lists (the plugin interceptors it runs itself): no further reflection.
+     * R8 keeps `RealCall.getClient()` through bridge/proguard-rules.pro.
+     */
+    fun clientOf(call: Call): OkHttpClient? = runCatching {
         val c = call.javaClass
         val m = cached?.takeIf { it.first == c }?.second
             ?: runCatching { c.getMethod("getClient") }.getOrNull().also { cached = c to it }
-        (m?.invoke(call) as? OkHttpClient)?.followRedirects
+        m?.invoke(call) as? OkHttpClient
     }.getOrNull()
 }

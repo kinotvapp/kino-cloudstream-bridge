@@ -7,10 +7,11 @@ import com.kino.csbridge.HostLink
 import com.kino.csbridge.contract.CsWire
 import com.kino.csbridge.contract.IHost
 import com.kino.csbridge.contract.IHttpReply
+import com.lagradost.cloudstream3.UnsafeSSL
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.insecureApp
-import com.lagradost.cloudstream3.UnsafeSSL
 import okhttp3.Call
+import okhttp3.Connection
 import okhttp3.EventListener
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -18,6 +19,7 @@ import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Protocol
+import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.asResponseBody
@@ -26,6 +28,7 @@ import okio.ForwardingSink
 import okio.ForwardingSource
 import okio.buffer
 import okio.source
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.util.Collections
@@ -34,20 +37,95 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
- * Application interceptor that never calls `chain.proceed()`: every request leaves the bridge (which has no INTERNET
- * permission) as one oneway [IHost.request]. Kino applies its own policy (https on every hop, no LAN, valid TLS,
- * redirects followed hop by hop, 1 MB request / 5 MB response caps) and answers through [IHttpReply], then streams
- * the body into the sink pipe and closes it.
+ * Application interceptor that never lets OkHttp touch the network: every request leaves the bridge (which has no
+ * INTERNET permission) as one oneway [IHost.request]. Kino applies its own policy (https on every hop, no LAN, valid
+ * TLS, redirects followed hop by hop, 1 MB request / 5 MB response caps), answers through [IHttpReply], then streams
+ * the body into the sink pipe and closes it (with an error status when the body failed).
  *
- * A request is only served inside a live Kino call: its [CallContext] comes from the thread that created the OkHttp
+ * A request is only served inside a live Kino call. Its [CallContext] comes from the thread that created the OkHttp
  * call ([CallCapture], because NiceHttp enqueues on OkHttp's dispatcher threads) or from the current thread.
+ *
+ * Plugin interceptors (decision record, Task 4 review B4). NiceHttp adds a request's `interceptor =` (CloudflareKiller,
+ * header and cookie interceptors) after this one, and plugins add their own to derived clients. Since OkHttp's chain
+ * would reach them only through `proceed()`, which would go to the network, this interceptor runs them itself:
+ * every application interceptor after it in the calling client's list, then the client's network interceptors,
+ * through a [BridgeChain] whose last `proceed(request)` is one IPC with that request. Each `proceed` is its own IPC,
+ * so a retrying interceptor works. Network interceptors run too, because their usual job (headers, response
+ * rewriting) still makes sense on Kino's response. They see `connection() == null`, and the redirects Kino followed
+ * happen inside the one exchange. While they run, the [CallContext] thread local is set on this thread (and restored
+ * after), so calls they start themselves (CloudflareKiller's `app.baseClient.newCall()`) belong to the same Kino
+ * call. The client is read through [RedirectFlag.clientOf]. If that read fails, only the IPC runs.
  */
 class IpcInterceptor(private val host: () -> IHost? = { HostLink.host }) : Interceptor {
 
     override fun intercept(chain: Interceptor.Chain): Response {
-        val req = chain.request()
         val call = chain.call()
         val ctx = CallCapture.of(call) ?: CallContext.current() ?: throw IOException("bridge: request outside a Kino call")
+        val client = RedirectFlag.clientOf(call)
+        val follow = client?.followRedirects ?: true
+        val downstream = client?.let { downstreamOf(it) }.orEmpty()
+        val previous = CallContext.threadLocal.get()
+        CallContext.threadLocal.set(ctx)
+        try {
+            return BridgeChain(
+                downstream, 0, chain.request(), call, ctx, follow,
+                chain.connectTimeoutMillis(), chain.readTimeoutMillis(), chain.writeTimeoutMillis(), explicitMs = 0,
+            ).proceed(chain.request())
+        } finally {
+            CallContext.threadLocal.set(previous)
+        }
+    }
+
+    /** Application interceptors after this one (found by identity), then the network interceptors. */
+    private fun downstreamOf(client: OkHttpClient): List<Interceptor> {
+        val appInterceptors = client.interceptors
+        val i = appInterceptors.indexOfFirst { it === this }
+        if (i < 0) return emptyList()
+        return appInterceptors.subList(i + 1, appInterceptors.size) + client.networkInterceptors
+    }
+
+    /**
+     * The chain plugin interceptors see. `with*Timeout` values set by an interceptor bound the request's timeout
+     * ([explicitMs], 0 = none set); the client's defaults are only reported, never sent as a total timeout.
+     */
+    private inner class BridgeChain(
+        private val interceptors: List<Interceptor>, private val index: Int, private val request: Request,
+        private val call: Call, private val ctx: CallContext, private val follow: Boolean,
+        private val connectMs: Int, private val readMs: Int, private val writeMs: Int, private val explicitMs: Int,
+    ) : Interceptor.Chain {
+        override fun request(): Request = request
+        override fun call(): Call = call
+        override fun connection(): Connection? = null
+        override fun connectTimeoutMillis(): Int = connectMs
+        override fun readTimeoutMillis(): Int = readMs
+        override fun writeTimeoutMillis(): Int = writeMs
+
+        override fun withConnectTimeout(timeout: Int, unit: TimeUnit): Interceptor.Chain =
+            ms(timeout, unit).let { copy(connect = it, explicit = tighter(it)) }
+        override fun withReadTimeout(timeout: Int, unit: TimeUnit): Interceptor.Chain =
+            ms(timeout, unit).let { copy(read = it, explicit = tighter(it)) }
+        override fun withWriteTimeout(timeout: Int, unit: TimeUnit): Interceptor.Chain =
+            ms(timeout, unit).let { copy(write = it, explicit = tighter(it)) }
+
+        override fun proceed(request: Request): Response =
+            if (index < interceptors.size) {
+                val next = BridgeChain(interceptors, index + 1, request, call, ctx, follow, connectMs, readMs, writeMs, explicitMs)
+                interceptors[index].intercept(next)
+            } else {
+                exchange(request, call, ctx, follow, explicitMs)
+            }
+
+        private fun ms(timeout: Int, unit: TimeUnit): Int = unit.toMillis(timeout.toLong()).coerceIn(0, Int.MAX_VALUE.toLong()).toInt()
+
+        /** The smallest positive timeout an interceptor set so far (0 = none). */
+        private fun tighter(ms: Int): Int = listOf(explicitMs, ms).filter { it > 0 }.minOrNull() ?: 0
+
+        private fun copy(connect: Int = connectMs, read: Int = readMs, write: Int = writeMs, explicit: Int): BridgeChain =
+            BridgeChain(interceptors, index, request, call, ctx, follow, connect, read, write, explicit)
+    }
+
+    /** One IPC: [req] to Kino, its answer back as an OkHttp response streaming from the sink pipe. */
+    private fun exchange(req: Request, call: Call, ctx: CallContext, follow: Boolean, explicitMs: Int): Response {
         if (ctx.isOver()) throw IOException("bridge: the Kino call is over (cancelled or past its deadline)")
         val h = host() ?: throw IOException("bridge: Kino is not connected")
 
@@ -56,28 +134,29 @@ class IpcInterceptor(private val host: () -> IHost? = { HostLink.host }) : Inter
         req.body?.contentType()?.let { ct -> if (req.header("Content-Type") == null) headers += "Content-Type" to ct.toString() }
         val meta = CsWire.httpMeta(
             ctx.callId, ctx.pluginId, req.method, req.url.toString(), headers,
-            followRedirects = RedirectFlag.of(chain), timeoutMs = timeoutMs(ctx, call), hasBody = body != null,
+            followRedirects = follow, timeoutMs = timeoutMs(ctx, call, explicitMs), hasBody = body != null,
         )
 
         val sink = ParcelFileDescriptor.createReliablePipe() // [0] we read, [1] Kino writes
-        val bodyPipe = body?.let { ParcelFileDescriptor.createReliablePipe() } // [0] Kino reads, [1] we write
+        val bodyPipe = body?.let { ParcelFileDescriptor.createReliablePipe() } // [0] Kino reads, [1] the writer thread
+        // The writer thread owns bodyPipe[1] alone: it ends when the bytes are written or every read end is gone.
+        if (body != null) startBodyWriter(bodyPipe!![1], body)
         val waiter = ReplyWaiter()
         try {
             h.request(meta, bodyPipe?.get(0), sink[1], waiter)
         } catch (e: Exception) { // DeadObjectException / RemoteException, or a Binder-side runtime failure
-            closeQuietly(sink[0]); closeQuietly(bodyPipe?.get(1))
-            fail(req.url.host, "Kino unreachable (${e.javaClass.simpleName})", e)
+            closeQuietly(sink[0])
+            fail(req.url, "Kino unreachable (${e.javaClass.simpleName})", e)
         } finally {
             // Binder duplicated these for Kino; our copies must go or the reader never sees EOF.
             closeQuietly(sink[1]); closeQuietly(bodyPipe?.get(0))
         }
-        if (body != null) startBodyWriter(bodyPipe!![1], body)
 
         val replyJson = try {
             awaitReply(waiter, ctx, call, h)
         } catch (e: IOException) {
-            closeQuietly(sink[0]); closeQuietly(bodyPipe?.get(1))
-            fail(req.url.host, e.message ?: "no reply", null)
+            closeQuietly(sink[0])
+            fail(req.url, e.message ?: "no reply", null)
         }
         return buildResponse(req, replyJson, sink[0])
     }
@@ -99,19 +178,23 @@ class IpcInterceptor(private val host: () -> IHost? = { HostLink.host }) : Inter
         }
     }
 
-    private fun buildResponse(req: okhttp3.Request, replyJson: String, read: ParcelFileDescriptor): Response {
+    private fun buildResponse(req: Request, replyJson: String, read: ParcelFileDescriptor): Response {
         val r = runCatching { JSONObject(replyJson) }.getOrNull()
         CsWire.errorOf(replyJson)?.let { (code, msg) ->
             closeQuietly(read)
-            fail(req.url.host, "Kino refused the request: $code ${msg.replace(QUERY_OR_FRAGMENT, "").take(120)}", null)
+            fail(req.url, "Kino refused the request: $code ${scrubUrls(msg).take(160)}", null)
         }
         val status = r?.optInt("status", -1) ?: -1
-        if (r == null || status !in 100..999) { closeQuietly(read); fail(req.url.host, "malformed reply", null) }
+        if (r == null || status !in 100..999) { closeQuietly(read); fail(req.url, "malformed reply", null) }
         val hb = Headers.Builder()
-        CsWire.headersOf(r.optJSONArray("headers") ?: org.json.JSONArray()).forEach { (n, v) -> runCatching { hb.addUnsafeNonAscii(n, v) } }
+        var dropped = 0
+        CsWire.headersOf(r.optJSONArray("headers") ?: JSONArray()).forEach { (n, v) ->
+            if (runCatching { hb.addUnsafeNonAscii(n, v) }.isFailure) dropped++
+        }
+        if (dropped > 0) log("http ${req.url.host}: dropped $dropped invalid response header(s)")
         val respHeaders = hb.build()
         val finalUrl = r.optString("finalUrl").toHttpUrlOrNull()?.takeIf { it.isHttps } ?: req.url
-        val source = CappedSource(ParcelFileDescriptor.AutoCloseInputStream(read).source()).buffer()
+        val source = CheckedSource(read).buffer()
         val now = System.currentTimeMillis()
         return Response.Builder()
             .request(req.newBuilder().url(finalUrl).build())
@@ -148,16 +231,18 @@ class IpcInterceptor(private val host: () -> IHost? = { HostLink.host }) : Inter
         }, "bridge-http-body").apply { isDaemon = true }.start()
     }
 
-    private fun timeoutMs(ctx: CallContext, call: Call): Int {
+    private fun timeoutMs(ctx: CallContext, call: Call, explicitMs: Int): Int {
+        var ms = ctx.remainingMs()
         val callTimeoutMs = call.timeout().timeoutNanos() / 1_000_000
-        val left = ctx.remainingMs()
-        val ms = if (callTimeoutMs > 0) minOf(callTimeoutMs, left) else left
+        if (callTimeoutMs > 0) ms = minOf(ms, callTimeoutMs)
+        if (explicitMs > 0) ms = minOf(ms, explicitMs.toLong())
         return if (ms == Long.MAX_VALUE) 0 else ms.coerceIn(1, Int.MAX_VALUE.toLong()).toInt()
     }
 
-    /** Never the full URL: queries can carry tokens. Host only. */
-    private fun fail(host: String, why: String, cause: Throwable?): Nothing {
-        runCatching { Log.w(TAG, "http $host failed: $why") }
+    /** Logs host + first path segment only (queries can carry tokens), then throws. */
+    private fun fail(url: okhttp3.HttpUrl, why: String, cause: Throwable?): Nothing {
+        val where = url.host + (url.pathSegments.firstOrNull()?.takeIf { it.isNotEmpty() }?.let { "/$it" } ?: "")
+        log("http $where failed: $why")
         throw IOException("bridge: $why", cause)
     }
 
@@ -174,11 +259,17 @@ class IpcInterceptor(private val host: () -> IHost? = { HostLink.host }) : Inter
         fun await(ms: Long) { latch.await(ms, TimeUnit.MILLISECONDS) }
     }
 
-    /** Local guard on top of Kino's own cap: a body past [MAX_RESPONSE_BODY] ends in an IOException. */
-    private class CappedSource(delegate: okio.Source) : ForwardingSource(delegate) {
+    /**
+     * The response body from our read end of the sink pipe. At EOF it asks the pipe how Kino closed it: a
+     * `closeWithError` (Kino's 5 MB cap, a timeout, a reset) or Kino's death is an IOException, never a silently
+     * truncated success. A local guard on top of Kino's cap stops past [MAX_RESPONSE_BODY].
+     */
+    internal class CheckedSource(private val pfd: ParcelFileDescriptor) :
+        ForwardingSource(ParcelFileDescriptor.AutoCloseInputStream(pfd).source()) {
         private var total = 0L
         override fun read(sink: Buffer, byteCount: Long): Long {
             val n = super.read(sink, byteCount)
+            if (n == -1L) pfd.checkError()
             if (n > 0) {
                 total += n
                 if (total > MAX_RESPONSE_BODY) throw IOException("bridge: response body over ${MAX_RESPONSE_BODY / (1024 * 1024)} MB")
@@ -192,8 +283,12 @@ class IpcInterceptor(private val host: () -> IHost? = { HostLink.host }) : Inter
         const val MAX_RESPONSE_BODY = 5 * 1024 * 1024
         private const val POLL_MS = 100L
         private const val TAG = "CsBridgeHttp"
-        private val QUERY_OR_FRAGMENT = Regex("[?#]\\S*")
+        private val URL = Regex("(https?://[^/\\s?#]+)(/[^/\\s?#]*)?\\S*")
 
+        /** Every URL in [s] cut to scheme + host + first path segment. */
+        internal fun scrubUrls(s: String): String = s.replace(URL) { m -> m.groupValues[1] + m.groupValues[2] }
+
+        private fun log(msg: String) { runCatching { Log.w(TAG, msg) } }
         private fun closeQuietly(pfd: ParcelFileDescriptor?) { runCatching { pfd?.close() } }
     }
 }

@@ -13,6 +13,10 @@ import com.kino.csbridge.contract.IReply
 import com.lagradost.cloudstream3.UnsafeSSL
 import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.insecureApp
+import com.lagradost.cloudstream3.network.CloudflareKiller
+import com.lagradost.cloudstream3.network.WebViewResolver
+import okhttp3.Interceptor
+import okio.buffer
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.asContextElement
 import kotlinx.coroutines.runBlocking
@@ -43,6 +47,7 @@ class IpcInterceptorTest {
     data class Route(
         val status: Int = 200, val headers: List<Pair<String, String>> = emptyList(), val body: ByteArray = ByteArray(0),
         val finalUrl: String? = null, val error: String? = null, val reply: Boolean = true, val dieAfterSend: Boolean = false,
+
     )
 
     /** A fake Kino serving from [routes]; records each meta and request body it received. */
@@ -104,7 +109,8 @@ class IpcInterceptorTest {
         assertEquals("hello", r.text)
         assertEquals(listOf("a=1", "b=2"), r.okhttpResponse.headers("Set-Cookie"))
         val h = r.okhttpResponse.headers
-        assertEquals(listOf("Set-Cookie", "Content-Type", "Set-Cookie"), (0 until h.size).map { h.name(it) })
+        // Kino's headers in order; NiceHttp's own CacheInterceptor (a network interceptor) then adds Cache-Control.
+        assertEquals(listOf("Set-Cookie", "Content-Type", "Set-Cookie"), (0 until h.size).map { h.name(it) }.take(3))
         assertEquals("https://b.example/final", r.url)
         val m = host.metas.single()
         assertEquals("call-1", m.callId); assertEquals("cloudstream-x", m.pluginId); assertEquals("GET", m.method)
@@ -219,6 +225,83 @@ class IpcInterceptorTest {
         @OptIn(UnsafeSSL::class)
         val clients = listOf(app.baseClient, insecureApp.baseClient)
         clients.forEach { c -> assertNotNull(c.interceptors.singleOrNull { it is IpcInterceptor }) }
+    }
+
+    @Test fun `a plugin interceptor's header reaches Kino`() {
+        serve("https://a.example/h" to Route())
+        val add = Interceptor { it.proceed(it.request().newBuilder().header("X-Plugin", "1").build()) }
+        inCall { app.get("https://a.example/h", interceptor = add) }
+        assertTrue(host.metas.single().headers.contains("X-Plugin" to "1"))
+    }
+
+    @Test fun `a retrying interceptor makes one IPC per proceed`() {
+        serve("https://a.example/retry" to Route(body = "x".toByteArray()))
+        val retry = Interceptor { chain -> chain.proceed(chain.request()).close(); chain.proceed(chain.request()) }
+        assertEquals("x", inCall { app.get("https://a.example/retry", interceptor = retry) }.text)
+        assertEquals(2, host.metas.size)
+    }
+
+    @Test fun `the call context is set inside plugin interceptors and restored after`() {
+        serve("https://a.example/ctx" to Route())
+        val seen = CopyOnWriteArrayList<Any?>()
+        var thread: Thread? = null
+        val probe = Interceptor { chain -> thread = Thread.currentThread(); seen += CallContext.current(); chain.proceed(chain.request()) }
+        val ctx = CallContext("call-ctx", "cloudstream-x", CallContext.deadlineFromNow(10_000))
+        inCall(ctx) { app.get("https://a.example/ctx", interceptor = probe) }
+        assertEquals(listOf<Any?>(ctx), seen.toList())
+        assertTrue("NiceHttp runs interceptors on OkHttp's dispatcher", thread !== Thread.currentThread())
+    }
+
+    @Test fun `withReadTimeout from an interceptor bounds the timeout sent to Kino`() {
+        serve("https://a.example/t" to Route())
+        val tight = Interceptor { it.withReadTimeout(2, java.util.concurrent.TimeUnit.SECONDS).proceed(it.request()) }
+        inCall { app.get("https://a.example/t", interceptor = tight) }
+        assertTrue(host.metas.single().timeoutMs in 1..2_000)
+    }
+
+    @Test fun `network interceptors run after the application ones`() {
+        serve("https://a.example/n" to Route(headers = listOf("X-From-Kino" to "1")))
+        val order = CopyOnWriteArrayList<String>()
+        val client = app.baseClient.newBuilder()
+            .addNetworkInterceptor { c -> order += "network"; c.proceed(c.request()).newBuilder().header("X-Network", "1").build() }
+            .addInterceptor { c -> order += "app"; c.proceed(c.request()) }
+            .build()
+        val r = inCall { client.newCall(Request.Builder().url("https://a.example/n").build()).execute() }
+        assertEquals(listOf("app", "network"), order.toList())
+        assertEquals("1", r.header("X-Network")); assertEquals("1", r.header("X-From-Kino"))
+    }
+
+    @Test fun `CloudflareKiller compiled in the bridge runs and its own call reaches Kino`() {
+        serve("https://a.example/cf" to Route(body = "solved".toByteArray()))
+        WebViewResolver.webViewUserAgent = "UA-test" // no WebView on the JVM
+        val killer = CloudflareKiller().apply { savedCookies["a.example"] = mapOf("cf_clearance" to "ok") }
+        assertEquals("solved", inCall { app.get("https://a.example/cf", interceptor = killer) }.text)
+        // Its saved-cookie path starts a new app.baseClient call from the dispatcher thread: same Kino call.
+        val m = host.metas.single()
+        assertEquals("call-1", m.callId)
+        assertTrue(m.headers.any { it.first.equals("cookie", true) && it.second.contains("cf_clearance=ok") })
+        assertTrue(m.headers.any { it.first.equals("user-agent", true) && it.second == "UA-test" })
+    }
+
+    @Test fun `a body Kino closed with an error is an IOException, not a truncated success`() {
+        // Robolectric's file-backed pipe has no comm channel, so Kino's closeWithError can't travel through it: the EOF
+        // hook is tested against a read end whose checkError reports what a real reliable pipe would. Task 9 checks
+        // the real closeWithError on a device.
+        val pipe = ParcelFileDescriptor.createReliablePipe()
+        ParcelFileDescriptor.AutoCloseOutputStream(pipe[1]).use { it.write("partial".toByteArray()) }
+        val closedWithError = object : ParcelFileDescriptor(pipe[0]) {
+            override fun checkError() { throw IOException("Remote error: body over cap") }
+        }
+        assertIo { IpcInterceptor.CheckedSource(closedWithError).buffer().readByteArray() }
+        // A cleanly closed pipe reads to the end.
+        val ok = ParcelFileDescriptor.createReliablePipe()
+        ParcelFileDescriptor.AutoCloseOutputStream(ok[1]).use { it.write("whole".toByteArray()) }
+        assertEquals("whole", IpcInterceptor.CheckedSource(ok[0]).buffer().readUtf8())
+    }
+
+    @Test fun `URLs in Kino's messages are cut to host and first segment`() {
+        assertEquals("boom https://h.example/a end", IpcInterceptor.scrubUrls("boom https://h.example/a/b/c?token=s#f end"))
+        assertEquals("https://h.example", IpcInterceptor.scrubUrls("https://h.example?x=1"))
     }
 
     private fun okhttp() = app.baseClient
