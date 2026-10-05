@@ -1,0 +1,26 @@
+# Upstream :app files compiled unchanged into :bridge (paths under app/src/main/java), one per line.
+# Each is here because cs3-symbols.tsv lists a symbol it declares, or because another listed file needs it.
+# Anything that would pull UI (Activities, Fragments, Compose, media3, Cast) or R resources is a headless stub
+# in src/main/kotlin/com/kino/csbridge/stubs instead; see each stub's header for the upstream file it replaces.
+
+# Plugin entry point and the application object plugins read context and keys from
+com/lagradost/cloudstream3/plugins/Plugin.kt
+com/lagradost/cloudstream3/CloudStreamApp.kt
+com/lagradost/cloudstream3/AcraApplication.kt
+com/lagradost/cloudstream3/utils/DataStore.kt
+
+# Networking helpers plugins construct
+com/lagradost/cloudstream3/network/CloudflareKiller.kt
+
+# Small value types used across the app API
+com/lagradost/cloudstream3/utils/Event.kt
+com/lagradost/cloudstream3/utils/TextUtil.kt
+
+# Sync / auth / subtitle provider base classes (the concrete providers are stubs)
+com/lagradost/cloudstream3/syncproviders/AuthAPI.kt
+com/lagradost/cloudstream3/syncproviders/SyncAPI.kt
+com/lagradost/cloudstream3/syncproviders/SyncRepo.kt
+com/lagradost/cloudstream3/syncproviders/SubtitleAPI.kt
+com/lagradost/cloudstream3/subtitles/AbstractSubtitleEntities.kt
+com/lagradost/cloudstream3/subtitles/AbstractSubProvider.kt
+com/lagradost/cloudstream3/syncproviders/SubtitleRepo.kt

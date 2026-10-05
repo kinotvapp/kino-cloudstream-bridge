@@ -2,6 +2,8 @@
 plugins {
     // AGP 9 compiles Kotlin itself (built-in Kotlin), as upstream's :app does: no kotlin.android plugin.
     alias(libs.plugins.android.application)
+    // Upstream :app applies it too; the included app files use @Serializable (generated serializers are ABI).
+    alias(libs.plugins.kotlin.serialization)
 }
 
 // The upstream commit this fork is pinned at. A constant, not `git rev-parse`, so builds are
@@ -45,8 +47,33 @@ android {
     // Keep META-INF/*.kotlin_module: stripping it breaks resolution of top-level declarations (spike finding).
 }
 
+// ---- Upstream :app classes plugins link against ----------------------------------------------------------
+// The files listed in app-sources.txt are copied unchanged from upstream app/src/main/java into the build dir and
+// compiled here; what would drag UI in is replaced by headless stubs in src/main/kotlin/com/kino/csbridge/stubs.
+val appSources = file("app-sources.txt").readLines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }
+val upstreamAppSrc = layout.buildDirectory.dir("upstream-app-src")
+val copyAppSources by tasks.registering(Sync::class) {
+    from(rootProject.file("app/src/main/java")) { appSources.forEach { include(it) } }
+    into(upstreamAppSrc)
+}
+// AGP 9 built-in Kotlin has no `kotlin { sourceSets }` block: the android source set's kotlin directories are what
+// it compiles (srcDir() is deprecated there). preBuild runs before every compile task, so the copy is in place.
+android.sourceSets["main"].kotlin.directories.add(upstreamAppSrc.get().asFile.absolutePath)
+tasks.named("preBuild") { dependsOn(copyAppSources) }
+
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile>().configureEach {
+    compilerOptions {
+        // Same as upstream :app, so interface and opt-in ABI matches what plugins were compiled against.
+        jvmDefault.set(org.jetbrains.kotlin.gradle.dsl.JvmDefaultMode.ENABLE)
+        optIn.addAll("com.lagradost.cloudstream3.InternalAPI", "com.lagradost.cloudstream3.Prerelease")
+    }
+}
+
 dependencies {
     implementation(project(":library"))
+    // UI base classes the headless stubs keep in their supertypes (as upstream :app declares them).
+    implementation(libs.appcompat)
+    implementation(libs.fragment.ktx)
     // Mirrors upstream :app / :library runtime dependencies for plugins (catalog aliases, same versions).
     implementation(libs.kotlin.reflect)
     implementation(libs.kotlinx.coroutines.core)
@@ -77,3 +104,50 @@ dependencies {
     androidTestImplementation(libs.ext.junit)
     androidTestImplementation(libs.core)
 }
+
+// ---- Symbol-coverage oracle (scripts/symbol-coverage.py) -------------------------------------------------
+// Every symbol in src/test/resources/cs3-symbols.tsv (measured across 583 real .cs3 plugins) must resolve on the
+// debug classpath: our compiled classes + :library + dependency class jars + android.jar, minus symbol-allowlist.txt.
+val oracleClasspathFile = layout.buildDirectory.file("symbol-coverage/debug-classpath.txt")
+val oracleDependencyJars = provider {
+    // The variant configuration exists only after AGP finishes configuring, hence the lazy lookup.
+    configurations.getByName("debugRuntimeClasspath").incoming.artifactView {
+        attributes { attribute(Attribute.of("artifactType", String::class.java), "android-classes-jar") }
+    }.files
+}
+val oracleBootClasspath = provider { }.flatMap { androidComponents.sdkComponents.bootClasspath } // android.jar; read late
+val oracleClassDirs = listOf(
+    layout.buildDirectory.dir("intermediates/built_in_kotlinc/debug/compileDebugKotlin/classes"),
+    layout.buildDirectory.dir("intermediates/javac/debug/compileDebugJavaWithJavac/classes"),
+)
+val writeOracleClasspath by tasks.registering {
+    description = "Writes the debug class dirs + class jars the symbol oracle reads."
+    dependsOn("compileDebugKotlin", "compileDebugJavaWithJavac")
+    inputs.files(oracleDependencyJars)
+    inputs.files(oracleBootClasspath)
+    outputs.file(oracleClasspathFile)
+    // Locals only inside doLast: script-level references cannot be stored in the configuration cache.
+    val dirs = oracleClassDirs.map { it.get().asFile }
+    val jars = oracleDependencyJars
+    val boot = oracleBootClasspath
+    val out = oracleClasspathFile
+    doLast {
+        val lines = dirs.map { it.absolutePath } + jars.get().files.map { it.absolutePath } + boot.get().map { it.asFile.absolutePath }
+        out.get().asFile.apply { parentFile.mkdirs(); writeText(lines.joinToString("\n") + "\n") }
+    }
+}
+val symbolCoverage by tasks.registering(Exec::class) {
+    description = "Fails when a symbol real CloudStream plugins link against is missing from the bridge classpath."
+    group = "verification"
+    dependsOn(writeOracleClasspath)
+    val script = rootProject.file("scripts/symbol-coverage.py")
+    val tsv = file("src/test/resources/cs3-symbols.tsv")
+    val allow = file("symbol-allowlist.txt")
+    inputs.files(script, tsv, oracleClasspathFile)
+    inputs.files(allow).optional()
+    commandLine(
+        "python3", script.absolutePath, "--symbols", tsv.absolutePath, "--allowlist", allow.absolutePath,
+        "--classpath-file", oracleClasspathFile.get().asFile.absolutePath,
+    )
+}
+tasks.named("check") { dependsOn(symbolCoverage) }
