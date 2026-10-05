@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- GPL-3.0. The bridge never holds network access: every request goes through Kino over IPC. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.INTERNET" tools:node="remove" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" tools:node="remove" />
+    <permission android:name="com.arkiv.player.permission.CLOUDSTREAM_BRIDGE" android:protectionLevel="signature" />
+    <application android:name=".BridgeApp" android:allowBackup="false" android:label="Kino CloudStream"
+        android:extractNativeLibs="false" tools:replace="android:label">
+        <service android:name=".BridgeService" android:exported="true"
+            android:permission="com.arkiv.player.permission.CLOUDSTREAM_BRIDGE" android:process=":plugins" />
+    </application>
+</manifest>

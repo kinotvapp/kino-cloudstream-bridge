@@ -19,3 +19,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "CloudStream"
 include(":app", ":shared", ":library", ":docs", ":desktopApp")
+
+include(":bridge")
