@@ -10,12 +10,10 @@ import com.lagradost.cloudstream3.LoadResponse
 import com.lagradost.cloudstream3.MovieLoadResponse
 import com.lagradost.cloudstream3.MovieSearchResponse
 import com.lagradost.cloudstream3.SearchResponse
-import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TorrentLoadResponse
 import com.lagradost.cloudstream3.TvSeriesLoadResponse
 import com.lagradost.cloudstream3.TvSeriesSearchResponse
 import com.lagradost.cloudstream3.TvType
-import com.lagradost.cloudstream3.utils.ExtractorLink
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -24,7 +22,8 @@ import org.json.JSONObject
  * open interfaces), so callers run this on the op's plugin thread. Absent values are left out, never sent as null.
  *
  * Caps: [MAX_ITEMS] items per row or search, [MAX_ROWS] rows, [MAX_EPISODES] episodes, [MAX_PLOT] plot chars,
- * [MAX_TAGS] tags. URLs and `data` are never truncated (a cut one is a broken one): an item whose url is over
+ * [MAX_TAGS] tags. Peer-to-peer items (Torrent type, magnet or .torrent url) and episodes (magnet or .torrent data) are
+ * dropped. URLs and `data` are never truncated (a cut one is a broken one): an item whose url is over
  * [LinkFilter.MAX_URL_CHARS], or an episode whose data is over [MAX_DATA_CHARS], is left out instead.
  */
 object Json {
@@ -39,7 +38,7 @@ object Json {
     private const val MAX_HEADERS = 64
 
     /** Item lists of one answer stop growing past this many chars, so a page stays under the service's result cap. */
-    const val ITEMS_BUDGET_CHARS = 400 * 1024
+    const val ITEMS_BUDGET_CHARS = 100_000
 
     /** Thrown for a LoadResponse the bridge will not serve (torrents); the op answers `bad_request`. */
     class Refused(message: String) : Exception(message)
@@ -47,6 +46,9 @@ object Json {
     fun item(sr: SearchResponse, provider: Int): JSONObject? {
         val url = sr.url
         if (url.isEmpty() || url.length > LinkFilter.MAX_URL_CHARS) return null
+        // Peer-to-peer is dropped everywhere, titles included: a Torrent-typed item, or one whose url is a magnet or a .torrent.
+        val type = sr.type
+        if (type == TvType.Torrent || LinkFilter.peerToPeer(url)) return null
         val year = when (sr) {
             is MovieSearchResponse -> sr.year
             is TvSeriesSearchResponse -> sr.year
@@ -54,7 +56,7 @@ object Json {
             else -> null
         }
         return JSONObject()
-            .put("name", sr.name.take(MAX_NAME)).put("url", url).put("type", sr.type?.name)
+            .put("name", sr.name.take(MAX_NAME)).put("url", url).put("type", type?.name)
             .put("poster", sr.posterUrl?.takeIf { it.isNotEmpty() && it.length <= LinkFilter.MAX_URL_CHARS })
             .put("posterHeaders", headers(sr.posterHeaders)).put("year", year).put("quality", sr.quality?.name)
             .put("provider", provider)
@@ -113,7 +115,7 @@ object Json {
     }
 
     private fun single(data: String?, into: JSONArray) {
-        if (!invalidData(data) && data!!.length <= MAX_DATA_CHARS) into.put(JSONObject().put("data", data))
+        if (!invalidData(data) && data!!.length <= MAX_DATA_CHARS && !LinkFilter.peerToPeer(data)) into.put(JSONObject().put("data", data))
     }
 
     /** CloudStream's `APIRepository.isInvalidData`, plus null. */
@@ -121,7 +123,7 @@ object Json {
 
     private fun episode(e: Episode, dub: DubStatus?, lean: Int): JSONObject? {
         val data = e.data
-        if (invalidData(data) || data.length > MAX_DATA_CHARS) return null
+        if (invalidData(data) || data.length > MAX_DATA_CHARS || LinkFilter.peerToPeer(data)) return null
         val o = JSONObject().put("data", data).put("season", e.season).put("episode", e.episode).put("date", e.date)
             .put("dubStatus", dub?.name)
         if (lean < 2) o.put("name", e.name?.take(MAX_NAME))
@@ -152,15 +154,16 @@ object Json {
         else -> "series"
     }
 
-    fun link(l: ExtractorLink): JSONObject = JSONObject()
-        .put("type", "link").put("url", l.url.trim()).put("name", l.name.take(MAX_NAME)).put("source", l.source.take(MAX_NAME))
+    /** A link event from a [LinkFilter.snapshot] (never from the live, plugin-mutable object). */
+    fun link(l: LinkFilter.Link): JSONObject = JSONObject()
+        .put("type", "link").put("url", l.url).put("name", l.name.take(MAX_NAME)).put("source", l.source.take(MAX_NAME))
         .put("referer", l.referer.takeIf { it.isNotEmpty() && it.length <= LinkFilter.MAX_URL_CHARS })
         .put("quality", l.quality).put("linkType", l.type.name)
-        .put("headers", JSONObject(LinkFilter.headers(l) as Map<*, *>))
+        .put("headers", JSONObject(l.headers as Map<*, *>))
 
-    fun subtitle(s: SubtitleFile): JSONObject = JSONObject()
-        .put("type", "subtitle").put("lang", s.lang.take(MAX_NAME)).put("url", s.url.trim())
-        .put("headers", JSONObject(LinkFilter.headers(s) as Map<*, *>))
+    fun subtitle(s: LinkFilter.Subtitle): JSONObject = JSONObject()
+        .put("type", "subtitle").put("lang", s.lang.take(MAX_NAME)).put("url", s.url)
+        .put("headers", JSONObject(s.headers as Map<*, *>))
 
     private fun headers(h: Map<String, String>?): JSONObject? {
         if (h.isNullOrEmpty()) return null

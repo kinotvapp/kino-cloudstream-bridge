@@ -73,10 +73,12 @@ class OpsJsonTest {
     }
 
     private val events = CopyOnWriteArrayList<String>()
+    /** False simulates a binder that refuses the event. */
+    @Volatile private var emitOk = true
 
     private fun op(op: String, args: JSONObject, vararg apis: MainAPI): String = runBlocking {
         val req = CsWire.parseOpRequest(CsWire.opRequest(op, "c1", "cloudstream-fx", 10_000, args))!!
-        ProviderOps.run(req, { events += it }) { apis.toList() }
+        ProviderOps.run(req, { emitOk && events.add(it) }) { apis.toList() }
     }
 
     private fun load(api: FakeApi): JSONObject = JSONObject(op(CsWire.Op.LOAD, JSONObject().put("provider", 0).put("url", "/t/1"), api))
@@ -281,13 +283,86 @@ class OpsJsonTest {
 
     @Test fun `a long series is rebuilt lean instead of failing`() {
         val api = FakeApi().apply {
-            onLoad = { url -> newTvSeriesLoadResponse("S", url, TvType.TvSeries, (1..3000).map { i -> newEpisode("/e/$i") { episode = i; description = "d".repeat(400) } }) }
+            onLoad = { url -> newTvSeriesLoadResponse("S", url, TvType.TvSeries, (1..1000).map { i -> newEpisode("/e/$i") { episode = i; description = "d".repeat(400) } }) }
         }
         val o = load(api)
         assertTrue(o.toString().length <= ProviderOps.LOAD_LEAN_ABOVE_CHARS)
-        assertEquals(3000, o.getJSONArray("episodes").length())
+        assertTrue(ProviderOps.LOAD_LEAN_ABOVE_CHARS < com.kino.csbridge.BridgeService.MAX_RESULT_CHARS)
+        assertEquals(1000, o.getJSONArray("episodes").length())
         val e = o.getJSONArray("episodes").getJSONObject(0)
         assertFalse(e.has("description")); assertEquals(1, e.getInt("episode"))
     }
 
+
+    @Test fun `the largest legal search and mainPage answers stay under the result cap`() {
+        val long = "n".repeat(500)
+        val api = FakeApi().apply {
+            onSearch = { _, _ -> (1..200).map { newMovieSearchResponse(long, "/m/$it" + "u".repeat(300)) { posterUrl = "https://img.example/" + "p".repeat(300) } } }
+            onMainPage = { _, _ ->
+                @Suppress("DEPRECATION_ERROR")
+                HomePageResponse((1..30).map { r -> HomePageList(long, (1..200).map { newMovieSearchResponse(long, "/m/$r/$it") }) }, true)
+            }
+        }
+        val search = op(CsWire.Op.SEARCH, JSONObject().put("provider", 0).put("query", "x"), api)
+        val page = op(CsWire.Op.MAIN_PAGE, JSONObject().put("provider", 0).put("index", 0).put("page", 1), api)
+        assertTrue(search.length.toString(), search.length < com.kino.csbridge.BridgeService.MAX_RESULT_CHARS)
+        assertTrue(page.length.toString(), page.length < com.kino.csbridge.BridgeService.MAX_RESULT_CHARS)
+        assertEquals(30, JSONObject(page).getJSONArray("rows").length())
+    }
+
+    @Test fun `peer-to-peer titles and episodes are dropped too`() {
+        val api = FakeApi().apply {
+            onSearch = { _, _ ->
+                listOf(newMovieSearchResponse("T", "/t/1", TvType.Torrent), newMovieSearchResponse("M", "magnet:?xt=urn:btih:x", fix = false),
+                    newMovieSearchResponse("F", "https://t.example/a.torrent"), newMovieSearchResponse("OK", "/ok"))
+            }
+        }
+        val items = JSONObject(op(CsWire.Op.SEARCH, JSONObject().put("provider", 0).put("query", "x"), api)).getJSONArray("items")
+        assertEquals(1, items.length()); assertEquals("OK", items.getJSONObject(0).getString("name"))
+        api.onLoad = { url -> newMovieLoadResponse("M", url, TvType.Movie, "magnet:?xt=urn:btih:x") }
+        assertEquals(0, load(api).getJSONArray("episodes").length())
+        api.onLoad = { url ->
+            newTvSeriesLoadResponse("S", url, TvType.TvSeries, listOf(newEpisode("magnet:?xt=urn:btih:y", fix = false), newEpisode("https://t.example/e.torrent"), newEpisode("/e/1")))
+        }
+        val eps = load(api).getJSONArray("episodes")
+        assertEquals(1, eps.length()); assertEquals("https://fake.example/e/1", eps.getJSONObject(0).getString("data"))
+    }
+
+    @Test fun `index and page must be integers`() {
+        val api = FakeApi()
+        assertEquals(CsWire.Err.BAD_REQUEST, CsWire.errorOf(op(CsWire.Op.MAIN_PAGE, JSONObject().put("provider", 0).put("index", 1.7).put("page", 1), api))!!.first)
+        assertEquals(CsWire.Err.BAD_REQUEST, CsWire.errorOf(op(CsWire.Op.MAIN_PAGE, JSONObject().put("provider", 0).put("index", 0).put("page", 1.5), api))!!.first)
+    }
+
+    @Test fun `an oversized event is dropped and a refused event is not counted`() {
+        val api = FakeApi().apply {
+            onLinks = { _, _, cb ->
+                cb(newExtractorLink("S", "big", "https://cdn.example/" + "a".repeat(8150)) { referer = "https://r.example/" + "b".repeat(8150) })
+                cb(newExtractorLink("S", "ok", "https://cdn.example/ok.mp4"))
+                true
+            }
+        }
+        val done = JSONObject(op(CsWire.Op.LOAD_LINKS, JSONObject().put("provider", 0).put("data", "d"), api))
+        assertEquals(1, done.getInt("links")); assertEquals(1, events.size)
+        assertEquals("ok", JSONObject(events[0]).getString("name"))
+        events.clear(); emitOk = false
+        val refused = JSONObject(op(CsWire.Op.LOAD_LINKS, JSONObject().put("provider", 0).put("data", "d"), api))
+        assertEquals(0, refused.getInt("links")); assertTrue(events.isEmpty())
+    }
+
+    /** A plugin link whose url getter answers https once, then a magnet. */
+    @Suppress("DEPRECATION")
+    class ShiftyLink : ExtractorLink(source = "S", name = "n", url = "https://cdn.example/a.mp4", referer = "", quality = 720,
+        type = ExtractorLinkType.VIDEO) {
+        var reads = 0
+        override val url: String get() = if (reads++ == 0) "https://cdn.example/a.mp4" else "magnet:?xt=urn:btih:z"
+    }
+
+    @Test fun `a link is read once, so the filter and the event see the same url`() {
+        val link = ShiftyLink()
+        val api = FakeApi().apply { onLinks = { _, _, cb -> cb(link); true } }
+        op(CsWire.Op.LOAD_LINKS, JSONObject().put("provider", 0).put("data", "d"), api)
+        assertEquals(1, link.reads)
+        assertEquals("https://cdn.example/a.mp4", JSONObject(events.single()).getString("url"))
+    }
 }

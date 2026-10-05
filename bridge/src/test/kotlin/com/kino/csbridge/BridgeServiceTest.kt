@@ -9,6 +9,7 @@ import com.kino.csbridge.contract.IHttpReply
 import com.kino.csbridge.contract.IReply
 import kotlinx.coroutines.awaitCancellation
 import org.json.JSONObject
+import com.lagradost.cloudstream3.newMovieSearchResponse
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -51,7 +52,7 @@ class BridgeServiceTest {
     private fun req(op: String, callId: String = "c1", plugin: String = "cloudstream-x", deadline: Long = 5000) =
         CsWire.opRequest(op, callId, plugin, deadline, JSONObject())
 
-    @After fun tearDown() { HostLink.host = null }
+    @After fun tearDown() { HostLink.host = null; com.kino.csbridge.ops.PluginWork.resetForTest() }
 
     @Test fun `hello with another protocol answers protocol error`() {
         val s = bind(true)
@@ -284,5 +285,88 @@ class BridgeServiceTest {
         Thread.sleep(300)
         assertEquals(1, r.dones.size)
         assertTrue(r.events.isEmpty())
+    }
+
+    /** search() blocks its thread on [release] (no suspension point); [entered] counts calls that started. */
+    private class StuckSearchApi(val release: CountDownLatch) : com.lagradost.cloudstream3.MainAPI() {
+        override var name = "Stuck"
+        val entered = java.util.concurrent.atomic.AtomicInteger()
+        override suspend fun search(query: String, page: Int): com.lagradost.cloudstream3.SearchResponseList? {
+            entered.incrementAndGet()
+            release.await(20, TimeUnit.SECONDS)
+            return com.lagradost.cloudstream3.newSearchResponseList(emptyList())
+        }
+    }
+
+    private class QuickApi : com.lagradost.cloudstream3.MainAPI() {
+        override var name = "Quick"
+        override suspend fun search(query: String, page: Int) =
+            com.lagradost.cloudstream3.newSearchResponseList(listOf(newMovieSearchResponse("hit", "https://q.example/1")))
+    }
+
+    private fun search(plugin: String, callId: String, deadline: Long) =
+        CsWire.opRequest(CsWire.Op.SEARCH, callId, plugin, deadline, JSONObject().put("provider", 0).put("query", "x"))
+
+    @Test fun `more stuck plugins than the plugin pool still leave every done on time, and a stuck plugin turns busy`() {
+        val pool = 4
+        com.kino.csbridge.ops.PluginWork.dispatcher = kotlinx.coroutines.Dispatchers.IO.limitedParallelism(pool)
+        val s = bind(true); val svc = service!!
+        val release = CountDownLatch(1)
+        val stuck = StuckSearchApi(release)
+        val quick = QuickApi()
+        svc.runOp = { req, _, emit -> com.kino.csbridge.ops.ProviderOps.run(req, emit) { listOf(if (req.pluginId == "cloudstream-ok") quick else stuck) } }
+        try {
+            // 6 stuck ops on 6 plugins: the pool (4) fills, two wait in its queue. Every one is answered at its deadline.
+            val replies = (1..6).map { i -> FakeReply().also { s.call(search("cloudstream-s$i", "s$i", 300), null, it) } }
+            val t0 = System.nanoTime()
+            replies.forEach { assertEquals("timeout", CsWire.errorOf(it.await())!!.first) }
+            assertTrue((System.nanoTime() - t0) / 1_000_000 < 2_000)
+            // The healthy plugin cannot run on a full pool, but the service still answers it at its deadline.
+            val h = FakeReply(); val t1 = System.nanoTime()
+            s.call(search("cloudstream-ok", "h1", 300), null, h)
+            assertEquals("timeout", CsWire.errorOf(h.await())!!.first)
+            assertTrue((System.nanoTime() - t1) / 1_000_000 < 1_500)
+
+            // One plugin with 3 leaked tasks is busy: answered at once, its code not started.
+            release.countDown(); Thread.sleep(300)
+            val release2 = CountDownLatch(1)
+            val stuck2 = StuckSearchApi(release2)
+            svc.runOp = { req, _, emit -> com.kino.csbridge.ops.ProviderOps.run(req, emit) { listOf(if (req.pluginId == "cloudstream-ok") quick else stuck2) } }
+            (1..3).map { i -> FakeReply().also { s.call(search("cloudstream-b", "b$i", 200), null, it) } }.forEach { it.await() }
+            assertEquals(3, com.kino.csbridge.ops.PluginWork.leakedCount("cloudstream-b"))
+            val busy = FakeReply(); val t2 = System.nanoTime()
+            s.call(search("cloudstream-b", "b4", 5_000), null, busy)
+            assertEquals(CsWire.Err.TIMEOUT to "busy", CsWire.errorOf(busy.await()))
+            assertTrue((System.nanoTime() - t2) / 1_000_000 < 500)
+            assertEquals(3, stuck2.entered.get())
+            // The healthy plugin, with a free slot, gets its real answer.
+            val ok = FakeReply(); s.call(search("cloudstream-ok", "h2", 3_000), null, ok)
+            assertEquals("hit", JSONObject(ok.await()).getJSONArray("items").getJSONObject(0).getString("name"))
+            // Once the stuck code returns, the plugin is no longer busy.
+            release2.countDown(); Thread.sleep(300)
+            assertEquals(0, com.kino.csbridge.ops.PluginWork.leakedCount("cloudstream-b"))
+        } finally {
+            release.countDown()
+        }
+    }
+
+    @Test fun `a done refused with DeadObjectException on a live binder is retried once as too_large`() {
+        val s = bind(true); val svc = service!!
+        svc.runOp = { _, _, _ -> "{}" }
+        val calls = CopyOnWriteArrayList<String>()
+        val latch = CountDownLatch(2)
+        val r = object : IReply.Stub() {
+            override fun event(e: String) {}
+            override fun done(j: String) { calls += j; latch.countDown(); if (calls.size == 1) throw android.os.DeadObjectException() }
+        }
+        s.call(req(CsWire.Op.SEARCH), null, r)
+        assertTrue(latch.await(5, TimeUnit.SECONDS)); Thread.sleep(200)
+        assertEquals(2, calls.size)
+        assertEquals("{}", calls[0]); assertEquals("too_large", CsWire.errorOf(calls[1])!!.first)
+    }
+
+    @Test fun `the result cap leaves room for two dones in binder's oneway space`() {
+        // 2 bytes a char in a parcel; about 508 KB of async space for every oneway call to Kino.
+        assertTrue(BridgeService.MAX_RESULT_CHARS * 2 * 2 < 508 * 1024)
     }
 }

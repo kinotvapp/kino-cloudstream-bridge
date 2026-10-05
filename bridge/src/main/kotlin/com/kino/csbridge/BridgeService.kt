@@ -32,10 +32,17 @@ class BridgeService : Service() {
     internal var callerCheck: (Int) -> Boolean = { uid -> CallerCheck.isKino(this, uid) }
 
     /** The op runner; tests swap it to simulate silent or throwing ops. */
-    internal var runOp: suspend (CsWire.OpRequest, ParcelFileDescriptor?, (String) -> Unit) -> String =
+    internal var runOp: suspend (CsWire.OpRequest, ParcelFileDescriptor?, (String) -> Boolean) -> String =
         { req, payload, emit -> Ops.run(this, req, payload, emit) }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    /**
+     * Op bodies and replies. Plugin code never runs here (it runs on PluginWork's own pool), so stuck plugins cannot take
+     * these threads; a view of IO with its own limit, apart from the plugin pool's.
+     */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(SERVICE_THREADS))
+    /** Deadline timers: never blocked by anything, so a deadline always fires. */
+    private val timers = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     internal val jobs = ConcurrentHashMap<String, Job>()
 
     internal val binder = object : IBridge.Stub() {
@@ -70,7 +77,7 @@ class BridgeService : Service() {
                     val self = coroutineContext.job
                     ctx.job = self // the HTTP shim stops waiting on Kino once this job ends
                     val fired = AtomicBoolean(false)
-                    val timer = scope.launch { delay(req.deadlineMs); fired.set(true); self.cancel() }
+                    val timer = timers.launch { delay(req.deadlineMs); fired.set(true); self.cancel() }
                     val answer = try {
                         runOp(req, payload) { ev -> safeEvent(reply, ev) }
                     } catch (e: CancellationException) {
@@ -113,6 +120,7 @@ class BridgeService : Service() {
 
     override fun onDestroy() {
         scope.cancel()
+        timers.cancel()
         super.onDestroy()
     }
 
@@ -123,22 +131,34 @@ class BridgeService : Service() {
 
     private fun incompatible(e: Throwable) = CsWire.error(CsWire.Err.INCOMPATIBLE, describe(e))
 
-    /** Exactly one `done` reaches Kino: an oversized or Binder-rejected result becomes a short too_large error. */
+    /**
+     * Exactly one `done` reaches Kino: an oversized or Binder-rejected result becomes a short too_large error. A
+     * DeadObjectException on a live binder is not a dead peer: libbinder reports an exhausted oneway buffer that way, so
+     * it gets the same single too_large retry (on a truly dead binder the retry fails harmlessly).
+     */
     private fun safeDone(r: IReply, json: String) {
         val out = if (json.length > MAX_RESULT_CHARS) TOO_LARGE else json
         try {
             r.done(out)
         } catch (_: DeadObjectException) {
+            if (out !== TOO_LARGE && r.asBinder().isBinderAlive) try { r.done(TOO_LARGE) } catch (_: RemoteException) {}
         } catch (_: RemoteException) {
             if (out !== TOO_LARGE) try { r.done(TOO_LARGE) } catch (_: RemoteException) {}
         }
     }
-    private fun safeEvent(r: IReply, json: String) { try { r.event(json) } catch (_: RemoteException) {} }
+
+    /** True when the event left this process; a failed one is not counted as sent. */
+    private fun safeEvent(r: IReply, json: String): Boolean = try { r.event(json); true } catch (_: RemoteException) { false }
 
     companion object {
         private const val ID_PREFIX = "cloudstream-"
 
-        private const val MAX_RESULT_CHARS = 512 * 1024
+        /**
+         * A String parcel is 2 bytes a char; oneway transactions share about 508 KB of Kino's binder space. 120K chars is
+         * about 240 KB, so two concurrent dones still fit. Larger results need a pipe (a separate contract task).
+         */
+        internal const val MAX_RESULT_CHARS = 120_000
+        private const val SERVICE_THREADS = 16
         private val TOO_LARGE = CsWire.error(CsWire.Err.TOO_LARGE, "result too large")
         private val QUERY_OR_FRAGMENT = Regex("[?#]\\S*")
 

@@ -39,7 +39,7 @@ class OpsInstallTest {
 
     private fun op(op: String, args: JSONObject = JSONObject(), payload: File? = null, id: String = "cloudstream-fx") = runBlocking {
         val req = CsWire.parseOpRequest(CsWire.opRequest(op, "c1", id, 5000, args))!!
-        Ops.run(context, req, payload?.let { ParcelFileDescriptor.open(it, ParcelFileDescriptor.MODE_READ_ONLY) }) {}
+        Ops.run(context, req, payload?.let { ParcelFileDescriptor.open(it, ParcelFileDescriptor.MODE_READ_ONLY) }) { true }
     }
 
     @Test fun `installPlugin answers the PROTOCOL shape and listPlugins and hello show id and sha`() {

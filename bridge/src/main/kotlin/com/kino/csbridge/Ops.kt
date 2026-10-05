@@ -3,6 +3,7 @@ package com.kino.csbridge
 import android.content.Context
 import android.os.ParcelFileDescriptor
 import com.kino.csbridge.contract.CsWire
+import com.kino.csbridge.ops.PluginWork
 import com.kino.csbridge.ops.ProviderOps
 import com.kino.csbridge.plugins.PluginRegistry
 import com.lagradost.cloudstream3.MainAPI
@@ -28,13 +29,21 @@ object Ops {
      */
     fun helloPlugins(context: Context): List<CsWire.HelloPlugin> = registry(context).stored()
 
-    /** Runs one op and returns its `done` JSON. [emit] sends `event` JSON. May throw; the service maps throwables to errors. */
-    suspend fun run(context: Context, req: CsWire.OpRequest, payload: ParcelFileDescriptor?, emit: (String) -> Unit): String = try {
+    /**
+     * Runs one op and returns its `done` JSON. [emit] sends `event` JSON and says whether it left the process. May throw;
+     * the service maps throwables to errors. Every op that can run plugin code (install's load(), remove's beforeUnload(),
+     * the provider ops) runs on the plugin pool ([PluginWork]) and is answered `timeout` "busy" at once for a plugin with
+     * too many tasks stuck in blocking code; listPlugins runs no plugin code.
+     */
+    suspend fun run(context: Context, req: CsWire.OpRequest, payload: ParcelFileDescriptor?, emit: (String) -> Boolean): String = try {
         val reg = registry(context)
         when (req.op) {
             CsWire.Op.LIST -> JSONObject().put("plugins", CsWire.helloPluginsToJson(reg.stored())).toString()
-            CsWire.Op.INSTALL -> install(reg, req, payload)
-            CsWire.Op.REMOVE -> { reg.remove(req.pluginId); JSONObject().put("ok", true).toString() }
+            CsWire.Op.INSTALL ->
+                if (PluginWork.busy(req.pluginId)) ProviderOps.BUSY else PluginWork.run(req.pluginId) { install(reg, req, payload) }
+            CsWire.Op.REMOVE -> if (PluginWork.busy(req.pluginId)) ProviderOps.BUSY else PluginWork.run(req.pluginId) {
+                reg.remove(req.pluginId); JSONObject().put("ok", true).toString()
+            }
             in ProviderOps.OPS -> ProviderOps.run(req, emit) { reg.providers(req.pluginId) }
             else -> CsWire.error(CsWire.Err.BAD_REQUEST, "op")
         }
