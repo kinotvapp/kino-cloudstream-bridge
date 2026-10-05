@@ -3,6 +3,7 @@ package com.kino.csbridge
 import android.content.Context
 import android.os.ParcelFileDescriptor
 import com.kino.csbridge.contract.CsWire
+import com.kino.csbridge.ops.ProviderOps
 import com.kino.csbridge.plugins.PluginRegistry
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.TvType
@@ -10,7 +11,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * Dispatch of the wire ops. Task 6 replaces the provider ops; the service only depends on [run] and [helloPlugins].
+ * Dispatch of the wire ops; the service only depends on [run] and [helloPlugins]. The provider ops live in
+ * [ProviderOps], which finds providers only through the registry's per-plugin list (never by name: names collide).
  */
 object Ops {
     /** The process-wide registry; tests set it to one whose loader can run on the JVM. */
@@ -33,7 +35,8 @@ object Ops {
             CsWire.Op.LIST -> JSONObject().put("plugins", CsWire.helloPluginsToJson(reg.stored())).toString()
             CsWire.Op.INSTALL -> install(reg, req, payload)
             CsWire.Op.REMOVE -> { reg.remove(req.pluginId); JSONObject().put("ok", true).toString() }
-            else -> CsWire.error(CsWire.Err.NOT_INSTALLED, "plugin")
+            in ProviderOps.OPS -> ProviderOps.run(req, emit) { reg.providers(req.pluginId) }
+            else -> CsWire.error(CsWire.Err.BAD_REQUEST, "op")
         }
     } catch (e: PluginRegistry.RegistryException) {
         CsWire.error(e.code, e.message ?: e.code)

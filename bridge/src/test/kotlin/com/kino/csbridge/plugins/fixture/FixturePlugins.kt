@@ -2,6 +2,8 @@ package com.kino.csbridge.plugins.fixture
 
 import android.content.Context
 import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.SearchResponse
+import com.lagradost.cloudstream3.newMovieSearchResponse
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.mainPageOf
 import com.lagradost.cloudstream3.plugins.BasePlugin
@@ -21,6 +23,7 @@ class FixtureApi : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Movie, TvType.Torrent)
     override val mainPage = mainPageOf("/movies" to "Películas")
+    override suspend fun search(query: String): List<SearchResponse> = listOf(newMovieSearchResponse("Hit $query", "/m/1"))
 }
 
 class FixtureExtractor : ExtractorApi() {

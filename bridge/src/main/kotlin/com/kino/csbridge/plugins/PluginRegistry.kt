@@ -273,11 +273,15 @@ class PluginRegistry(
     /** By identity against what this plugin registered: upstream's removePluginMapping compares with equals(). */
     private fun unregister(plugin: BasePlugin?, path: String, providers: List<MainAPI>, extractors: List<ExtractorApi>, actions: List<VideoClickAction>) {
         val p = identitySet(providers); val x = identitySet(extractors); val a = identitySet(actions)
-        if (p.isNotEmpty()) {
-            APIHolder.apis.withLock { APIHolder.apis = APIHolder.apis.filter { it !in p } }
-            APIHolder.apiMap = null // rebuilt from `apis` on the next name lookup
+        // One allProviders critical section, the lock getApiFromNameNull holds while it pairs apiMap with apis: a
+        // concurrent name lookup sees either the old list and map or the new list with no map, never a mix.
+        APIHolder.allProviders.withLock {
+            if (p.isNotEmpty()) {
+                APIHolder.apis.withLock { APIHolder.apis = APIHolder.apis.filter { it !in p } }
+                APIHolder.apiMap = null // rebuilt from `apis` on the next name lookup
+            }
+            APIHolder.allProviders.removeAll { it in p }
         }
-        APIHolder.allProviders.withLock { APIHolder.allProviders.removeAll { it in p } }
         extractorApis.withLock { extractorApis.removeAll { it in x } }
         VideoClickActionHolder.allVideoClickActions.withLock { VideoClickActionHolder.allVideoClickActions.removeAll { it in a } }
         synchronized(PluginManager.plugins) { if (PluginManager.plugins[path] === plugin) PluginManager.plugins.remove(path) }

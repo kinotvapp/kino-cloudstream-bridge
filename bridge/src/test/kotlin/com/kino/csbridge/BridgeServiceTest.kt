@@ -251,4 +251,38 @@ class BridgeServiceTest {
         assertTrue(a.dones.isEmpty())
         s.cancel("c1"); a.await()
     }
+
+    /** Blocks its thread (no suspension point, like Jsoup on a slow socket), then reports a link and returns. */
+    private class BlockingApi(val release: CountDownLatch) : com.lagradost.cloudstream3.MainAPI() {
+        override var name = "Blocking"
+        override var mainUrl = "https://blocking.example"
+        val returned = CountDownLatch(1)
+        override suspend fun loadLinks(
+            data: String, isCasting: Boolean, subtitleCallback: (com.lagradost.cloudstream3.SubtitleFile) -> Unit,
+            callback: (com.lagradost.cloudstream3.utils.ExtractorLink) -> Unit,
+        ): Boolean {
+            release.await(10, TimeUnit.SECONDS)
+            callback(com.lagradost.cloudstream3.utils.newExtractorLink("s", "n", "https://cdn.example/v.mp4",
+                com.lagradost.cloudstream3.utils.ExtractorLinkType.VIDEO))
+            returned.countDown()
+            return true
+        }
+    }
+
+    @Test fun `a plugin blocked past the deadline is answered timeout on time, and its late return sends nothing`() {
+        val s = bind(true); val svc = service!!
+        val release = CountDownLatch(1)
+        val api = BlockingApi(release)
+        svc.runOp = { req, _, emit -> com.kino.csbridge.ops.ProviderOps.run(req, emit) { listOf(api) } }
+        val r = FakeReply()
+        val t0 = System.nanoTime()
+        s.call(CsWire.opRequest(CsWire.Op.LOAD_LINKS, "c1", "cloudstream-x", 300, JSONObject().put("provider", 0).put("data", "d")), null, r)
+        assertEquals("timeout", CsWire.errorOf(r.await())!!.first)
+        assertTrue("done took too long", (System.nanoTime() - t0) / 1_000_000 < 2_000)
+        release.countDown()
+        assertTrue(api.returned.await(5, TimeUnit.SECONDS))
+        Thread.sleep(300)
+        assertEquals(1, r.dones.size)
+        assertTrue(r.events.isEmpty())
+    }
 }

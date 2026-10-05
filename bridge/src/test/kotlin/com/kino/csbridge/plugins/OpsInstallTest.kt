@@ -79,4 +79,16 @@ class OpsInstallTest {
         assertEquals(CsWire.Err.BAD_REQUEST,
             CsWire.errorOf(op(CsWire.Op.INSTALL, JSONObject().put("sha256", DexFixtures.sha256(f)), f, id = "cloudstream-UPPER"))!!.first)
     }
+
+    @Test fun `provider ops find the provider through the registry by plugin id and index`() {
+        val f = DexFixtures.cs3(File.createTempFile("fixture", ".cs3"), listOf(DexFixtures.currentEpisodeDex()),
+            DexFixtures.manifest("Cuevana", FixturePlugin::class.java.name, 7))
+        op(CsWire.Op.INSTALL, JSONObject().put("sha256", DexFixtures.sha256(f)), f)
+        val items = JSONObject(op(CsWire.Op.SEARCH, JSONObject().put("provider", 0).put("query", "x"))).getJSONArray("items")
+        assertEquals("Hit x", items.getJSONObject(0).getString("name"))
+        assertEquals("https://fixture.example/m/1", items.getJSONObject(0).getString("url"))
+        assertEquals(CsWire.Err.NOT_INSTALLED, CsWire.errorOf(op(CsWire.Op.SEARCH, JSONObject().put("provider", 1).put("query", "x")))!!.first)
+        assertEquals(CsWire.Err.NOT_INSTALLED,
+            CsWire.errorOf(op(CsWire.Op.SEARCH, JSONObject().put("provider", 0).put("query", "x"), id = "cloudstream-other"))!!.first)
+    }
 }
