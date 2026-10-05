@@ -20,7 +20,6 @@ android {
         versionCode = (project.findProperty("bridgeVersionCode") as String?)?.toInt() ?: 1
         versionName = (project.findProperty("bridgeVersionName") as String?) ?: "0.1.0"
         buildConfigField("String", "UPSTREAM_COMMIT", "\"$upstreamCommit\"")
-        buildConfigField("String", "KOTLIN_VERSION", "\"${KotlinVersion.CURRENT}\"")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     testOptions { unitTests.isIncludeAndroidResources = true }

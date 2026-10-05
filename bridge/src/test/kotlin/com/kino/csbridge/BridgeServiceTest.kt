@@ -128,6 +128,118 @@ class BridgeServiceTest {
         assertEquals("timeout", CsWire.errorOf(r.await())!!.first)
     }
 
+    @Test fun `a done too large for binder gets exactly one too_large fallback`() {
+        val s = bind(true); val svc = service!!
+        svc.runOp = { _, _, _ -> "{}" }
+        val calls = CopyOnWriteArrayList<String>()
+        val latch = CountDownLatch(2)
+        val r = object : IReply.Stub() {
+            override fun event(e: String) {}
+            override fun done(j: String) { calls += j; latch.countDown(); if (calls.size == 1) throw android.os.TransactionTooLargeException() }
+        }
+        s.call(req(CsWire.Op.SEARCH), null, r)
+        assertTrue(latch.await(5, TimeUnit.SECONDS)); Thread.sleep(200)
+        assertEquals(2, calls.size)
+        assertEquals("too_large", CsWire.errorOf(calls[1])!!.first)
+    }
+
+    @Test fun `a result over the cap is replaced by too_large`() {
+        val s = bind(true); val svc = service!!
+        svc.runOp = { _, _, _ -> "x".repeat(600 * 1024) }
+        val r = FakeReply(); s.call(req(CsWire.Op.SEARCH), null, r)
+        assertEquals("too_large", CsWire.errorOf(r.await())!!.first)
+    }
+
+    @Test fun `a stray CancellationException from the plugin is plugin_error`() {
+        val s = bind(true); val svc = service!!
+        svc.runOp = { _, _, _ -> throw kotlinx.coroutines.CancellationException("plugin") }
+        val r = FakeReply(); s.call(req(CsWire.Op.SEARCH), null, r)
+        assertEquals("plugin_error", CsWire.errorOf(r.await())!!.first)
+    }
+
+    @Test fun `a plugin's own inner timeout before our deadline is plugin_error`() {
+        val s = bind(true); val svc = service!!
+        svc.runOp = { _, _, _ -> kotlinx.coroutines.withTimeout(20) { awaitCancellation() } }
+        val r = FakeReply(); s.call(req(CsWire.Op.SEARCH, deadline = 5000), null, r)
+        assertEquals("plugin_error", CsWire.errorOf(r.await())!!.first)
+    }
+
+    @Test fun `only ABI drift errors are incompatible`() {
+        val s = bind(true); val svc = service!!
+        val cases = listOf<Pair<Throwable, String>>(
+            NoSuchFieldError("f") to "incompatible", NoClassDefFoundError("c") to "incompatible",
+            AbstractMethodError("m") to "incompatible", IncompatibleClassChangeError("i") to "incompatible",
+            ExceptionInInitializerError("e") to "plugin_error", UnsatisfiedLinkError("u") to "plugin_error",
+        )
+        cases.forEachIndexed { i, (t, code) ->
+            svc.runOp = { _, _, _ -> throw t }
+            val r = FakeReply(); s.call(req(CsWire.Op.SEARCH, "k$i"), null, r)
+            assertEquals(t.toString(), code, CsWire.errorOf(r.await())!!.first)
+        }
+    }
+
+    @Test fun `listPlugins accepts a non-plugin id, other ops need the cloudstream prefix`() {
+        val s = bind(true)
+        val r = FakeReply(); s.call(req(CsWire.Op.LIST, plugin = "kino"), null, r)
+        assertNotNull(JSONObject(r.await()).optJSONArray("plugins"))
+        val r2 = FakeReply(); s.call(req(CsWire.Op.SEARCH, "c2", plugin = "kino"), null, r2)
+        assertEquals("bad_request", CsWire.errorOf(r2.await())!!.first)
+    }
+
+    @Test fun `url queries and fragments never reach the done message`() {
+        val s = bind(true); val svc = service!!
+        svc.runOp = { _, _, _ -> throw java.io.IOException("GET https://h.example/p?token=SECRET&a=1 failed, see https://h.example/x#frag") }
+        val r = FakeReply(); s.call(req(CsWire.Op.SEARCH), null, r)
+        val msg = CsWire.errorOf(r.await())!!.second
+        assertTrue(msg, !msg.contains("SECRET") && !msg.contains("frag") && msg.contains("https://h.example/p"))
+    }
+
+    @Test fun `hello reports the runtime kotlin version`() {
+        val s = bind(true)
+        assertEquals(KotlinVersion.CURRENT.toString(), JSONObject(s.hello(1, FakeHost())).getString("kotlinVersion"))
+    }
+
+    @Test fun `cancel from an untrusted caller is a no-op`() {
+        val s = bind(true); val svc = service!!
+        val started = CountDownLatch(1)
+        svc.runOp = { _, _, _ -> started.countDown(); awaitCancellation() }
+        val r = FakeReply(); s.call(req(CsWire.Op.SEARCH), null, r)
+        assertTrue(started.await(5, TimeUnit.SECONDS))
+        svc.callerCheck = { false }
+        s.cancel("c1"); Thread.sleep(200)
+        assertTrue(r.dones.isEmpty())
+        svc.callerCheck = { true }; s.cancel("c1"); r.await()
+    }
+
+    @Test fun `onUnbind cancels every running call once and clears the host`() {
+        val s = bind(true); val svc = service!!
+        val started = CountDownLatch(2)
+        svc.runOp = { _, _, _ -> started.countDown(); awaitCancellation() }
+        s.hello(1, FakeHost())
+        val a = FakeReply(); val b = FakeReply()
+        s.call(req(CsWire.Op.SEARCH, "a1"), null, a); s.call(req(CsWire.Op.SEARCH, "b1"), null, b)
+        assertTrue(started.await(5, TimeUnit.SECONDS))
+        svc.onUnbind(Intent())
+        assertEquals("cancelled", CsWire.errorOf(a.await())!!.first)
+        assertEquals("cancelled", CsWire.errorOf(b.await())!!.first)
+        Thread.sleep(200)
+        assertEquals(1, a.dones.size); assertEquals(1, b.dones.size)
+        assertNull(HostLink.host)
+    }
+
+    private fun closed(p: ParcelFileDescriptor) = try { p.fd; false } catch (_: IllegalStateException) { true }
+
+    @Test fun `the payload is closed on refusal and after a call`() {
+        val s = bind(true); val svc = service!!
+        val p1 = ParcelFileDescriptor.createPipe()[0]
+        val r1 = FakeReply(); s.call(req(CsWire.Op.SEARCH, plugin = "evil"), p1, r1); r1.await()
+        assertTrue(closed(p1))
+        svc.runOp = { _, _, _ -> "{}" }
+        val p2 = ParcelFileDescriptor.createPipe()[0]
+        val r2 = FakeReply(); s.call(req(CsWire.Op.SEARCH, "c2"), p2, r2); r2.await(); Thread.sleep(100)
+        assertTrue(closed(p2))
+    }
+
     @Test fun `a duplicate callId is refused and does not disturb the running call`() {
         val s = bind(true); val svc = service!!
         val started = CountDownLatch(1)
