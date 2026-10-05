@@ -9,7 +9,9 @@ import com.kino.csbridge.contract.IHttpReply
 import com.kino.csbridge.contract.IReply
 import kotlinx.coroutines.awaitCancellation
 import org.json.JSONObject
+import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newMovieSearchResponse
+import com.lagradost.cloudstream3.newTvSeriesLoadResponse
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -34,10 +36,14 @@ class BridgeServiceTest {
     private class FakeReply : IReply.Stub() {
         val dones = CopyOnWriteArrayList<String>()
         val events = CopyOnWriteArrayList<String>()
+        /** Our own copy of each streamed read end, dup'ed at once as a real Binder transaction would hand it over. */
+        val streams = CopyOnWriteArrayList<ParcelFileDescriptor>()
         val first = CountDownLatch(1)
         override fun event(e: String) { events += e }
         override fun done(r: String) { dones += r; first.countDown() }
+        override fun doneStream(result: ParcelFileDescriptor) { streams += result.dup(); first.countDown() }
         fun await(): String { assertTrue("no done within 5s", first.await(5, TimeUnit.SECONDS)); return dones[0] }
+        fun awaitAny() { assertTrue("no done/doneStream within 5s", first.await(5, TimeUnit.SECONDS)) }
     }
 
     private var service: BridgeService? = null
@@ -62,7 +68,7 @@ class BridgeServiceTest {
 
     @Test fun `untrusted caller is refused and the host is not kept`() {
         val s = bind(false)
-        assertEquals("refused", CsWire.errorOf(s.hello(1, FakeHost()))!!.first)
+        assertEquals("refused", CsWire.errorOf(s.hello(CsWire.PROTOCOL_VERSION, FakeHost()))!!.first)
         assertNull(HostLink.host)
         val r = FakeReply()
         s.call(req(CsWire.Op.LIST), null, r)
@@ -137,6 +143,7 @@ class BridgeServiceTest {
         val r = object : IReply.Stub() {
             override fun event(e: String) {}
             override fun done(j: String) { calls += j; latch.countDown(); if (calls.size == 1) throw android.os.TransactionTooLargeException() }
+            override fun doneStream(result: ParcelFileDescriptor) = error("not expected")
         }
         s.call(req(CsWire.Op.SEARCH), null, r)
         assertTrue(latch.await(5, TimeUnit.SECONDS)); Thread.sleep(200)
@@ -144,11 +151,103 @@ class BridgeServiceTest {
         assertEquals("too_large", CsWire.errorOf(calls[1])!!.first)
     }
 
-    @Test fun `a result over the cap is replaced by too_large`() {
+    @Test fun `a result over the stream cap is replaced by too_large in a done`() {
         val s = bind(true); val svc = service!!
-        svc.runOp = { _, _, _ -> "x".repeat(600 * 1024) }
+        // 4.2M chars of 2-byte UTF-8: under 8 MiB as chars, over it as bytes.
+        svc.runOp = { _, _, _ -> "\"" + "ñ".repeat(CsWire.MAX_STREAM_RESULT_BYTES / 2 + 10) + "\"" }
         val r = FakeReply(); s.call(req(CsWire.Op.SEARCH), null, r)
         assertEquals("too_large", CsWire.errorOf(r.await())!!.first)
+        assertTrue(r.streams.isEmpty())
+        svc.runOp = { _, _, _ -> "x".repeat(CsWire.MAX_STREAM_RESULT_BYTES + 1) }
+        val r2 = FakeReply(); s.call(req(CsWire.Op.SEARCH, "c2"), null, r2)
+        assertEquals("too_large", CsWire.errorOf(r2.await())!!.first)
+        assertTrue(r2.streams.isEmpty())
+    }
+
+    /** Waits for every op of the service to end (an op's job ends after its done or its stream write). */
+    private fun awaitIdle(svc: BridgeService, ms: Long = 10_000) = waitUntil("ops still running", ms) { svc.jobs.isEmpty() }
+
+    @Test fun `a result up to the inline cap goes in done, one char more goes through doneStream`() {
+        val s = bind(true); val svc = service!!
+        val inline = "x".repeat(CsWire.MAX_INLINE_RESULT_CHARS)
+        svc.runOp = { _, _, _ -> inline }
+        val r = FakeReply(); s.call(req(CsWire.Op.SEARCH), null, r)
+        assertEquals(inline, r.await())
+        assertTrue(r.streams.isEmpty())
+        val streamed = "y".repeat(CsWire.MAX_INLINE_RESULT_CHARS + 1)
+        svc.runOp = { _, _, _ -> streamed }
+        val r2 = FakeReply(); s.call(req(CsWire.Op.SEARCH, "c2"), null, r2)
+        r2.awaitAny(); awaitIdle(svc)
+        assertTrue(r2.dones.isEmpty())
+        assertEquals(streamed, CsWire.readStreamedResult(r2.streams.single()))
+    }
+
+    /** A series of [episodes] episodes with [descriptionChars]-char descriptions, non-ASCII included. */
+    private class LongSeriesApi(val episodes: Int, val descriptionChars: Int) : com.lagradost.cloudstream3.MainAPI() {
+        override var name = "Long"
+        override var mainUrl = "https://long.example"
+        override suspend fun load(url: String): com.lagradost.cloudstream3.LoadResponse =
+            newTvSeriesLoadResponse("Señal ✓", url, com.lagradost.cloudstream3.TvType.Anime,
+                (1..episodes).map { i -> newEpisode("https://long.example/e/$i") { episode = i; name = "Capítulo $i 😀"; description = "ñ".repeat(descriptionChars) } })
+    }
+
+    @Test fun `a long series load of about 2M chars arrives intact through doneStream`() {
+        val s = bind(true); val svc = service!!
+        val api = LongSeriesApi(episodes = 1_000, descriptionChars = 1_950)
+        svc.runOp = { req, _, emit -> com.kino.csbridge.ops.ProviderOps.run(req, emit) { listOf(api) } }
+        val r = FakeReply()
+        s.call(CsWire.opRequest(CsWire.Op.LOAD, "c1", "cloudstream-x", 20_000, JSONObject().put("provider", 0).put("url", "https://long.example/s")), null, r)
+        r.awaitAny(); awaitIdle(svc)
+        assertTrue(r.dones.isEmpty())
+        val json = CsWire.readStreamedResult(r.streams.single())
+        assertNull(CsWire.errorOf(json))
+        assertTrue("${json.length} chars", json.length > 2_000_000)
+        val o = JSONObject(json)
+        assertEquals("Señal ✓", o.getJSONObject("title").getString("name"))
+        val eps = o.getJSONArray("episodes")
+        assertEquals(1_000, eps.length())
+        assertEquals("ñ".repeat(1_950), eps.getJSONObject(999).getString("description")) // not rebuilt lean
+        assertEquals("Capítulo 1000 😀", eps.getJSONObject(999).getString("name"))
+    }
+
+    @Test fun `a reader that never reads the stream frees the bridge thread at the stream deadline`() {
+        val s = bind(true); val svc = service!!
+        val nio = java.nio.channels.Pipe.open()
+        val ended = CopyOnWriteArrayList<String?>()
+        svc.streamPipes = {
+            StreamPipe(ParcelFileDescriptor.createPipe()[0], java.nio.channels.Channels.newOutputStream(nio.sink()),
+                java.nio.channels.Channels.newInputStream(nio.source()), { err -> ended += err; nio.sink().close() }, { nio.source().close() })
+        }
+        svc.minStreamMs = 300; svc.maxStreamMs = 300
+        svc.runOp = { _, _, _ -> "z".repeat(2 * 1024 * 1024) }
+        val r = FakeReply(); val t0 = System.nanoTime()
+        s.call(req(CsWire.Op.SEARCH), null, r)
+        r.awaitAny(); awaitIdle(svc, 5_000)
+        val ms = (System.nanoTime() - t0) / 1_000_000
+        assertTrue("took $ms ms", ms < 3_000)
+        assertEquals(listOf<String?>("deadline"), ended.toList())
+        assertTrue(r.dones.isEmpty())
+        // Every service thread is free again: four ops at once are all answered.
+        svc.runOp = { _, _, _ -> "{}" }
+        val more = (1..4).map { i -> FakeReply().also { s.call(req(CsWire.Op.SEARCH, "m$i"), null, it) } }
+        more.forEach { assertEquals("{}", it.await()) }
+    }
+
+    @Test fun `a doneStream Binder refuses gets exactly one too_large done`() {
+        val s = bind(true); val svc = service!!
+        svc.runOp = { _, _, _ -> "w".repeat(CsWire.MAX_INLINE_RESULT_CHARS + 1) }
+        val calls = CopyOnWriteArrayList<String>()
+        val latch = CountDownLatch(2)
+        val r = object : IReply.Stub() {
+            override fun event(e: String) {}
+            override fun done(j: String) { calls += j; latch.countDown() }
+            override fun doneStream(result: ParcelFileDescriptor) { calls += "stream"; latch.countDown(); throw android.os.RemoteException("refused") }
+        }
+        s.call(req(CsWire.Op.SEARCH), null, r)
+        assertTrue(latch.await(5, TimeUnit.SECONDS)); Thread.sleep(200)
+        assertEquals("stream", calls[0])
+        assertEquals(2, calls.size)
+        assertEquals("too_large", CsWire.errorOf(calls[1])!!.first)
     }
 
     @Test fun `a stray CancellationException from the plugin is plugin_error`() {
@@ -197,7 +296,7 @@ class BridgeServiceTest {
 
     @Test fun `hello reports the runtime kotlin version`() {
         val s = bind(true)
-        assertEquals(KotlinVersion.CURRENT.toString(), JSONObject(s.hello(1, FakeHost())).getString("kotlinVersion"))
+        assertEquals(KotlinVersion.CURRENT.toString(), JSONObject(s.hello(CsWire.PROTOCOL_VERSION, FakeHost())).getString("kotlinVersion"))
     }
 
     @Test fun `cancel from an untrusted caller is a no-op`() {
@@ -216,7 +315,7 @@ class BridgeServiceTest {
         val s = bind(true); val svc = service!!
         val started = CountDownLatch(2)
         svc.runOp = { _, _, _ -> started.countDown(); awaitCancellation() }
-        s.hello(1, FakeHost())
+        s.hello(CsWire.PROTOCOL_VERSION, FakeHost())
         val a = FakeReply(); val b = FakeReply()
         s.call(req(CsWire.Op.SEARCH, "a1"), null, a); s.call(req(CsWire.Op.SEARCH, "b1"), null, b)
         assertTrue(started.await(5, TimeUnit.SECONDS))
@@ -365,6 +464,7 @@ class BridgeServiceTest {
         val r = object : IReply.Stub() {
             override fun event(e: String) {}
             override fun done(j: String) { calls += j; latch.countDown(); if (calls.size == 1) throw android.os.DeadObjectException() }
+            override fun doneStream(result: ParcelFileDescriptor) = error("not expected")
         }
         s.call(req(CsWire.Op.SEARCH), null, r)
         assertTrue(latch.await(5, TimeUnit.SECONDS)); Thread.sleep(200)
@@ -372,8 +472,8 @@ class BridgeServiceTest {
         assertEquals("{}", calls[0]); assertEquals("too_large", CsWire.errorOf(calls[1])!!.first)
     }
 
-    @Test fun `the result cap leaves room for two dones in binder's oneway space`() {
+    @Test fun `the inline cap leaves room for two dones in binder's oneway space`() {
         // 2 bytes a char in a parcel; about 508 KB of async space for every oneway call to Kino.
-        assertTrue(BridgeService.MAX_RESULT_CHARS * 2 * 2 < 508 * 1024)
+        assertTrue(CsWire.MAX_INLINE_RESULT_CHARS * 2 * 2 < 508 * 1024)
     }
 }

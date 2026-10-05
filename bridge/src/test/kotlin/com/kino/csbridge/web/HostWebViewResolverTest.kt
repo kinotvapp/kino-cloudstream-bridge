@@ -37,12 +37,13 @@ import kotlin.concurrent.thread
 @RunWith(RobolectricTestRunner::class)
 class HostWebViewResolverTest {
     /** A fake Kino: records every webView request and answers with [answer] (null = never answers). */
-    private class FakeHost(@Volatile var answer: ((JSONObject) -> String?)?, val delayMs: Long = 20) : IHost.Stub() {
+    private open class FakeHost(@Volatile var answer: ((JSONObject) -> String?)?, val delayMs: Long = 20) : IHost.Stub() {
         val requests = CopyOnWriteArrayList<JSONObject>()
         override fun request(metaJson: String?, requestBody: ParcelFileDescriptor?, responseSink: ParcelFileDescriptor?, reply: IHttpReply?) =
             error("no HTTP expected here")
         override fun webView(requestJson: String, reply: IReply) {
             val o = JSONObject(requestJson)
+            assertTrue("not a request Kino accepts: $requestJson", CsWire.parseWebViewRequest(requestJson) != null)
             requests += o
             val a = answer?.invoke(o) ?: return
             thread { Thread.sleep(delayMs); reply.done(a) } // oneway: Kino answers later, from another thread
@@ -62,9 +63,16 @@ class HostWebViewResolverTest {
     private fun <T> inCall(c: CallContext = ctx(), block: suspend () -> T): T =
         runBlocking(c + CallContext.threadLocal.asContextElement(c)) { block() }
 
-    private fun found(url: String, headers: Map<String, String> = emptyMap(), cookies: String = "", ua: String = "UA-kino", finalUrl: String = "https://a.example/") =
-        JSONObject().put("request", JSONObject().put("url", url).put("headers", JSONObject(headers as Map<*, *>)))
-            .put("cookies", cookies).put("userAgent", ua).put("finalUrl", finalUrl).toString()
+    /** Kino's v2 reply. */
+    private fun reply(
+        requests: List<CsWire.CapturedRequest> = emptyList(), cookies: Map<String, String> = emptyMap(), ua: String = "UA-kino",
+        finalUrl: String = "https://a.example/", timedOut: Boolean = false,
+    ) = CsWire.webViewReply(CsWire.WebViewReply(requests, cookies, ua, finalUrl, timedOut))
+
+    private fun found(
+        url: String, headers: Map<String, String> = emptyMap(), cookies: Map<String, String> = emptyMap(), ua: String = "UA-kino",
+        finalUrl: String = "https://a.example/", method: String = "GET",
+    ) = reply(listOf(CsWire.CapturedRequest(url, method, headers)), cookies, ua, finalUrl)
 
     @Before fun setUp() {
         WebCookies.clearForTest()
@@ -82,7 +90,7 @@ class HostWebViewResolverTest {
 
     // ---- request shape and limits ---------------------------------------------------------------------------
 
-    @Test fun `request carries call, plugin, url, match, clamped timeout, first-load headers and wantCookies`() {
+    @Test fun `request carries call, plugin, url, match, clamped timeout and first-load headers`() {
         serve { found("https://cdn.example/v/master.m3u8?t=1") }
         inCall {
             WebViewResolver(Regex("""master\.m3u8""")).resolveUsingWebView(
@@ -90,13 +98,14 @@ class HostWebViewResolverTest {
             )
         }
         val o = host.requests.single()
-        assertEquals(setOf("callId", "pluginId", "url", "match", "timeoutMs", "headers", "wantCookies"), o.keys().asSequence().toSet())
+        // No additionalUrls: a single capture, no captureAll / alsoMatch / returnCookiesOnTimeout.
+        assertEquals(setOf("callId", "pluginId", "url", "match", "timeoutMs", "headers"), o.keys().asSequence().toSet())
         assertEquals("call-1", o.getString("callId"))
         assertEquals("cloudstream-x", o.getString("pluginId"))
         assertEquals("https://a.example/embed?id=7", o.getString("url"))
         assertEquals("""(?-i)master\.m3u8""", o.getString("match")) // case-sensitive like upstream (Kino adds IGNORE_CASE)
         assertEquals(25_000L, o.getLong("timeoutMs")) // upstream's 60 s default, cut to Kino's maximum
-        assertTrue(o.getBoolean("wantCookies"))
+        assertTrue(CsWire.parseWebViewRequest(o.toString()) != null) // what Kino accepts
         val h = o.getJSONObject("headers")
         assertEquals("1", h.getString("X-Req"))
         assertEquals("https://r.example/", h.getString("referer"))
@@ -136,10 +145,10 @@ class HostWebViewResolverTest {
     // ---- result mapping -------------------------------------------------------------------------------------
 
     @Test fun `answer maps to upstream's pair, runs the callback, keeps cookies per host and the WebView UA`() {
-        serve { found("https://cdn.example/v/master.m3u8?t=1", headers = mapOf("Referer" to "https://a.example/"), cookies = "cf_clearance=abc; s=1") }
+        serve { found("https://cdn.example/v/master.m3u8?t=1", headers = mapOf("Referer" to "https://a.example/"), cookies = mapOf("cf_clearance" to "abc", "s" to "1")) }
         val seen = CopyOnWriteArrayList<Request>()
         val (req, extra) = inCall {
-            WebViewResolver(Regex("""master\.m3u8"""), additionalUrls = listOf(Regex("."))).resolveUsingWebView("https://a.example/embed") { seen += it; false }
+            WebViewResolver(Regex("""master\.m3u8""")).resolveUsingWebView("https://a.example/embed") { seen += it; false }
         }
         assertEquals("https://cdn.example/v/master.m3u8?t=1", req!!.url.toString())
         assertEquals("GET", req.method)
@@ -166,7 +175,10 @@ class HostWebViewResolverTest {
             "not json",
             found("https://cdn.example/other.mp4"),
             found("http://cdn.example/a.m3u8"),
-            JSONObject().put("request", JSONObject.NULL).put("cookies", "").toString(),
+            reply(), // nothing captured
+            // The v1 shape is not a v2 answer.
+            JSONObject().put("request", JSONObject().put("url", "https://cdn.example/a.m3u8").put("headers", JSONObject()))
+                .put("cookies", "").put("userAgent", "UA").put("finalUrl", "https://a.example/").toString(),
         )
         for (a in answers) {
             serve { a }
@@ -207,9 +219,9 @@ class HostWebViewResolverTest {
     }
 
     /** Kino's cookie-mode answer; the page ends on the requested URL unless [finalUrl] says otherwise. */
-    private fun cfAnswer(clearance: String?, finalUrl: String? = null) = { o: JSONObject ->
-        JSONObject().put("request", JSONObject.NULL).put("cookies", clearance?.let { "cf_clearance=$it; __cf_bm=z" } ?: "")
-            .put("userAgent", "UA-kino").put("finalUrl", finalUrl ?: o.getString("url")).toString()
+    private fun cfAnswer(clearance: String?, finalUrl: String? = null, timedOut: Boolean = false) = { o: JSONObject ->
+        reply(cookies = clearance?.let { mapOf("cf_clearance" to it, "__cf_bm" to "z") } ?: emptyMap(),
+            finalUrl = finalUrl ?: o.getString("url"), timedOut = timedOut)
     }
 
     private fun intercept(killer: CloudflareKiller, chain: FakeChain): Response {
@@ -230,7 +242,10 @@ class HostWebViewResolverTest {
         val o = host.requests.single()
         assertFalse("cookie mode: no match", o.has("match"))
         assertEquals("cf_clearance", o.getString("waitForCookie"))
+        assertTrue(o.getBoolean("returnCookiesOnTimeout"))
+        assertFalse(o.has("captureAll"))
         assertEquals("https://a.example/list?p=2", o.getString("url"))
+        assertTrue(CsWire.parseWebViewRequest(o.toString()) != null)
     }
 
     @Test fun `solved cookies are cached per host, so a new killer of the same plugin opens no page`() {
@@ -355,6 +370,131 @@ class HostWebViewResolverTest {
         assertEquals(mapOf("cf_clearance" to "b"), WebCookies.get("p", "h.example"))
         WebCookies.put("p", "h.example", (1..100).associate { "c$it" to "v" })
         assertEquals(WebCookies.MAX_COOKIES_PER_ENTRY, WebCookies.get("p", "h.example")!!.size)
+    }
+
+    // ---- contract v2: every match, method, cookies on timeout -------------------------------------------------
+
+    private fun captured(url: String, method: String = "GET", headers: Map<String, String> = emptyMap()) = CsWire.CapturedRequest(url, method, headers)
+
+    @Test fun `additionalUrls ask Kino for every match, with alsoMatch and cookies on timeout`() {
+        serve { reply(listOf(captured("https://cdn.example/master.m3u8"))) }
+        inCall {
+            WebViewResolver(Regex("""master\.m3u8"""), additionalUrls = listOf(Regex("""\.vtt"""), Regex("key", RegexOption.IGNORE_CASE)))
+                .resolveUsingWebView("https://a.example/embed")
+        }
+        val o = host.requests.single()
+        assertTrue(o.getBoolean("captureAll"))
+        assertEquals(listOf("""(?-i)\.vtt""", "key"), (0 until o.getJSONArray("alsoMatch").length()).map { o.getJSONArray("alsoMatch").getString(it) })
+        assertTrue(o.getBoolean("returnCookiesOnTimeout"))
+        assertFalse(o.has("waitForCookie"))
+        assertTrue(CsWire.parseWebViewRequest(o.toString()) != null)
+    }
+
+    @Test fun `alsoMatch keeps at most 10 patterns that fit Kino's limit`() {
+        serve { reply(listOf(captured("https://cdn.example/m.m3u8"))) }
+        val extra = listOf(Regex("x".repeat(600))) + (1..12).map { Regex("p$it") }
+        inCall { WebViewResolver(Regex("m3u8"), additionalUrls = extra).resolveUsingWebView("https://a.example/") }
+        val also = host.requests.single().getJSONArray("alsoMatch")
+        assertEquals((1..10).map { "(?-i)p$it" }, (0 until also.length()).map { also.getString(it) })
+    }
+
+    @Test fun `requests map back to upstream's pair with the real method and headers`() {
+        serve {
+            reply(listOf(
+                captured("https://cdn.example/master.m3u8", headers = mapOf("Referer" to "https://a.example/", "Origin" to "https://a.example")),
+                captured("https://cdn.example/sub.vtt", headers = mapOf("X-A" to "1")),
+                captured("https://cdn.example/key", method = "POST", headers = mapOf("Content-Type" to "application/json")),
+                captured("https://cdn.example/other.js"), // matches nothing the plugin asked for
+                captured("http://cdn.example/plain.vtt"), // not https
+            ))
+        }
+        val seen = CopyOnWriteArrayList<String>()
+        val (primary, extras) = inCall {
+            WebViewResolver(Regex("""master\.m3u8"""), additionalUrls = listOf(Regex("""\.vtt"""), Regex("/key")))
+                .resolveUsingWebView("https://a.example/embed") { seen += it.url.toString(); false }
+        }
+        assertEquals("https://cdn.example/master.m3u8", primary!!.url.toString())
+        assertEquals("GET", primary.method)
+        assertEquals("https://a.example", primary.header("Origin"))
+        assertEquals(listOf("https://cdn.example/sub.vtt", "https://cdn.example/key"), extras.map { it.url.toString() })
+        assertEquals("1", extras[0].header("X-A"))
+        assertEquals("POST", extras[1].method)
+        assertEquals("application/json", extras[1].header("Content-Type"))
+        assertEquals(listOf("https://cdn.example/master.m3u8", "https://cdn.example/sub.vtt", "https://cdn.example/key"), seen.toList())
+    }
+
+    @Test fun `a timeout reply with only additional matches gives null and the extras, as upstream's timeout does`() {
+        serve { reply(listOf(captured("https://cdn.example/sub.vtt")), timedOut = true) }
+        val (primary, extras) = inCall {
+            WebViewResolver(Regex("m3u8"), additionalUrls = listOf(Regex("vtt"))).resolveUsingWebView("https://a.example/")
+        }
+        assertNull(primary)
+        assertEquals(listOf("https://cdn.example/sub.vtt"), extras.map { it.url.toString() })
+    }
+
+    @Test fun `a doneStream from Kino is refused, webView answers come in done only`() {
+        host = object : FakeHost(null) {
+            override fun webView(requestJson: String, reply: IReply) {
+                requests += JSONObject(requestJson)
+                thread { reply.doneStream(ParcelFileDescriptor.createPipe()[0]) }
+            }
+        }
+        HostWebViewResolver.host = { host }
+        HostWebViewResolver.callMarginMs = 0; HostWebViewResolver.pageOverheadMs = 0
+        val t0 = System.nanoTime()
+        val r = inCall(ctx(deadlineMs = 3_000)) { WebViewResolver(Regex("m3u8")).resolveUsingWebView("https://a.example/") }
+        assertEquals(null to emptyList<Request>(), r)
+        assertTrue("answered as a failure at once", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0) < 2_000)
+    }
+
+    @Test fun `CloudflareKiller uses the cookies of a timed-out page when cf_clearance is there`() {
+        serve(cfAnswer("late", timedOut = true))
+        val chain = FakeChain(Request.Builder().url("https://a.example/").build(), cfSite("late"))
+        assertEquals(200, intercept(CloudflareKiller(), chain).code)
+        assertEquals("late", WebCookies.get("cloudstream-x", "a.example")!!["cf_clearance"])
+    }
+
+    @Test fun `a timed-out page without cf_clearance is a failed solve`() {
+        serve(cfAnswer(null, timedOut = true))
+        assertEquals(503, intercept(CloudflareKiller(), FakeChain(Request.Builder().url("https://a.example/").build(), cfSite("ok"))).code)
+        intercept(CloudflareKiller(), FakeChain(Request.Builder().url("https://a.example/2").build(), cfSite("ok")))
+        assertEquals("remembered as failed: no second page", 1, host.requests.size)
+    }
+
+    @Test fun `Kino busy is not remembered as a failed solve`() {
+        serve { CsWire.error(CsWire.Err.BUSY, "otra página") }
+        assertEquals(503, intercept(CloudflareKiller(), FakeChain(Request.Builder().url("https://a.example/").build(), cfSite("ok"))).code)
+        serve(cfAnswer("ok"))
+        assertEquals(200, intercept(CloudflareKiller(), FakeChain(Request.Builder().url("https://a.example/2").build(), cfSite("ok"))).code)
+        assertEquals(1, host.requests.size)
+    }
+
+    @Test fun `a solve cut short by the op's end is not remembered as failed`() {
+        HostWebViewResolver.callMarginMs = 0; HostWebViewResolver.pageOverheadMs = 0
+        serve(null) // Kino never answers: the op's deadline ends the wait
+        val c = ctx(deadlineMs = 1_500)
+        CallContext.threadLocal.set(c)
+        val first = try {
+            CloudflareKiller().intercept(FakeChain(Request.Builder().url("https://a.example/").build(), cfSite("ok")))
+        } finally { CallContext.threadLocal.set(null) }
+        assertEquals(503, first.code)
+        serve(cfAnswer("ok"))
+        assertEquals(200, intercept(CloudflareKiller(), FakeChain(Request.Builder().url("https://a.example/2").build(), cfSite("ok"))).code)
+        assertEquals(1, host.requests.size)
+    }
+
+    @Test fun `the per-host solve locks are released once nobody holds or waits for them`() {
+        serveAfter(300, cfAnswer("ok"))
+        val killer = CloudflareKiller()
+        val threads = (1..4).map { i ->
+            thread {
+                if (i > 1) Thread.sleep(100)
+                intercept(killer, FakeChain(Request.Builder().url("https://a.example/$i").build(), cfSite("ok")))
+            }
+        }
+        threads.forEach { it.join(10_000) }
+        assertEquals(1, host.requests.size)
+        assertEquals(0, CloudflareKiller.solvingCountForTest())
     }
 
     // ---- never a WebView in this process ---------------------------------------------------------------------

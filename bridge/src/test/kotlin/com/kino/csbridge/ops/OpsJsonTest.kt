@@ -281,16 +281,26 @@ class OpsJsonTest {
         assertTrue((System.nanoTime() - t0) / 1_000_000 in 4_500..9_000)
     }
 
-    @Test fun `a long series is rebuilt lean instead of failing`() {
+    @Test fun `a long series keeps every field, only one over the stream cap is rebuilt lean`() {
         val api = FakeApi().apply {
             onLoad = { url -> newTvSeriesLoadResponse("S", url, TvType.TvSeries, (1..1000).map { i -> newEpisode("/e/$i") { episode = i; description = "d".repeat(400) } }) }
         }
         val o = load(api)
-        assertTrue(o.toString().length <= ProviderOps.LOAD_LEAN_ABOVE_CHARS)
-        assertTrue(ProviderOps.LOAD_LEAN_ABOVE_CHARS < com.kino.csbridge.BridgeService.MAX_RESULT_CHARS)
-        assertEquals(1000, o.getJSONArray("episodes").length())
-        val e = o.getJSONArray("episodes").getJSONObject(0)
+        assertTrue(o.toString().length > CsWire.MAX_INLINE_RESULT_CHARS) // streamed, not trimmed
+        assertEquals("d".repeat(400), o.getJSONArray("episodes").getJSONObject(0).getString("description"))
+        // 5000 episodes of 2000 two-byte chars: about 20 MB of UTF-8, so the answer drops descriptions to fit 8 MiB.
+        val huge = FakeApi().apply {
+            onLoad = { url -> newTvSeriesLoadResponse("S", url, TvType.TvSeries, (1..5000).map { i -> newEpisode("/e/$i") { episode = i; description = "é".repeat(2000) } }) }
+        }
+        val lean = load(huge)
+        assertTrue(lean.toString().toByteArray().size <= CsWire.MAX_STREAM_RESULT_BYTES)
+        assertEquals(5000, lean.getJSONArray("episodes").length())
+        val e = lean.getJSONArray("episodes").getJSONObject(0)
         assertFalse(e.has("description")); assertEquals(1, e.getInt("episode"))
+    }
+
+    @Test fun `utf8Length counts like String toByteArray for valid text`() {
+        for (t in listOf("", "abc", "ñandú", "✓", "😀x", "a\u0000b")) assertEquals(t, t.toByteArray().size.toLong(), ProviderOps.utf8Length(t))
     }
 
 
@@ -305,8 +315,8 @@ class OpsJsonTest {
         }
         val search = op(CsWire.Op.SEARCH, JSONObject().put("provider", 0).put("query", "x"), api)
         val page = op(CsWire.Op.MAIN_PAGE, JSONObject().put("provider", 0).put("index", 0).put("page", 1), api)
-        assertTrue(search.length.toString(), search.length < com.kino.csbridge.BridgeService.MAX_RESULT_CHARS)
-        assertTrue(page.length.toString(), page.length < com.kino.csbridge.BridgeService.MAX_RESULT_CHARS)
+        assertTrue(search.length.toString(), search.length < CsWire.MAX_STREAM_RESULT_BYTES)
+        assertTrue(page.length.toString(), page.length < CsWire.MAX_STREAM_RESULT_BYTES)
         assertEquals(30, JSONObject(page).getJSONArray("rows").length())
     }
 

@@ -1,5 +1,6 @@
 package com.kino.csbridge.web
 
+import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.kino.csbridge.CallContext
 import com.kino.csbridge.HostLink
@@ -14,38 +15,30 @@ import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
-import org.json.JSONObject
+import okhttp3.RequestBody.Companion.toRequestBody
 
 /**
- * The bridge's side of `IHost.webView`: the page load and cookie capture that upstream's WebViewResolver and
- * CloudflareKiller do in a WebView of their own are asked of Kino's hidden WebView instead. This process has no
- * INTERNET permission and never creates a WebView (or touches CookieManager, which loads the WebView provider).
+ * The bridge's side of `IHost.webView` (contract v2, bridge-contract/PROTOCOL.md "IHost.webView"): the page load and
+ * cookie capture that upstream's WebViewResolver and CloudflareKiller do in a WebView of their own are asked of Kino's
+ * hidden WebView instead. This process has no INTERNET permission and never creates a WebView (or touches
+ * CookieManager, which loads the WebView provider).
  *
- * Request, exactly what Kino's `PluginBrowser.captureForCloudStream` parses:
- * `{"callId","pluginId","url","match","timeoutMs","headers":{name:value},"wantCookies":true}`. Cookie mode sends
- * `"waitForCookie":"cf_clearance"` instead of `match`: Kino ends the page as soon as that cookie exists (or at the
- * timeout), with no media required. (Kino also defaults to it when `match` is absent; the explicit field is what a
- * later contract combining `match` and `waitForCookie` builds on.)
- * Answer: `{"request":{"url","headers"}|null,"cookies","userAgent","finalUrl"}` or `{"error":{"code","message"}}`.
+ * Requests are built with [CsWire.webViewRequest] (what Kino's parser accepts) and answers read with
+ * [CsWire.parseWebViewReply]: every request the page made that matched (`requests`, primary match first), with its real
+ * method and headers, the cookies of the page's final host, the WebView's user agent, and `timedOut` when Kino answered
+ * a timeout with what it had (`returnCookiesOnTimeout`).
  *
  * Only inside a live Kino call (Kino refuses anything else too), https only, and every wait is bounded by the call's
- * deadline: no call, no host, a refusal, an error or the deadline all give `null`, never an exception (cancellation of
- * the calling coroutine excepted). Logs name the host and an error code only: never a path, a query or a cookie.
+ * deadline: no call, no host, a refusal, an error or the deadline all give a [Outcome.Failed], never an exception
+ * (cancellation of the calling coroutine excepted). Logs name the host and an error code only: never a path, a query or
+ * a cookie.
  */
 object HostWebViewResolver {
-    // Kino's limits (PluginBrowser.parseRequest), verbatim: a value outside them is clamped or refused over there.
-    const val MIN_TIMEOUT_MS = 1_000L
-    const val MAX_TIMEOUT_MS = 25_000L
-    const val MAX_MATCH_CHARS = 500
-    const val MAX_HEADERS = 10
-    const val MAX_HEADER_VALUE_CHARS = 2048
-    private val HEADER_NAME = Regex("^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$")
-    private val FORBIDDEN_HEADERS = setOf("host", "content-length", "transfer-encoding", "connection", "cookie")
+    // Kino's limits (CsWire.WebView): a value outside them is clamped or refused over there.
+    const val MIN_TIMEOUT_MS = CsWire.WebView.MIN_TIMEOUT_MS
+    const val MAX_TIMEOUT_MS = CsWire.WebView.MAX_TIMEOUT_MS
+    const val MAX_MATCH_CHARS = CsWire.WebView.MAX_MATCH_CHARS
     private const val MAX_URL_CHARS = 8192
-    private const val MAX_UA_CHARS = 512
-    private const val MAX_COOKIES = 64
-    private const val MAX_COOKIE_NAME_CHARS = 256
-    private const val MAX_COOKIE_VALUE_CHARS = 4096
     private const val TAG = "CsBridgeWeb"
 
     /**
@@ -61,8 +54,27 @@ object HostWebViewResolver {
     @Volatile internal var host: () -> IHost? = { HostLink.host }
     @Volatile internal var log: (String) -> Unit = { msg -> runCatching { Log.w(TAG, msg) } }
 
-    /** What Kino's page saw: the first request matching `match` (null in cookie mode or when none matched), the page's cookies and user agent. */
-    data class Capture(val request: Request?, val cookies: Map<String, String>, val userAgent: String?, val finalUrl: HttpUrl?)
+    /**
+     * What Kino's page saw: the matching requests (https only; the primary match first when one was seen), the cookies of
+     * the page's final host, its user agent and final address, and whether the page timed out.
+     */
+    data class Capture(val requests: List<Request>, val cookies: Map<String, String>, val userAgent: String?, val finalUrl: HttpUrl?, val timedOut: Boolean)
+
+    /** A capture, or why there is none: one of Kino's error codes ([CsWire.Err.BUSY], ...) or a local one below. */
+    sealed interface Outcome {
+        data class Got(val capture: Capture) : Outcome
+        data class Failed(val code: String) : Outcome
+    }
+
+    // Local failure codes (never sent anywhere; logs and callers only).
+    const val NO_CALL = "no_call"
+    const val REFUSED_LOCALLY = "refused_locally"
+    const val NO_TIME = "no_time"
+    const val NO_HOST = "no_host"
+    const val UNREACHABLE = "unreachable"
+    const val NO_ANSWER = "no_answer"
+    const val MALFORMED = "malformed"
+    const val FAILED = "failed"
 
     /**
      * The page's timeout to send: [requestedMs] within Kino's [MIN_TIMEOUT_MS]..[MAX_TIMEOUT_MS], and short enough that
@@ -75,11 +87,11 @@ object HostWebViewResolver {
         return if (fits < MIN_TIMEOUT_MS) null else minOf(wanted, fits)
     }
 
-    /** The cookie a cookie-mode capture waits for. */
+    /** The cookie Cloudflare's check ends with. */
     const val CF_CLEARANCE = "cf_clearance"
 
     /**
-     * `match` as Kino accepts it (1..[MAX_MATCH_CHARS] chars, the limit checked on what is sent); an empty pattern
+     * A pattern as Kino accepts it (1..[MAX_MATCH_CHARS] chars, the limit checked on what is sent); an empty pattern
      * matches anything, as it does upstream. Kino compiles it with IGNORE_CASE, so unless the plugin's regex is
      * case-insensitive itself it is sent as `(?-i)…`: Kino then picks the same first match upstream would. Null = refused.
      */
@@ -89,62 +101,74 @@ object HostWebViewResolver {
         return sent.takeIf { it.length <= MAX_MATCH_CHARS }
     }
 
-    /** The first-load headers Kino would keep, in order: valid names, no hop/cookie headers, no line breaks, at most [MAX_HEADERS]. */
-    fun headersForKino(headers: Map<String, String>): Map<String, String> {
-        val out = LinkedHashMap<String, String>()
-        for ((k, v) in headers) {
-            if (out.size >= MAX_HEADERS) break
-            if (!HEADER_NAME.matches(k) || k.lowercase() in FORBIDDEN_HEADERS || '\n' in v || '\r' in v || v.length > MAX_HEADER_VALUE_CHARS) continue
-            out[k] = v
-        }
-        return out
-    }
+    /** The first-load headers Kino would keep, in order ([CsWire.firstLoadHeaders]). */
+    fun headersForKino(headers: Map<String, String>): Map<String, String> = CsWire.firstLoadHeaders(headers)
 
-    fun requestJson(ctx: CallContext, url: HttpUrl, match: String?, headers: Map<String, String>, timeoutMs: Long): String =
-        JSONObject().put("callId", ctx.callId).put("pluginId", ctx.pluginId).put("url", url.toString())
-            .apply { if (match != null) put("match", match) else put("waitForCookie", CF_CLEARANCE) }
-            .put("timeoutMs", timeoutMs).put("headers", JSONObject(headersForKino(headers) as Map<*, *>))
-            .put("wantCookies", true).toString()
+    /** As [ask], keeping only a capture. */
+    suspend fun capture(
+        url: String, match: Regex?, headers: Map<String, String>, timeoutMs: Long,
+        alsoMatch: List<Regex> = emptyList(), waitForCookie: String? = null, returnOnTimeout: Boolean = false,
+    ): Capture? = (ask(url, match, headers, timeoutMs, alsoMatch, waitForCookie, returnOnTimeout) as? Outcome.Got)?.capture
 
     /**
-     * Asks Kino's hidden WebView to load [url] (first load with [headers]) for up to [timeoutMs], ending at the first
-     * request matching [match], or, with [match] null, as soon as Cloudflare's `cf_clearance` cookie exists.
-     * The page's cookies go to [WebCookies] (this plugin, the page's host) and its user agent to
-     * [WebViewResolver.webViewUserAgent]. Null when there was no answer to use.
+     * Asks Kino's hidden WebView to load [url] (first load with [headers]) for up to [timeoutMs]:
+     * - [match]: ends at the first request matching it; with [alsoMatch] (`captureAll`) Kino collects every request
+     *   matching it or one of them until the page settles. Patterns past Kino's limits are left out (logged).
+     * - [waitForCookie]: ends once that cookie exists (with [match], once both hold).
+     * - [returnOnTimeout]: a timeout answers what was captured with `timedOut`, instead of an error.
+     * The page's cookies go to [WebCookies] (this plugin, the page's final host) and its user agent to
+     * [WebViewResolver.webViewUserAgent].
      */
-    suspend fun capture(url: String, match: Regex?, headers: Map<String, String>, timeoutMs: Long): Capture? {
-        val ctx = CallContext.currentInCoroutine() ?: return null // outside a Kino call: no IPC at all
+    suspend fun ask(
+        url: String, match: Regex?, headers: Map<String, String>, timeoutMs: Long,
+        alsoMatch: List<Regex> = emptyList(), waitForCookie: String? = null, returnOnTimeout: Boolean = false,
+    ): Outcome {
+        val ctx = CallContext.currentInCoroutine() ?: return Outcome.Failed(NO_CALL) // outside a Kino call: no IPC at all
         val start = url.takeIf { it.length <= MAX_URL_CHARS }?.toHttpUrlOrNull()
         if (start == null || !start.isHttps) {
             log("webview refused locally: not an https URL")
-            return null
+            return Outcome.Failed(REFUSED_LOCALLY)
         }
         val pattern = if (match == null) null else matchPattern(match) ?: run {
             log("webview ${start.host}: match pattern over $MAX_MATCH_CHARS chars, not sent")
-            return null
+            return Outcome.Failed(REFUSED_LOCALLY)
         }
-        if (ctx.isOver()) return null
+        if (pattern == null && waitForCookie == null) return Outcome.Failed(REFUSED_LOCALLY)
+        val also = if (pattern == null) emptyList() else alsoPatterns(start.host, alsoMatch)
+        if (ctx.isOver()) return Outcome.Failed(NO_TIME)
         val pageMs = clampTimeout(timeoutMs, ctx.remainingMs()) ?: run {
             log("webview ${start.host}: too little time left in the call")
-            return null
+            return Outcome.Failed(NO_TIME)
         }
-        val h = host() ?: run { log("webview ${start.host}: Kino is not connected"); return null }
+        val h = host() ?: run { log("webview ${start.host}: Kino is not connected"); return Outcome.Failed(NO_HOST) }
+        val request = CsWire.webViewRequest(CsWire.WebViewRequest(
+            ctx.callId, ctx.pluginId, start.toString(), pageMs, headers, match = pattern, alsoMatch = also,
+            captureAll = also.isNotEmpty(), waitForCookie = waitForCookie, returnCookiesOnTimeout = returnOnTimeout,
+        ))
         val waiter = Waiter()
         try {
-            h.webView(requestJson(ctx, start, pattern, headers, pageMs), waiter)
+            h.webView(request, waiter)
         } catch (e: Exception) { // DeadObjectException / RemoteException, or a Binder-side runtime failure
             log("webview ${start.host}: Kino unreachable (${e.javaClass.simpleName})")
-            return null
+            return Outcome.Failed(UNREACHABLE)
         }
-        val answer = await(waiter, ctx, h, pageMs) ?: run { log("webview ${start.host}: no answer in time"); return null }
+        val answer = await(waiter, ctx, h, pageMs) ?: run { log("webview ${start.host}: no answer in time"); return Outcome.Failed(NO_ANSWER) }
         CsWire.errorOf(answer)?.let { (code, _) ->
             log("webview ${start.host}: Kino answered $code")
-            return null
+            return Outcome.Failed(code)
         }
-        val capture = parseAnswer(answer) ?: run { log("webview ${start.host}: malformed answer"); return null }
+        val capture = parseAnswer(answer) ?: run { log("webview ${start.host}: malformed answer"); return Outcome.Failed(MALFORMED) }
         capture.userAgent?.let { WebViewResolver.webViewUserAgent = it }
         if (capture.cookies.isNotEmpty()) WebCookies.put(ctx.pluginId, (capture.finalUrl ?: start).host, capture.cookies)
-        return capture
+        return Outcome.Got(capture)
+    }
+
+    /** [alsoMatch] as sent: each through [matchPattern], at most [CsWire.WebView.MAX_ALSO_MATCH]; what does not fit is logged. */
+    private fun alsoPatterns(host: String, alsoMatch: List<Regex>): List<String> {
+        val fit = alsoMatch.mapNotNull { matchPattern(it) }
+        if (fit.size < alsoMatch.size) log("webview $host: ${alsoMatch.size - fit.size} additional pattern(s) over $MAX_MATCH_CHARS chars, not sent")
+        if (fit.size > CsWire.WebView.MAX_ALSO_MATCH) log("webview $host: only the first ${CsWire.WebView.MAX_ALSO_MATCH} additional patterns sent")
+        return fit.take(CsWire.WebView.MAX_ALSO_MATCH)
     }
 
     /** Kino's done(), or null at the call's deadline, the page's own bound, the op's end or Kino's death. */
@@ -166,33 +190,35 @@ object HostWebViewResolver {
         }
     }
 
+    /** A v2 reply as a [Capture]: only https requests, each with its real method (an empty body where OkHttp needs one). */
     internal fun parseAnswer(json: String): Capture? {
-        val o = runCatching { JSONObject(json) }.getOrNull() ?: return null
-        val request = o.optJSONObject("request")?.let { r ->
-            val u = r.optString("url").takeIf { it.length <= MAX_URL_CHARS }?.toHttpUrlOrNull()?.takeIf { it.isHttps }
-            u?.let { Request.Builder().url(it).headers(headersOf(r.optJSONObject("headers"))).build() }
-        }
-        val ua = o.optString("userAgent").takeIf { it.isNotBlank() && it.length <= MAX_UA_CHARS && it.none { c -> c == '\n' || c == '\r' } }
-        val finalUrl = o.optString("finalUrl").takeIf { it.length <= MAX_URL_CHARS }?.toHttpUrlOrNull()?.takeIf { it.isHttps }
-        return Capture(request, parseCookies(o.optString("cookies")), ua, finalUrl)
+        val reply = CsWire.parseWebViewReply(json) ?: return null
+        val requests = reply.requests.mapNotNull { r -> runCatching { toRequest(r) }.getOrNull() }
+        val ua = reply.userAgent.takeIf { it.isNotBlank() }
+        val finalUrl = reply.finalUrl.toHttpUrlOrNull()?.takeIf { it.isHttps }
+        return Capture(requests, reply.cookies, ua, finalUrl, reply.timedOut)
     }
 
-    private fun headersOf(o: JSONObject?): Headers {
+    private val BODY_METHODS = setOf("POST", "PUT", "PATCH")
+
+    private fun toRequest(r: CsWire.CapturedRequest): Request? {
+        val u = r.url.toHttpUrlOrNull()?.takeIf { it.isHttps } ?: return null
         val b = Headers.Builder()
-        o?.keys()?.forEach { k -> (o.opt(k) as? String)?.let { v -> runCatching { b.add(k, v) } } }
-        return b.build()
+        r.headers.forEach { (k, v) -> runCatching { b.add(k, v) } }
+        val body = if (r.method in BODY_METHODS) ByteArray(0).toRequestBody(null) else null
+        return Request.Builder().url(u).headers(b.build()).method(r.method, body).build()
     }
 
-    /** A `Cookie`-style string (`a=1; b=2`, as CookieManager gives it) as a name → value map, bounded. */
+    /** A `Cookie`-style string (`a=1; b=2`) as a name → value map, bounded. */
     fun parseCookies(header: String): Map<String, String> {
         val out = LinkedHashMap<String, String>()
         for (part in header.split(';')) {
-            if (out.size >= MAX_COOKIES) break
+            if (out.size >= CsWire.WebView.MAX_COOKIES) break
             val eq = part.indexOf('=')
             if (eq <= 0) continue
             val name = part.substring(0, eq).trim()
             val value = part.substring(eq + 1).trim()
-            if (name.isEmpty() || value.isEmpty() || name.length > MAX_COOKIE_NAME_CHARS || value.length > MAX_COOKIE_VALUE_CHARS) continue
+            if (name.isEmpty() || value.isEmpty() || name.length > CsWire.WebView.MAX_COOKIE_NAME_CHARS || value.length > CsWire.WebView.MAX_COOKIE_VALUE_CHARS) continue
             if (name.any { it.isWhitespace() || it == ',' } || value.any { it == '\r' || it == '\n' || it == ';' }) continue
             out[name] = value
         }
@@ -205,9 +231,14 @@ object HostWebViewResolver {
         val answer = CompletableDeferred<String>()
         override fun event(eventJson: String?) {} // IHost.webView replies via done() only
         override fun done(resultJson: String?) { if (resultJson != null) answer.complete(resultJson) }
+        /** Not a webView answer (PROTOCOL.md): the pipe is closed unread and the capture fails at once. */
+        override fun doneStream(result: ParcelFileDescriptor?) {
+            runCatching { result?.close() }
+            answer.complete(CsWire.error(CsWire.Err.BAD_REQUEST, "webView answers come in done"))
+        }
     }
 
-    /** Thrown nowhere: cancellation of the caller is rethrown as is, everything else is a null answer. */
+    /** Thrown nowhere: cancellation of the caller is rethrown as is, everything else is [fallback]. */
     internal inline fun <T> quiet(fallback: T, block: () -> T): T = try {
         block()
     } catch (e: CancellationException) {

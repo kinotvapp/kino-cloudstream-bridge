@@ -15,10 +15,14 @@ import okhttp3.Response
 /**
  * Upstream loads the page in a WebView of its own. Here the page is loaded by Kino's hidden WebView through
  * `IHost.webView` ([HostWebViewResolver]): only inside a live Kino call, https only, the timeout within Kino's
- * 1..25 s. What Kino's page does not offer is ignored: [userAgent] (Kino's WebView keeps its own, which is what
- * Cloudflare wants anyway), [useOkhttp] (every subrequest goes through Kino's network), [script] / [scriptCallback]
- * (no JavaScript injection), and [additionalUrls] (Kino answers one request: the first that matches [interceptUrl]).
- * Failure of any kind is upstream's "nothing found": `null to emptyList()`.
+ * 1..25 s. With [additionalUrls], Kino captures every request matching [interceptUrl] or one of them (`captureAll` +
+ * `alsoMatch`, at most 10 patterns) and answers what it had on a timeout too, so the extras come back as upstream
+ * returns them: `first` the first [interceptUrl] match (or null), `second` the other requests matching
+ * [additionalUrls], each with the method and headers the page used. [requestCallBack] runs on each of them after the
+ * page, so its `true` cannot end the page early.
+ * What Kino's page does not offer is ignored: [userAgent] (Kino's WebView keeps its own, which is what Cloudflare
+ * wants anyway), [useOkhttp] (every subrequest goes through Kino's network), [script] / [scriptCallback] (no
+ * JavaScript injection). Failure of any kind is upstream's "nothing found": `null to emptyList()`.
  */
 class WebViewResolver(
     val interceptUrl: Regex,
@@ -86,10 +90,13 @@ class WebViewResolver(
 
     private suspend fun capture(url: String, headers: Map<String, String>, requestCallBack: (Request) -> Boolean): Pair<Request?, List<Request>> =
         HostWebViewResolver.quiet(null to emptyList()) {
-            val found = HostWebViewResolver.capture(url, interceptUrl, headers, timeout)?.request
-            // Kino matched case-insensitively; upstream's contract is interceptUrl.containsMatchIn, checked again here.
-            if (found == null || !interceptUrl.containsMatchIn(found.url.toString())) return@quiet null to emptyList()
-            runCatching { requestCallBack(found) }
-            found to emptyList()
+            val extra = additionalUrls.isNotEmpty()
+            val got = HostWebViewResolver.capture(url, interceptUrl, headers, timeout, alsoMatch = additionalUrls, returnOnTimeout = extra)
+                ?: return@quiet null to emptyList()
+            // Upstream's contract is containsMatchIn on each pattern: checked again here, whatever Kino matched.
+            val primary = got.requests.firstOrNull { interceptUrl.containsMatchIn(it.url.toString()) }
+            val others = got.requests.filter { r -> r !== primary && additionalUrls.any { it.containsMatchIn(r.url.toString()) } }
+            (listOfNotNull(primary) + others).forEach { runCatching { requestCallBack(it) } }
+            primary to others
         }
 }

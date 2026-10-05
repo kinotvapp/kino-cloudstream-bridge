@@ -1,11 +1,17 @@
 // Apache-2.0. Shared verbatim by Kino and the CloudStream bridge (see ../../../../PROTOCOL.md).
 package com.kino.csbridge.contract
 
+import android.os.ParcelFileDescriptor
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
 
 object CsWire {
-    const val PROTOCOL_VERSION = 1
+    const val PROTOCOL_VERSION = 2
     const val BRIDGE_PACKAGE = "com.kino.csbridge"
     const val BRIDGE_SERVICE = "com.kino.csbridge.BridgeService"
     const val PERMISSION = "com.arkiv.player.permission.CLOUDSTREAM_BRIDGE"
@@ -13,10 +19,16 @@ object CsWire {
     const val MAX_RESPONSE_BODY_BYTES = 5 shl 20
     const val MAX_REQUESTS_PER_OP = 250
     const val MAX_IN_FLIGHT_PER_PLUGIN = 6
+    /** A result of at most this many chars ends its op through `IReply.done`; a longer one through `IReply.doneStream`. */
+    const val MAX_INLINE_RESULT_CHARS = 100_000
+    /** A streamed result's cap, in UTF-8 bytes. Over it the op ends with `done` and [Err.TOO_LARGE] instead. */
+    const val MAX_STREAM_RESULT_BYTES = 8 * 1024 * 1024
     private const val MAX_ID_CHARS = 64
     private const val MAX_URL_CHARS = 8192
     private val SHA256 = Regex("^[0-9a-f]{64}$")
     private val METHODS = setOf("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
+    /** An HTTP token (RFC 9110): header names, and the cookie name `waitForCookie` takes. */
+    private val HEADER_NAME = Regex("^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$")
 
     object Op {
         const val INSTALL = "installPlugin"; const val REMOVE = "removePlugin"; const val LIST = "listPlugins"
@@ -29,7 +41,207 @@ object CsWire {
         const val INCOMPATIBLE = "incompatible"; const val TIMEOUT = "timeout"; const val CANCELLED = "cancelled"
         const val PLUGIN = "plugin_error"; const val NETWORK = "network"; const val REFUSED = "refused"
         const val TOO_LARGE = "too_large"; const val BUDGET = "budget"; const val UNAVAILABLE = "unavailable"
+        /** A `doneStream` pipe that ended without the writer's OK (closeWithError, a dead writer) or with invalid UTF-8. */
+        const val STREAM_BROKEN = "bridge_stream_broken"
+        /** `IHost.webView` only: another hidden page is open in Kino. */
+        const val BUSY = "busy"
     }
+
+    /**
+     * Reads one `IReply.doneStream` result to its end and closes [result]: the result JSON, or an error JSON
+     * ([Err.TOO_LARGE] over [MAX_STREAM_RESULT_BYTES], [Err.STREAM_BROKEN] when the pipe ended without the writer's OK
+     * or the bytes are not UTF-8). Blocking: run it off the binder thread, and close [result] from elsewhere to stop it
+     * at a deadline (the read then fails as [Err.STREAM_BROKEN]).
+     */
+    fun readStreamedResult(result: ParcelFileDescriptor): String = try {
+        val bytes = ByteArrayOutputStream()
+        ParcelFileDescriptor.AutoCloseInputStream(result).use { input ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                bytes.write(buf, 0, n)
+                if (bytes.size() > MAX_STREAM_RESULT_BYTES) return error(Err.TOO_LARGE, "streamed result over ${MAX_STREAM_RESULT_BYTES shr 20} MB")
+            }
+            result.checkError() // EOF without the writer's OK status: closeWithError, or the writer died
+        }
+        val decoder = Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT).onUnmappableCharacter(CodingErrorAction.REPORT)
+        decoder.decode(ByteBuffer.wrap(bytes.toByteArray())).toString()
+    } catch (e: IOException) {
+        error(Err.STREAM_BROKEN, e.javaClass.simpleName)
+    } catch (e: CharacterCodingException) {
+        error(Err.STREAM_BROKEN, "not UTF-8")
+    }
+
+    /** `IHost.webView` limits (PROTOCOL.md "IHost.webView"). Kino enforces them; the bridge never sends past them. */
+    object WebView {
+        const val MIN_TIMEOUT_MS = 1_000L
+        const val MAX_TIMEOUT_MS = 25_000L
+        /** `match` and each `alsoMatch` pattern: 1..this many chars. */
+        const val MAX_MATCH_CHARS = 500
+        const val MAX_ALSO_MATCH = 10
+        /** Captured requests in one reply. */
+        const val MAX_REQUESTS = 20
+        /** With `captureAll`, the page ends once the primary match was seen and no new matching request came for this long. */
+        const val SETTLE_MS = 1_000L
+        const val MAX_FIRST_LOAD_HEADERS = 10
+        const val MAX_FIRST_LOAD_HEADER_VALUE_CHARS = 2048
+        const val MAX_WAIT_FOR_COOKIE_CHARS = 100
+        /** Headers of one captured request. */
+        const val MAX_REQUEST_HEADERS = 64
+        const val MAX_REQUEST_HEADER_VALUE_CHARS = 8192
+        const val MAX_COOKIES = 64
+        const val MAX_COOKIE_NAME_CHARS = 256
+        const val MAX_COOKIE_VALUE_CHARS = 4096
+        const val MAX_USER_AGENT_CHARS = 512
+        /** First-load headers Kino never sets from a request. */
+        val FORBIDDEN_FIRST_LOAD_HEADERS = setOf("host", "content-length", "transfer-encoding", "connection", "cookie")
+    }
+
+    /** One `IHost.webView` request (PROTOCOL.md). Optional fields at their default are left out of the JSON. */
+    data class WebViewRequest(
+        val callId: String, val pluginId: String, val url: String, val timeoutMs: Long,
+        val headers: Map<String, String> = emptyMap(),
+        val match: String? = null,
+        val alsoMatch: List<String> = emptyList(),
+        val captureAll: Boolean = false,
+        val waitForCookie: String? = null,
+        val returnCookiesOnTimeout: Boolean = false,
+    )
+
+    /** One request the page made, as the WebView saw it. */
+    data class CapturedRequest(val url: String, val method: String, val headers: Map<String, String>)
+
+    /** An `IHost.webView` success (or, with `returnCookiesOnTimeout`, timeout) reply. */
+    data class WebViewReply(
+        val requests: List<CapturedRequest>, val cookies: Map<String, String>, val userAgent: String, val finalUrl: String,
+        val timedOut: Boolean,
+    )
+
+    fun webViewRequest(r: WebViewRequest): String = JSONObject().put("callId", r.callId).put("pluginId", r.pluginId)
+        .put("url", r.url).put("timeoutMs", r.timeoutMs).put("headers", JSONObject(firstLoadHeaders(r.headers) as Map<*, *>))
+        .apply {
+            r.match?.let { put("match", it) }
+            if (r.alsoMatch.isNotEmpty()) put("alsoMatch", JSONArray(r.alsoMatch))
+            if (r.captureAll) put("captureAll", true)
+            r.waitForCookie?.let { put("waitForCookie", it) }
+            if (r.returnCookiesOnTimeout) put("returnCookiesOnTimeout", true)
+        }.toString()
+
+    /**
+     * [json] as a [WebViewRequest], or null when Kino must answer [Err.BAD_REQUEST]: a field of the wrong type, a value
+     * past a limit, `alsoMatch` without `captureAll`, `captureAll` without `match`, or neither `match` nor
+     * `waitForCookie`. `timeoutMs` is clamped and first-load headers filtered ([firstLoadHeaders]), never refused.
+     * Patterns are not compiled here: Kino compiles them and refuses an invalid one.
+     */
+    fun parseWebViewRequest(json: String): WebViewRequest? = runCatching {
+        val o = JSONObject(json)
+        val url = (o.opt("url") as? String)?.takeIf { it.length <= MAX_URL_CHARS && it.startsWith("https://", ignoreCase = true) } ?: return null
+        val timeout = (o.opt("timeoutMs") as? Number)?.toLong()?.coerceIn(WebView.MIN_TIMEOUT_MS, WebView.MAX_TIMEOUT_MS) ?: return null
+        val headers = when (val h = o.opt("headers")) {
+            null -> emptyMap()
+            is JSONObject -> firstLoadHeaders(h.keys().asSequence().mapNotNull { k -> (h.opt(k) as? String)?.let { k to it } }.toMap(LinkedHashMap()))
+            else -> return null
+        }
+        fun pattern(v: Any?): String? = (v as? String)?.takeIf { it.length in 1..WebView.MAX_MATCH_CHARS }
+        val match = if (o.has("match")) pattern(o.opt("match")) ?: return null else null
+        val also = when (val a = o.opt("alsoMatch")) {
+            null -> emptyList()
+            is JSONArray -> {
+                if (a.length() !in 1..WebView.MAX_ALSO_MATCH) return null
+                (0 until a.length()).map { pattern(a.opt(it)) ?: return null }
+            }
+            else -> return null
+        }
+        fun flag(name: String): Boolean? = when (val v = o.opt(name)) { null -> false; is Boolean -> v; else -> null }
+        val captureAll = flag("captureAll") ?: return null
+        val onTimeout = flag("returnCookiesOnTimeout") ?: return null
+        val cookie = if (o.has("waitForCookie")) {
+            (o.opt("waitForCookie") as? String)?.takeIf { it.length <= WebView.MAX_WAIT_FOR_COOKIE_CHARS && HEADER_NAME.matches(it) } ?: return null
+        } else null
+        if (also.isNotEmpty() && !captureAll) return null
+        if (captureAll && match == null) return null
+        if (match == null && cookie == null) return null
+        WebViewRequest(id(o.getString("callId")) ?: return null, id(o.getString("pluginId")) ?: return null, url, timeout,
+            headers, match, also, captureAll, cookie, onTimeout)
+    }.getOrNull()
+
+    /** The first-load headers Kino keeps, in order: token names, none of [WebView.FORBIDDEN_FIRST_LOAD_HEADERS], no line breaks, at most [WebView.MAX_FIRST_LOAD_HEADERS]. */
+    fun firstLoadHeaders(headers: Map<String, String>): Map<String, String> {
+        val out = LinkedHashMap<String, String>()
+        for ((k, v) in headers) {
+            if (out.size >= WebView.MAX_FIRST_LOAD_HEADERS) break
+            if (!HEADER_NAME.matches(k) || k.lowercase() in WebView.FORBIDDEN_FIRST_LOAD_HEADERS) continue
+            if ('\n' in v || '\r' in v || v.length > WebView.MAX_FIRST_LOAD_HEADER_VALUE_CHARS) continue
+            out[k] = v
+        }
+        return out
+    }
+
+    /**
+     * The reply JSON for [r], within every limit: invalid entries dropped, at most [WebView.MAX_REQUESTS] requests, and,
+     * since the reply travels in one `done`, trailing requests dropped until it is at most [MAX_INLINE_RESULT_CHARS].
+     */
+    fun webViewReply(r: WebViewReply): String {
+        val requests = r.requests.mapNotNull { capturedRequestJson(it) }.take(WebView.MAX_REQUESTS).toMutableList()
+        fun build() = JSONObject().put("requests", JSONArray(requests)).put("cookies", JSONObject(cookiesWithinLimits(r.cookies) as Map<*, *>))
+            .put("userAgent", r.userAgent.takeIf { validUserAgent(it) } ?: "").put("finalUrl", r.finalUrl.take(MAX_URL_CHARS))
+            .put("timedOut", r.timedOut).toString()
+        var out = build()
+        while (out.length > MAX_INLINE_RESULT_CHARS && requests.isNotEmpty()) { requests.removeAt(requests.size - 1); out = build() }
+        return out
+    }
+
+    /**
+     * [json] as a [WebViewReply], or null when it is not the success shape (an error answer included). Entries past a
+     * limit are dropped, never the whole reply: a request with a bad url or method, a header or cookie that is invalid.
+     */
+    fun parseWebViewReply(json: String): WebViewReply? = runCatching {
+        val o = JSONObject(json)
+        if (o.has("error")) return null
+        val a = o.optJSONArray("requests") ?: return null
+        val requests = (0 until minOf(a.length(), WebView.MAX_REQUESTS)).mapNotNull { i ->
+            val r = a.optJSONObject(i) ?: return@mapNotNull null
+            val h = r.optJSONObject("headers")
+            val headers = h?.keys()?.asSequence()?.mapNotNull { k -> (h.opt(k) as? String)?.let { k to it } }?.toMap(LinkedHashMap()).orEmpty()
+            CapturedRequest(r.optString("url"), r.optString("method"), headers).takeIf { capturedRequestJson(it) != null }
+                ?.let { it.copy(headers = requestHeaders(it.headers)) }
+        }
+        val c = o.optJSONObject("cookies") ?: return null
+        val cookies = cookiesWithinLimits(c.keys().asSequence().mapNotNull { k -> (c.opt(k) as? String)?.let { k to it } }.toMap(LinkedHashMap()))
+        val ua = (o.opt("userAgent") as? String)?.takeIf { validUserAgent(it) } ?: ""
+        val finalUrl = (o.opt("finalUrl") as? String)?.takeIf { it.length <= MAX_URL_CHARS } ?: return null
+        val timedOut = o.opt("timedOut") as? Boolean ?: return null
+        WebViewReply(requests, cookies, ua, finalUrl, timedOut)
+    }.getOrNull()
+
+    private fun capturedRequestJson(r: CapturedRequest): JSONObject? {
+        val web = r.url.startsWith("https://", ignoreCase = true) || r.url.startsWith("http://", ignoreCase = true)
+        if (!web || r.url.length > MAX_URL_CHARS || r.method !in METHODS) return null
+        return JSONObject().put("url", r.url).put("method", r.method).put("headers", JSONObject(requestHeaders(r.headers) as Map<*, *>))
+    }
+
+    private fun requestHeaders(h: Map<String, String>): Map<String, String> {
+        val out = LinkedHashMap<String, String>()
+        for ((k, v) in h) {
+            if (out.size >= WebView.MAX_REQUEST_HEADERS) break
+            if (HEADER_NAME.matches(k) && v.length <= WebView.MAX_REQUEST_HEADER_VALUE_CHARS && '\n' !in v && '\r' !in v) out[k] = v
+        }
+        return out
+    }
+
+    private fun cookiesWithinLimits(c: Map<String, String>): Map<String, String> {
+        val out = LinkedHashMap<String, String>()
+        for ((k, v) in c) {
+            if (out.size >= WebView.MAX_COOKIES) break
+            if (k.isEmpty() || k.length > WebView.MAX_COOKIE_NAME_CHARS || k.any { it.isWhitespace() || it in ",;=" }) continue
+            if (v.isEmpty() || v.length > WebView.MAX_COOKIE_VALUE_CHARS || v.any { it == '\r' || it == '\n' || it == ';' }) continue
+            out[k] = v
+        }
+        return out
+    }
+
+    private fun validUserAgent(ua: String) = ua.length <= WebView.MAX_USER_AGENT_CHARS && ua.none { it == '\n' || it == '\r' }
 
     /** One plugin the bridge holds, as `hello.plugins` lists it: its Kino id and the sha256 (64 lowercase hex) of its `.cs3`. */
     data class HelloPlugin(val id: String, val sha256: String)

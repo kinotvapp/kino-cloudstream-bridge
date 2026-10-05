@@ -32,15 +32,32 @@ internal object ProviderOps {
     /** One event's JSON past this is dropped (and not counted): binder's async space is shared with the `done`. */
     const val MAX_EVENT_CHARS = 16 * 1024
     /**
-     * All events of one op together: past this, events are dropped and not counted. About 200 KB as parcels, plus a done
-     * of up to 240 KB, stays under binder's ~508 KB oneway space.
+     * All events of one op together: past this, events are dropped and not counted. About 200 KB as parcels, plus an
+     * inline done of up to 200 KB (larger ones go through a pipe), stays under binder's ~508 KB oneway space.
      */
     const val MAX_EVENTS_TOTAL_CHARS = 100_000
     /**
-     * A `load` answer longer than this is rebuilt leaner (no episode posters and descriptions, then no names). Below the
-     * service's result cap, which keeps a `done` parcel (2 bytes a char) well inside binder's oneway space.
+     * A `load` answer over this many UTF-8 bytes is rebuilt leaner (no episode posters and descriptions, then no names):
+     * the streamed result's cap. Anything below it reaches Kino whole (inline or through `doneStream`).
      */
-    const val LOAD_LEAN_ABOVE_CHARS = 100_000
+    const val LOAD_LEAN_ABOVE_BYTES = CsWire.MAX_STREAM_RESULT_BYTES.toLong()
+
+    /** [s]'s length in UTF-8 without encoding it (a lone surrogate counted as 3 bytes, never fewer than it takes). */
+    fun utf8Length(s: String): Long {
+        var n = 0L
+        var i = 0
+        while (i < s.length) {
+            val c = s[i]
+            n += when {
+                c.code < 0x80 -> 1
+                c.code < 0x800 -> 2
+                Character.isHighSurrogate(c) && i + 1 < s.length && Character.isLowSurrogate(s[i + 1]) -> { i++; 4 }
+                else -> 3
+            }
+            i++
+        }
+        return n
+    }
 
     /** Ops this object answers. */
     val OPS = setOf(CsWire.Op.SEARCH, CsWire.Op.MAIN_PAGE, CsWire.Op.LOAD, CsWire.Op.LOAD_LINKS)
@@ -121,10 +138,10 @@ internal object ProviderOps {
                 // As upstream's APIRepository.load: a relative url is completed against the provider's mainUrl.
                 val res = api.load(api.fixUrl(url)) ?: return@timed CsWire.error(CsWire.Err.PLUGIN, "no answer")
                 try {
-                    // Leaner until it fits; past level 2 the service's result cap answers too_large.
+                    // Leaner until it fits the stream cap; past level 2 the service answers too_large.
                     var out = Json.load(res).toString()
                     var lean = 0
-                    while (out.length > LOAD_LEAN_ABOVE_CHARS && lean < 2) out = Json.load(res, ++lean).toString()
+                    while (utf8Length(out) > LOAD_LEAN_ABOVE_BYTES && lean < 2) out = Json.load(res, ++lean).toString()
                     out
                 } catch (e: Json.Refused) {
                     CsWire.error(CsWire.Err.BAD_REQUEST, e.message ?: "refused")

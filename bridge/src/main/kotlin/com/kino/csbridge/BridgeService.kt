@@ -41,6 +41,12 @@ class BridgeService : Service() {
      * Op bodies and replies, on this service's own threads (never Dispatchers.IO, which plugin code may fill). Plugin code
      * never runs here (it runs on PluginWork's pool or the registry's threads), so stuck plugins cannot take them.
      */
+    /** The pipe for a large result; tests swap it for one whose reader never reads. */
+    internal var streamPipes: () -> StreamPipe = { ResultStream.pipe() }
+    /** A streamed result gets what its op has left, within these bounds (PROTOCOL.md). Tests shrink them. */
+    @Volatile internal var minStreamMs = 5_000L
+    @Volatile internal var maxStreamMs = 60_000L
+
     private val executor = Executors.newFixedThreadPool(SERVICE_THREADS) { r -> Thread(r, "bridge-ops").apply { isDaemon = true } }
     private val scope = CoroutineScope(SupervisorJob() + executor.asCoroutineDispatcher())
     /** Deadline timers: never blocked by anything, so a deadline always fires. */
@@ -99,7 +105,7 @@ class BridgeService : Service() {
                         timer.cancel()
                         runCatching { payload?.close() }
                     }
-                    safeDone(reply, answer)
+                    safeDone(reply, answer, ctx)
                 }
                 jobs[req.callId] = job
                 job.invokeOnCompletion { jobs.remove(req.callId, job) }
@@ -129,18 +135,41 @@ class BridgeService : Service() {
 
     private fun refuse(r: IReply, payload: ParcelFileDescriptor?, code: String, msg: String) {
         runCatching { payload?.close() }
-        safeDone(r, CsWire.error(code, msg))
+        safeInline(r, CsWire.error(code, msg))
     }
 
     private fun incompatible(e: Throwable) = CsWire.error(CsWire.Err.INCOMPATIBLE, describe(e))
 
     /**
-     * Exactly one `done` reaches Kino: an oversized or Binder-rejected result becomes a short too_large error. A
-     * DeadObjectException on a live binder is not a dead peer: libbinder reports an exhausted oneway buffer that way, so
-     * it gets the same single too_large retry (on a truly dead binder the retry fails harmlessly).
+     * Ends the op with exactly one `done` or `doneStream` (PROTOCOL.md): up to [CsWire.MAX_INLINE_RESULT_CHARS] inline,
+     * up to [CsWire.MAX_STREAM_RESULT_BYTES] of UTF-8 through a pipe written here, on this service's thread, within what
+     * the op has left ([minStreamMs]..[maxStreamMs]), and anything larger as a short too_large `done`.
      */
-    private fun safeDone(r: IReply, json: String) {
-        val out = if (json.length > MAX_RESULT_CHARS) TOO_LARGE else json
+    private fun safeDone(r: IReply, json: String, ctx: CallContext) {
+        if (json.length <= CsWire.MAX_INLINE_RESULT_CHARS) return safeInline(r, json)
+        // UTF-8 never has fewer bytes than chars: a longer string is over the cap without encoding it.
+        if (json.length > CsWire.MAX_STREAM_RESULT_BYTES) return safeInline(r, TOO_LARGE)
+        val bytes = json.toByteArray(Charsets.UTF_8)
+        if (bytes.size > CsWire.MAX_STREAM_RESULT_BYTES) return safeInline(r, TOO_LARGE)
+        val pipe = try { streamPipes() } catch (_: Exception) { return safeInline(r, CsWire.error(CsWire.Err.UNAVAILABLE, "result pipe")) }
+        try {
+            r.doneStream(pipe.readEnd)
+        } catch (e: RemoteException) {
+            runCatching { pipe.closeWrite(ResultStream.ERR_WRITE) }; runCatching { pipe.closeRead() }
+            // Not delivered: the same single too_large fallback as a refused done (a dead peer makes it fail harmlessly).
+            if (e !is DeadObjectException || r.asBinder().isBinderAlive) try { r.done(TOO_LARGE) } catch (_: RemoteException) {}
+            return
+        }
+        ResultStream.write(pipe, bytes, ResultStream.windowMs(ctx.remainingMs(), minStreamMs, maxStreamMs))
+    }
+
+    /**
+     * One inline `done`: a Binder-rejected one becomes a short too_large error. A DeadObjectException on a live binder is
+     * not a dead peer: libbinder reports an exhausted oneway buffer that way, so it gets the same single too_large retry
+     * (on a truly dead binder the retry fails harmlessly).
+     */
+    private fun safeInline(r: IReply, json: String) {
+        val out = if (json.length > CsWire.MAX_INLINE_RESULT_CHARS) TOO_LARGE else json
         try {
             r.done(out)
         } catch (_: DeadObjectException) {
@@ -156,11 +185,6 @@ class BridgeService : Service() {
     companion object {
         private const val ID_PREFIX = "cloudstream-"
 
-        /**
-         * A String parcel is 2 bytes a char; oneway transactions share about 508 KB of Kino's binder space. 120K chars is
-         * about 240 KB, so two concurrent dones still fit. Larger results need a pipe (a separate contract task).
-         */
-        internal const val MAX_RESULT_CHARS = 120_000
         private const val SERVICE_THREADS = 4
         private val TOO_LARGE = CsWire.error(CsWire.Err.TOO_LARGE, "result too large")
         private val QUERY_OR_FRAGMENT = Regex("[?#]\\S*")
