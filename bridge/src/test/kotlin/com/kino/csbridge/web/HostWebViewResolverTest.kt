@@ -505,8 +505,8 @@ class HostWebViewResolverTest {
         assertEquals(1, host.requests.size)
     }
 
-    @Test fun `Kino's timeout and blocked answers are remembered for the site`() {
-        for (code in listOf(CsWire.Err.TIMEOUT, CsWire.Err.BLOCKED)) {
+    @Test fun `Kino's timeout, blocked and browser_unavailable answers are remembered for the site`() {
+        for (code in listOf(CsWire.Err.TIMEOUT, CsWire.Err.BLOCKED, CsWire.Err.BROWSER_UNAVAILABLE)) {
             CloudflareKiller.resetForTest()
             serve { CsWire.error(code, "x") }
             intercept(CloudflareKiller(), FakeChain(Request.Builder().url("https://a.example/").build(), cfSite("ok")))
@@ -516,6 +516,7 @@ class HostWebViewResolverTest {
     }
 
     @Test fun `a reply whose final address is not https solves nothing and files no cookies`() {
+        // webViewReply never writes one (it answers blocked), so a raw reply stands in for a broken Kino.
         serve { o -> JSONObject(cfAnswer("ok")(o)).put("finalUrl", "http://a.example/").toString() }
         assertEquals(503, intercept(CloudflareKiller(), FakeChain(Request.Builder().url("https://a.example/").build(), cfSite("ok"))).code)
         assertNull(WebCookies.get("cloudstream-x", "a.example"))

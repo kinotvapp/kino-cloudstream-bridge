@@ -48,7 +48,7 @@ class BridgeService : Service() {
     /**
      * Stream writes, on threads of their own: a Kino that reads slowly (or not at all) holds one of these for up to
      * [maxStreamMs], never an op thread, so every other op's answer (a deadline's included) still goes out on time.
-     * At most [STREAM_THREADS] streams at once; another large result is answered `unavailable` instead.
+     * At most [STREAM_THREADS] streams at once; another large result is answered `streams_busy` instead.
      */
     private val streamExecutor = Executors.newFixedThreadPool(STREAM_THREADS) { r -> Thread(r, "bridge-stream").apply { isDaemon = true } }
     private val streamSlots = Semaphore(STREAM_THREADS)
@@ -143,7 +143,7 @@ class BridgeService : Service() {
         scope.cancel()
         timers.cancel()
         executor.shutdown()
-        streamExecutor.shutdown()
+        streamExecutor.shutdownNow() // interrupts nothing stuck in a pipe write, but drops queued work at once
         super.onDestroy()
     }
 
@@ -158,7 +158,7 @@ class BridgeService : Service() {
      * Ends the op with exactly one `done` or `doneStream` (PROTOCOL.md): up to [CsWire.MAX_INLINE_RESULT_CHARS] inline,
      * up to [CsWire.MAX_STREAM_RESULT_BYTES] of UTF-8 through a pipe written on a stream thread within what the op has
      * left ([minStreamMs]..[maxStreamMs]), and anything larger as a short too_large `done`. With every stream thread
-     * busy, a large result is answered `unavailable` (before any doneStream).
+     * busy, a large result is answered `streams_busy` (before any doneStream).
      */
     private fun safeDone(r: IReply, json: String, ctx: CallContext) {
         if (json.length <= CsWire.MAX_INLINE_RESULT_CHARS) return safeInline(r, json)
@@ -166,7 +166,7 @@ class BridgeService : Service() {
         if (json.length > CsWire.MAX_STREAM_RESULT_BYTES) return safeInline(r, TOO_LARGE)
         val bytes = json.toByteArray(Charsets.UTF_8)
         if (bytes.size > CsWire.MAX_STREAM_RESULT_BYTES) return safeInline(r, TOO_LARGE)
-        if (!streamSlots.tryAcquire()) return safeInline(r, CsWire.error(CsWire.Err.UNAVAILABLE, "result streams busy"))
+        if (!streamSlots.tryAcquire()) return safeInline(r, CsWire.error(CsWire.Err.STREAMS_BUSY, "both result streams busy"))
         var handedOver = false
         try {
             val pipe = try { streamPipes() } catch (_: Exception) { return safeInline(r, CsWire.error(CsWire.Err.UNAVAILABLE, "result pipe")) }

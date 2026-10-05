@@ -43,6 +43,8 @@ object CsWire {
         const val TOO_LARGE = "too_large"; const val BUDGET = "budget"; const val UNAVAILABLE = "unavailable"
         /** A `doneStream` pipe that ended without the writer's OK (closeWithError, a dead writer) or with invalid UTF-8. */
         const val STREAM_BROKEN = "bridge_stream_broken"
+        /** Both of the bridge's stream slots are writing: a large result is answered this in `done`, with no doneStream. */
+        const val STREAMS_BUSY = "streams_busy"
         /** `IHost.webView` only: another hidden page is open in Kino. */
         const val BUSY = "busy"
         /** `IHost.webView` only: no live op the person started. */
@@ -189,11 +191,15 @@ object CsWire {
     /**
      * The reply JSON for [r], within every limit: invalid entries dropped, at most [WebView.MAX_REQUESTS] requests, and,
      * since the reply travels in one `done`, trailing requests dropped until it is at most [MAX_INLINE_RESULT_CHARS].
+     * A [WebViewReply.finalUrl] that is not https (or too long) is never sent: the answer is [Err.BLOCKED] instead.
      */
     fun webViewReply(r: WebViewReply): String {
+        if (!r.finalUrl.startsWith("https://", ignoreCase = true) || r.finalUrl.length > MAX_URL_CHARS) {
+            return error(Err.BLOCKED, "final address is not https")
+        }
         val requests = r.requests.mapNotNull { capturedRequestJson(it) }.take(WebView.MAX_REQUESTS).toMutableList()
         fun build() = JSONObject().put("requests", JSONArray(requests)).put("cookies", JSONObject(cookiesWithinLimits(r.cookies) as Map<*, *>))
-            .put("userAgent", r.userAgent.takeIf { validUserAgent(it) } ?: "").put("finalUrl", r.finalUrl.take(MAX_URL_CHARS))
+            .put("userAgent", r.userAgent.takeIf { validUserAgent(it) } ?: "").put("finalUrl", r.finalUrl)
             .put("timedOut", r.timedOut).toString()
         var out = build()
         while (out.length > MAX_INLINE_RESULT_CHARS && requests.isNotEmpty()) { requests.removeAt(requests.size - 1); out = build() }

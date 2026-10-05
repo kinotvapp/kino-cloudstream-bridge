@@ -36,6 +36,9 @@ Exactly one of `IReply.done(json)` / `IReply.doneStream(pfd)` ends each call, af
 - The bridge writes within the op's deadline, and at least 5 s and at most 60 s after `doneStream` whatever is left of
   it: a reader that does not read by then gets the stream closed with an error. Kino reads at once, off its binder
   threads, and closes the read end at its own deadline.
+- At most 2 streamed results are in flight. A large result that arrives while both stream slots are busy gets `done`
+  with `streams_busy` (`CsWire.Err.STREAMS_BUSY`) and no `doneStream`. Kino retries that op once after one of its
+  streams ends, or runs at most 2 large-result ops at a time.
 - `done` itself: when Binder refuses it (an exhausted oneway buffer is reported as `DeadObjectException` on a live
   binder), the bridge sends one short `too_large` instead. The same single fallback follows a refused `doneStream`.
 - `event`s stay inline (`done`'s budget is shared with them): per op at most 200 `link` and 100 `subtitle` events,
@@ -151,7 +154,8 @@ Reply:
   chars in all (`MAX_COOKIES_TOTAL_CHARS`; past it, cookies other than Cloudflare's `cf_*` / `__cf*` are dropped
   first). `{}` when none.
 - `userAgent`: the WebView's user agent (the one Cloudflare ties `cf_clearance` to), ≤ 512 chars, `""` if unknown.
-- `finalUrl`: the top page's last address, https (a reply with any other `finalUrl` is malformed). `timedOut`: true only on a `returnCookiesOnTimeout` timeout reply.
+- `finalUrl`: the top page's last address, https. Kino answers `blocked` instead of sending any other `finalUrl`
+  (`CsWire.webViewReply` does it), and a reply with one is malformed. `timedOut`: true only on a `returnCookiesOnTimeout` timeout reply.
 - Error codes (`CsWire.Err`): `refused` (caller is not the bridge), `bad_request`, `not_allowed` (no live op the
   person started), `blocked` (host not allowed, not https, a private address, a navigation off https), `busy` (another
   hidden page is open), `timeout`, `browser_unavailable` (no WebView on the device), `unavailable` (Kino failed or
@@ -162,7 +166,7 @@ Reply:
 `{"error":{"code","message"}}` (message ≤ 300 chars, never a URL query), codes in `CsWire.Err`: `protocol`,
 `bad_request`, `not_installed`, `incompatible` (a plugin linked against a symbol the bridge lacks), `timeout`, `cancelled`,
 `plugin_error`, `network`, `refused`, `too_large`, `budget`, `unavailable`, `bridge_stream_broken` (read side of
-`doneStream`), and, for `IHost.webView` only, `busy` plus the codes listed there.
+`doneStream`), `streams_busy` (both stream slots busy), and, for `IHost.webView` only, `busy` plus the codes listed there.
 
 ## Distribution (Kino's OTA manifest)
 

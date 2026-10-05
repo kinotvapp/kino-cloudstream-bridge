@@ -240,7 +240,7 @@ class BridgeServiceTest {
             java.nio.channels.Channels.newInputStream(nio.source()), { err -> ended += err; nio.sink().close() }, { nio.source().close() })
     }
 
-    @Test fun `stream writes never hold op threads, and a third concurrent stream is answered unavailable`() {
+    @Test fun `stream writes never hold op threads, and a third concurrent stream is answered streams_busy`() {
         val s = bind(true); val svc = service!!
         val ended = CopyOnWriteArrayList<String?>()
         svc.streamPipes = { stuckPipe(ended) }
@@ -252,7 +252,7 @@ class BridgeServiceTest {
         waitUntil("op jobs still running") { svc.jobs.isEmpty() }
         val third = FakeReply(); val t0 = System.nanoTime()
         s.call(req(CsWire.Op.SEARCH, "s3"), null, third)
-        assertEquals(CsWire.Err.UNAVAILABLE, CsWire.errorOf(third.await())!!.first)
+        assertEquals(CsWire.Err.STREAMS_BUSY, CsWire.errorOf(third.await())!!.first)
         assertTrue(third.streams.isEmpty())
         svc.runOp = { _, _, _ -> "{}" }
         val more = (1..4).map { i -> FakeReply().also { s.call(req(CsWire.Op.SEARCH, "m$i"), null, it) } }

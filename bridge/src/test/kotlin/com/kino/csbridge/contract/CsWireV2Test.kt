@@ -20,6 +20,7 @@ class CsWireV2Test {
         assertEquals(100_000, CsWire.MAX_INLINE_RESULT_CHARS)
         assertEquals(8 * 1024 * 1024, CsWire.MAX_STREAM_RESULT_BYTES)
         assertEquals("bridge_stream_broken", CsWire.Err.STREAM_BROKEN)
+        assertEquals("streams_busy", CsWire.Err.STREAMS_BUSY)
         assertEquals(20, CsWire.WebView.MAX_REQUESTS)
         assertEquals(10, CsWire.WebView.MAX_ALSO_MATCH)
         // An inline done (2 bytes a char in a parcel) leaves room for a second one in binder's ~508 KB oneway space.
@@ -124,6 +125,13 @@ class CsWireV2Test {
         val r = CsWire.WebViewReply(emptyList(), emptyMap(), "UA", "https://a.example/", false)
         for (bad in listOf("http://a.example/", "", "about:blank")) {
             assertNull(bad, CsWire.parseWebViewReply(JSONObject(CsWire.webViewReply(r)).put("finalUrl", bad).toString()))
+        }
+    }
+
+    @Test fun `webViewReply answers blocked instead of writing a non-https finalUrl`() {
+        for (bad in listOf("http://a.example/", "", "about:blank", "https://a.example/" + "p".repeat(8200))) {
+            val out = CsWire.webViewReply(CsWire.WebViewReply(emptyList(), mapOf("cf_clearance" to "x"), "UA", bad, false))
+            assertEquals(bad.take(40), CsWire.Err.BLOCKED, CsWire.errorOf(out)!!.first)
         }
     }
 
