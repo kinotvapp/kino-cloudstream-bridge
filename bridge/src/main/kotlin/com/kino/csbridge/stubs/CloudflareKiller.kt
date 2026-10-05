@@ -29,7 +29,13 @@ import java.util.concurrent.locks.ReentrantLock
  *   Saved cookies that hit the check again are dropped and solved once more, within the same request.
  * - Only one solve per plugin and host at a time: a second request waits for the first one's cookies (bounded by its
  *   own call's deadline) instead of asking Kino for a second page, which Kino would refuse as busy anyway.
- * - When the solve fails, the check page itself is returned (read into memory before the solve, so no second request).
+ * - When the solve fails, the check page itself is returned (read into memory before the solve, so no second request),
+ *   and for [FAILED_TTL_MS] that plugin and host are not solved again: their checks are answered with the check page
+ *   without a Kino page. Requests that waited for a solve that failed return too, without solving.
+ * - A solve counts only when the page ended on the request's host (cookies Kino read for another host are not this one's).
+ * - Cloudflare's own cookies (`cf_clearance`, `__cf_bm`, any `cf_*` / `__cf*`) from the solved or saved set override the
+ *   request's: a plugin that copied [getCookieHeaders] earlier must not send a stale clearance. Every other cookie of the
+ *   request wins, as upstream.
  */
 class CloudflareKiller : Interceptor {
     companion object {
@@ -38,7 +44,34 @@ class CloudflareKiller : Interceptor {
         private val CLOUDFLARE_SERVERS = setOf("cloudflare-nginx", "cloudflare")
         private const val CF_CLEARANCE = "cf_clearance"
         private const val CHECK_PAGE_MAX_BYTES = 256L * 1024
+        /** How long a failed solve keeps that plugin and host from opening another Kino page. */
+        const val FAILED_TTL_MS = 60_000L
+        private const val LOCK_SLICE_MS = 200L
+        private const val MAX_FAILED_ENTRIES = 256
         private val solving = ConcurrentHashMap<String, ReentrantLock>()
+        /** plugin + host → [System.nanoTime] of the last failed solve. */
+        private val failedAt = ConcurrentHashMap<String, Long>()
+
+        private fun recentlyFailed(key: String): Boolean {
+            val at = failedAt[key] ?: return false
+            if (System.nanoTime() - at < FAILED_TTL_MS * 1_000_000) return true
+            failedAt.remove(key, at)
+            return false
+        }
+
+        private fun markFailed(key: String) {
+            if (failedAt.size >= MAX_FAILED_ENTRIES) {
+                val now = System.nanoTime()
+                failedAt.entries.removeIf { now - it.value >= FAILED_TTL_MS * 1_000_000 }
+                if (failedAt.size >= MAX_FAILED_ENTRIES) failedAt.clear()
+            }
+            failedAt[key] = System.nanoTime()
+        }
+
+        /** Cloudflare's own cookie names: the ones a solve renews. */
+        internal fun isCloudflareCookie(name: String): Boolean = name.startsWith("cf_") || name.startsWith("__cf")
+
+        internal fun resetForTest() { solving.clear(); failedAt.clear() }
 
         /** `a=1; b=2` as a map; blank names or values are dropped. */
         fun parseCookieMap(cookie: String): Map<String, String> = cookie.split(";").associate {
@@ -65,7 +98,8 @@ class CloudflareKiller : Interceptor {
         val first = chain.proceed(if (saved != null) withCookies(request, saved) else request)
         if (!isCheck(first)) return first
         // Read the (small) check page now: it is what the plugin gets if the solve fails, without asking again.
-        val checkPage = first.newBuilder().body(first.peekBody(CHECK_PAGE_MAX_BYTES)).build()
+        // At most CHECK_PAGE_MAX_BYTES: the original Content-Length may no longer be true.
+        val checkPage = first.newBuilder().removeHeader("Content-Length").body(first.peekBody(CHECK_PAGE_MAX_BYTES)).build()
         first.close()
         if (saved != null) forget(host)
         val solved = solve(request, staleFrom = saved) ?: return checkPage
@@ -87,38 +121,55 @@ class CloudflareKiller : Interceptor {
 
     /**
      * Fresh cookies for [request]'s host: one Kino page in cookie mode, or the ones another request of this plugin just
-     * solved while this one waited for the lock (anything but [staleFrom]). Null on any failure.
+     * solved while this one waited for the lock (a clearance other than [staleFrom]'s). Null on any failure, and without
+     * a Kino page while a failed solve for this plugin and host is recent.
      */
     private fun solve(request: Request, staleFrom: Map<String, String>?): Map<String, String>? {
         val ctx = CallContext.current() ?: return null
         val host = request.url.host
-        val lock = solving.computeIfAbsent(ctx.pluginId + "\u0000" + host.lowercase()) { ReentrantLock() }
-        val waitMs = ctx.remainingMs().coerceAtMost(HostWebViewResolver.MAX_TIMEOUT_MS * 2)
-        if (!lock.tryLock(waitMs, TimeUnit.MILLISECONDS)) return null
+        val key = ctx.pluginId + "\u0000" + host.lowercase()
+        if (recentlyFailed(key)) return null
+        val lock = solving.computeIfAbsent(key) { ReentrantLock() }
+        // In short slices, so an op that ends (cancel, deadline) stops waiting at once.
+        while (!lock.tryLock(LOCK_SLICE_MS, TimeUnit.MILLISECONDS)) {
+            if (ctx.isOver()) return null
+        }
         try {
-            WebCookies.get(ctx.pluginId, host)?.takeIf { hasClearance(it) && it != staleFrom }?.let { savedCookies[host] = it; return it }
+            WebCookies.get(ctx.pluginId, host)
+                ?.takeIf { hasClearance(it) && it[CF_CLEARANCE] != staleFrom?.get(CF_CLEARANCE) }
+                ?.let { savedCookies[host] = it; return it }
+            // The holder before us failed just now: don't open another page for the same check.
+            if (recentlyFailed(key) || ctx.isOver()) return null
             log("solving the browser check for $host")
             val capture = runBlocking {
                 HostWebViewResolver.quiet(null) {
                     HostWebViewResolver.capture(request.url.toString(), match = null, headers = emptyMap(), timeoutMs = WebViewResolver.DEFAULT_TIMEOUT)
                 }
             }
-            val cookies = capture?.cookies?.takeIf { hasClearance(it) } ?: run {
+            val onHost = capture != null && (capture.finalUrl == null || capture.finalUrl.host.equals(host, ignoreCase = true))
+            val cookies = capture?.cookies?.takeIf { onHost && hasClearance(it) } ?: run {
                 log("browser check for $host not solved")
+                markFailed(key)
                 return null
             }
+            failedAt.remove(key)
             savedCookies[host] = cookies
             WebCookies.put(ctx.pluginId, host, cookies)
             return cookies
         } finally {
             lock.unlock()
+            if (!lock.hasQueuedThreads()) solving.remove(key, lock)
         }
     }
 
-    /** [request] with the solved cookies (the request's own win, as upstream) and the WebView's user agent. */
+    /**
+     * [request] with [cookies] and the WebView's user agent. The request's own cookies win, except Cloudflare's: those
+     * come from [cookies] whenever it has them (a stale copy of a clearance must not undo a solve).
+     */
     private fun withCookies(request: Request, cookies: Map<String, String>): Request {
         val own = request.headers("Cookie").flatMap { HostWebViewResolver.parseCookies(it).entries }.associate { it.key to it.value }
-        val merged = cookies + own
+        val renewed = cookies.keys.any { isCloudflareCookie(it) }
+        val merged = cookies + own.filterKeys { !(renewed && isCloudflareCookie(it)) }
         val b = request.newBuilder().removeHeader("Cookie")
             .header("Cookie", merged.entries.joinToString("; ") { "${it.key}=${it.value}" })
         WebViewResolver.webViewUserAgent?.let { b.header("User-Agent", it) }

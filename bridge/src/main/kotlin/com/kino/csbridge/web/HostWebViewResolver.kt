@@ -22,8 +22,10 @@ import org.json.JSONObject
  * INTERNET permission and never creates a WebView (or touches CookieManager, which loads the WebView provider).
  *
  * Request, exactly what Kino's `PluginBrowser.captureForCloudStream` parses:
- * `{"callId","pluginId","url","match","timeoutMs","headers":{name:value},"wantCookies":true}`. `match` absent = cookie
- * mode: Kino ends the page as soon as `cf_clearance` exists (or at the timeout), with no media required.
+ * `{"callId","pluginId","url","match","timeoutMs","headers":{name:value},"wantCookies":true}`. Cookie mode sends
+ * `"waitForCookie":"cf_clearance"` instead of `match`: Kino ends the page as soon as that cookie exists (or at the
+ * timeout), with no media required. (Kino also defaults to it when `match` is absent; the explicit field is what a
+ * later contract combining `match` and `waitForCookie` builds on.)
  * Answer: `{"request":{"url","headers"}|null,"cookies","userAgent","finalUrl"}` or `{"error":{"code","message"}}`.
  *
  * Only inside a live Kino call (Kino refuses anything else too), https only, and every wait is bounded by the call's
@@ -73,8 +75,19 @@ object HostWebViewResolver {
         return if (fits < MIN_TIMEOUT_MS) null else minOf(wanted, fits)
     }
 
-    /** `match` as Kino accepts it (1..[MAX_MATCH_CHARS] chars); an empty pattern matches anything, as it does upstream. Null = refused. */
-    fun matchPattern(match: Regex): String? = match.pattern.ifEmpty { "(?:)" }.takeIf { it.length <= MAX_MATCH_CHARS }
+    /** The cookie a cookie-mode capture waits for. */
+    const val CF_CLEARANCE = "cf_clearance"
+
+    /**
+     * `match` as Kino accepts it (1..[MAX_MATCH_CHARS] chars, the limit checked on what is sent); an empty pattern
+     * matches anything, as it does upstream. Kino compiles it with IGNORE_CASE, so unless the plugin's regex is
+     * case-insensitive itself it is sent as `(?-i)…`: Kino then picks the same first match upstream would. Null = refused.
+     */
+    fun matchPattern(match: Regex): String? {
+        val pattern = match.pattern.ifEmpty { "(?:)" }
+        val sent = if (RegexOption.IGNORE_CASE in match.options) pattern else "(?-i)$pattern"
+        return sent.takeIf { it.length <= MAX_MATCH_CHARS }
+    }
 
     /** The first-load headers Kino would keep, in order: valid names, no hop/cookie headers, no line breaks, at most [MAX_HEADERS]. */
     fun headersForKino(headers: Map<String, String>): Map<String, String> {
@@ -89,7 +102,7 @@ object HostWebViewResolver {
 
     fun requestJson(ctx: CallContext, url: HttpUrl, match: String?, headers: Map<String, String>, timeoutMs: Long): String =
         JSONObject().put("callId", ctx.callId).put("pluginId", ctx.pluginId).put("url", url.toString())
-            .apply { if (match != null) put("match", match) }
+            .apply { if (match != null) put("match", match) else put("waitForCookie", CF_CLEARANCE) }
             .put("timeoutMs", timeoutMs).put("headers", JSONObject(headersForKino(headers) as Map<*, *>))
             .put("wantCookies", true).toString()
 
@@ -212,6 +225,7 @@ object HostWebViewResolver {
  */
 object WebCookies {
     private const val MAX_ENTRIES = 128
+    const val MAX_COOKIES_PER_ENTRY = 64
     private val map = object : LinkedHashMap<String, Map<String, String>>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Map<String, String>>?): Boolean = size > MAX_ENTRIES
     }
@@ -220,8 +234,13 @@ object WebCookies {
 
     fun get(pluginId: String, host: String): Map<String, String>? = synchronized(map) { map[key(pluginId, host)] }
 
+    /**
+     * Replaces the entry: Kino wipes its WebView's cookies before every page, so each answer is that page's whole jar
+     * (merging would keep cookies the site deleted). At most [MAX_COOKIES_PER_ENTRY].
+     */
     fun put(pluginId: String, host: String, cookies: Map<String, String>) {
-        synchronized(map) { map[key(pluginId, host)] = (map[key(pluginId, host)].orEmpty() + cookies) }
+        val capped = if (cookies.size <= MAX_COOKIES_PER_ENTRY) cookies.toMap() else cookies.entries.take(MAX_COOKIES_PER_ENTRY).associate { it.key to it.value }
+        synchronized(map) { map[key(pluginId, host)] = capped }
     }
 
     fun remove(pluginId: String, host: String) { synchronized(map) { map.remove(key(pluginId, host)) } }

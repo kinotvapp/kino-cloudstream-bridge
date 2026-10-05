@@ -1,4 +1,7 @@
 // GPL-3.0 (this fork). Headless CloudStream runtime for Kino. See BRIDGE.md.
+import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
@@ -85,7 +88,8 @@ abstract class DropReplacedLibraryClasses : TransformAction<DropReplacedLibraryC
         @get:Input val classNames: ListProperty<String>
     }
 
-    @get:InputArtifact @get:PathSensitive(PathSensitivity.NAME_ONLY)
+    // Class artifacts: classpath normalisation (entry paths and contents count, timestamps and the file's name don't).
+    @get:InputArtifact @get:Classpath
     abstract val inputArtifact: Provider<FileSystemLocation>
 
     override fun transform(outputs: TransformOutputs) {
@@ -111,7 +115,8 @@ abstract class DropReplacedLibraryClasses : TransformAction<DropReplacedLibraryC
                         while (true) {
                             val e = zin.nextEntry ?: break
                             if (dropped(e.name)) continue
-                            zout.putNextEntry(ZipEntry(e.name))
+                            // Same time as the input entry (a fixed one when it has none): a reproducible jar.
+                            zout.putNextEntry(ZipEntry(e.name).apply { time = if (e.time >= 0) e.time else 315532800000L })
                             zin.copyTo(zout)
                             zout.closeEntry()
                         }
@@ -153,6 +158,20 @@ dependencies {
         }
     }
 }
+// Guard 1, at configuration time: the transform only runs for :library variants tagged above. If an AGP or upstream bump
+// renames them, nothing is tagged and the library's WebViewResolver silently comes back (D8/R8 would then fail late on
+// a duplicate class, with a message that does not name the cause). Today 3 are tagged: runtime jar + directory, api jar.
+gradle.projectsEvaluated {
+    val lib = project(":library")
+    val tagged = listOf("androidRuntimeElements", "androidApiElements").mapNotNull { lib.configurations.findByName(it) }
+        .sumOf { c -> c.outgoing.variants.count { it.attributes.getAttribute(replacedClassesDropped) == false } }
+    if (tagged < 2) throw GradleException(
+        "bridge: only $tagged :library class variant(s) carry replacedClassesDropped=false, so DropReplacedLibraryClasses " +
+            "would not run and the library's WebViewResolver (a real WebView) would stay. Update strippedClassVariants " +
+            "in bridge/build.gradle.kts to the variant names AGP now gives :library.",
+    )
+}
+
 configurations.configureEach {
     if (isCanBeResolved && (name.endsWith("RuntimeClasspath") || name.endsWith("CompileClasspath"))) {
         attributes.attribute(replacedClassesDropped, true)
@@ -257,3 +276,74 @@ val symbolCoverage by tasks.registering(Exec::class) {
     )
 }
 tasks.named("check") { dependsOn(symbolCoverage) }
+
+// ---- Guard 2: the APK itself (every variant, release included) ----------------------------------------------------
+// Scans the dex of the variant's APK: exactly one com.lagradost.cloudstream3.network.WebViewResolver, none of the
+// library copy's inner classes, and no method of android.webkit.WebView / CookieManager referenced anywhere (calling
+// one would load the WebView provider into this process), except the allowlisted ones below. Wired into assemble<Variant>.
+abstract class VerifyReplacedClasses : DefaultTask() {
+    @get:InputFiles @get:PathSensitive(PathSensitivity.NONE) abstract val apkDir: DirectoryProperty
+    @get:OutputFile abstract val report: RegularFileProperty
+
+    private class Dex(val b: ByteBuffer) {
+        fun u4(at: Int) = b.getInt(at)
+        fun u2(at: Int) = b.getShort(at).toInt() and 0xffff
+        fun string(i: Int): String {
+            var p = u4(u4(0x3C) + 4 * i)
+            while (b.get(p).toInt() and 0x80 != 0) p++ // skip the uleb128 utf16 length
+            p++
+            val out = ByteArrayOutputStream()
+            while (true) { val c = b.get(p++); if (c.toInt() == 0) break; out.write(c.toInt()) }
+            return out.toString(Charsets.UTF_8) // MUTF-8: exact for the ASCII names checked here
+        }
+        fun type(i: Int) = string(u4(u4(0x44) + 4 * i))
+        fun classes() = (0 until u4(0x60)).map { type(u4(u4(0x64) + 32 * it)) }
+        fun methods() = (0 until u4(0x58)).map { val at = u4(0x5C) + 8 * it; type(u2(at)) + "->" + string(u4(at + 4)) }
+    }
+
+    @TaskAction fun verify() {
+        val apks = apkDir.get().asFile.walkTopDown().filter { it.isFile && it.name.endsWith(".apk") }.toList()
+        if (apks.isEmpty()) throw GradleException("verifyReplacedClasses: no APK in ${apkDir.get().asFile}")
+        val lines = mutableListOf<String>()
+        for (apk in apks) {
+            val classes = mutableListOf<String>()
+            val methods = mutableSetOf<String>()
+            ZipFile(apk).use { z ->
+                z.entries().asSequence().filter { it.name.matches(Regex("classes\\d*\\.dex")) }.forEach { e ->
+                    val dex = Dex(ByteBuffer.wrap(z.getInputStream(e).readBytes()).order(ByteOrder.LITTLE_ENDIAN))
+                    classes += dex.classes(); methods += dex.methods()
+                }
+            }
+            val resolver = "Lcom/lagradost/cloudstream3/network/WebViewResolver;"
+            val problems = mutableListOf<String>()
+            val n = classes.count { it == resolver }
+            if (n != 1) problems += "$n definitions of WebViewResolver (expected exactly 1, the bridge's)"
+            classes.filter { it.startsWith("Lcom/lagradost/cloudstream3/network/WebViewResolver\$resolveUsingWebView\$") }
+                .forEach { problems += "library WebViewResolver inner class $it" }
+            methods.filter { (it.startsWith("Landroid/webkit/WebView;->") || it.startsWith("Landroid/webkit/CookieManager;->")) && it !in WEBKIT_ALLOWED }
+                .forEach { problems += "webkit method referenced: $it" }
+            if (problems.isNotEmpty()) throw GradleException("verifyReplacedClasses ${apk.name}:\n  " + problems.joinToString("\n  "))
+            lines += "${apk.name}: ${classes.size} classes, WebViewResolver x1, no WebView/CookieManager use"
+        }
+        report.get().asFile.apply { parentFile.mkdirs(); writeText(lines.joinToString("\n") + "\n") }
+    }
+
+    companion object {
+        /**
+         * androidx.core LinkifyCompat calls the static WebView.findAddress (Linkify MAP_ADDRESSES); nothing headless
+         * reaches it (Task 8 review F13).
+         */
+        val WEBKIT_ALLOWED = setOf("Landroid/webkit/WebView;->findAddress")
+    }
+}
+
+androidComponents.onVariants { variant ->
+    val cap = variant.name.replaceFirstChar { it.uppercase() }
+    val verify = tasks.register<VerifyReplacedClasses>("verifyReplacedClasses$cap") {
+        description = "Fails when the $cap APK holds the library's WebViewResolver or calls WebView/CookieManager."
+        group = "verification"
+        apkDir.set(variant.artifacts.get(com.android.build.api.artifact.SingleArtifact.APK))
+        report.set(layout.buildDirectory.file("verifyReplacedClasses/${variant.name}.txt"))
+    }
+    tasks.matching { it.name == "assemble$cap" }.configureEach { dependsOn(verify) }
+}

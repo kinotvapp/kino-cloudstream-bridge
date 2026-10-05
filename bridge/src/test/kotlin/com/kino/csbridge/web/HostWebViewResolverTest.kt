@@ -37,7 +37,7 @@ import kotlin.concurrent.thread
 @RunWith(RobolectricTestRunner::class)
 class HostWebViewResolverTest {
     /** A fake Kino: records every webView request and answers with [answer] (null = never answers). */
-    private class FakeHost(@Volatile var answer: ((JSONObject) -> String?)?) : IHost.Stub() {
+    private class FakeHost(@Volatile var answer: ((JSONObject) -> String?)?, val delayMs: Long = 20) : IHost.Stub() {
         val requests = CopyOnWriteArrayList<JSONObject>()
         override fun request(metaJson: String?, requestBody: ParcelFileDescriptor?, responseSink: ParcelFileDescriptor?, reply: IHttpReply?) =
             error("no HTTP expected here")
@@ -45,14 +45,16 @@ class HostWebViewResolverTest {
             val o = JSONObject(requestJson)
             requests += o
             val a = answer?.invoke(o) ?: return
-            thread { Thread.sleep(20); reply.done(a) } // oneway: Kino answers later, from another thread
+            thread { Thread.sleep(delayMs); reply.done(a) } // oneway: Kino answers later, from another thread
         }
         override fun storage(opJson: String?): String = CsWire.error(CsWire.Err.UNAVAILABLE, "none")
     }
 
     private lateinit var host: FakeHost
 
-    private fun serve(answer: ((JSONObject) -> String?)?) { host = FakeHost(answer); HostWebViewResolver.host = { host } }
+    private fun serve(answer: ((JSONObject) -> String?)?) = serveAfter(20, answer)
+
+    private fun serveAfter(delayMs: Long, answer: ((JSONObject) -> String?)?) { host = FakeHost(answer, delayMs); HostWebViewResolver.host = { host } }
 
     private fun ctx(deadlineMs: Long = 60_000, callId: String = "call-1") =
         CallContext(callId, "cloudstream-x", CallContext.deadlineFromNow(deadlineMs))
@@ -66,6 +68,7 @@ class HostWebViewResolverTest {
 
     @Before fun setUp() {
         WebCookies.clearForTest()
+        CloudflareKiller.resetForTest()
         WebViewResolver.webViewUserAgent = null
     }
 
@@ -91,7 +94,7 @@ class HostWebViewResolverTest {
         assertEquals("call-1", o.getString("callId"))
         assertEquals("cloudstream-x", o.getString("pluginId"))
         assertEquals("https://a.example/embed?id=7", o.getString("url"))
-        assertEquals("""master\.m3u8""", o.getString("match"))
+        assertEquals("""(?-i)master\.m3u8""", o.getString("match")) // case-sensitive like upstream (Kino adds IGNORE_CASE)
         assertEquals(25_000L, o.getLong("timeoutMs")) // upstream's 60 s default, cut to Kino's maximum
         assertTrue(o.getBoolean("wantCookies"))
         val h = o.getJSONObject("headers")
@@ -203,9 +206,10 @@ class HostWebViewResolverTest {
             .body("<html>checking</html>".toResponseBody("text/html".toMediaType())).build()
     }
 
-    private fun cfAnswer(clearance: String?) = { _: JSONObject ->
+    /** Kino's cookie-mode answer; the page ends on the requested URL unless [finalUrl] says otherwise. */
+    private fun cfAnswer(clearance: String?, finalUrl: String? = null) = { o: JSONObject ->
         JSONObject().put("request", JSONObject.NULL).put("cookies", clearance?.let { "cf_clearance=$it; __cf_bm=z" } ?: "")
-            .put("userAgent", "UA-kino").put("finalUrl", "https://a.example/").toString()
+            .put("userAgent", "UA-kino").put("finalUrl", finalUrl ?: o.getString("url")).toString()
     }
 
     private fun intercept(killer: CloudflareKiller, chain: FakeChain): Response {
@@ -225,6 +229,7 @@ class HostWebViewResolverTest {
         assertEquals("UA-kino", chain.sent[1].header("User-Agent"))
         val o = host.requests.single()
         assertFalse("cookie mode: no match", o.has("match"))
+        assertEquals("cf_clearance", o.getString("waitForCookie"))
         assertEquals("https://a.example/list?p=2", o.getString("url"))
     }
 
@@ -280,11 +285,88 @@ class HostWebViewResolverTest {
         assertTrue(h["Cookie"]!!.contains("cf_clearance=ok"))
     }
 
+    // ---- review fixes (F1, F2, F4, F5, F7) --------------------------------------------------------------------
+
+    @Test fun `solved Cloudflare cookies override the request's stale ones, other own cookies still win`() {
+        serve(cfAnswer("new"))
+        val req = Request.Builder().url("https://a.example/").header("Cookie", "cf_clearance=old; __cf_bm=old; session=mine").build()
+        val chain = FakeChain(req, cfSite("new"))
+        val r = intercept(CloudflareKiller(), chain)
+        assertEquals(200, r.code)
+        val sent = HostWebViewResolver.parseCookies(chain.sent[1].header("Cookie")!!)
+        assertEquals("new", sent["cf_clearance"])
+        assertEquals("z", sent["__cf_bm"])
+        assertEquals("mine", sent["session"])
+        // Saved cookies on the first try win over a stale copy too: one request, no new page.
+        val again = FakeChain(Request.Builder().url("https://a.example/2").header("Cookie", "cf_clearance=old").build(), cfSite("new"))
+        assertEquals(200, intercept(CloudflareKiller(), again).code)
+        assertEquals(1, again.sent.size)
+        assertEquals(1, host.requests.size)
+    }
+
+    @Test fun `a failed solve is remembered for a minute, so the next check gets the check page without a page`() {
+        serve(cfAnswer(null))
+        intercept(CloudflareKiller(), FakeChain(Request.Builder().url("https://a.example/").build(), cfSite("ok")))
+        val chain = FakeChain(Request.Builder().url("https://a.example/2").build(), cfSite("ok"))
+        val r = intercept(CloudflareKiller(), chain)
+        assertEquals(503, r.code)
+        assertEquals(1, chain.sent.size)
+        assertEquals(1, host.requests.size)
+        // Another host of the same plugin is not affected.
+        intercept(CloudflareKiller(), FakeChain(Request.Builder().url("https://b.example/").build(), cfSite("ok")))
+        assertEquals(2, host.requests.size)
+    }
+
+    @Test fun `requests waiting behind a solve that fails return without solving`() {
+        serveAfter(600, cfAnswer(null))
+        val killer = CloudflareKiller()
+        val results = CopyOnWriteArrayList<Int>()
+        val threads = (1..3).map { i ->
+            thread {
+                if (i > 1) Thread.sleep(150) // start while the first one holds the lock
+                results += intercept(killer, FakeChain(Request.Builder().url("https://a.example/$i").build(), cfSite("ok"))).code
+            }
+        }
+        threads.forEach { it.join(10_000) }
+        assertEquals(listOf(503, 503, 503), results.toList())
+        assertEquals(1, host.requests.size)
+    }
+
+    @Test fun `a solve whose page ended on another host does not count`() {
+        serve(cfAnswer("ok", finalUrl = "https://challenge.other.example/"))
+        val chain = FakeChain(Request.Builder().url("https://a.example/").build(), cfSite("ok"))
+        assertEquals(503, intercept(CloudflareKiller(), chain).code)
+        assertEquals(1, chain.sent.size)
+        assertNull(WebCookies.get("cloudstream-x", "a.example"))
+    }
+
+    @Test fun `match is sent case-sensitive unless the plugin's regex ignores case, limit checked after the prefix`() {
+        assertEquals("(?-i)m3u8", HostWebViewResolver.matchPattern(Regex("m3u8")))
+        assertEquals("m3u8", HostWebViewResolver.matchPattern(Regex("m3u8", RegexOption.IGNORE_CASE)))
+        assertEquals("(?-i)(?:)", HostWebViewResolver.matchPattern(Regex("")))
+        assertEquals(500, HostWebViewResolver.matchPattern(Regex("a".repeat(495)))!!.length)
+        assertNull(HostWebViewResolver.matchPattern(Regex("a".repeat(496))))
+        assertEquals(496, HostWebViewResolver.matchPattern(Regex("a".repeat(496), RegexOption.IGNORE_CASE))!!.length)
+    }
+
+    @Test fun `a page's cookies replace the previous ones, capped`() {
+        WebCookies.put("p", "h.example", mapOf("old" to "1", "cf_clearance" to "a"))
+        WebCookies.put("p", "h.example", mapOf("cf_clearance" to "b"))
+        assertEquals(mapOf("cf_clearance" to "b"), WebCookies.get("p", "h.example"))
+        WebCookies.put("p", "h.example", (1..100).associate { "c$it" to "v" })
+        assertEquals(WebCookies.MAX_COOKIES_PER_ENTRY, WebCookies.get("p", "h.example")!!.size)
+    }
+
     // ---- never a WebView in this process ---------------------------------------------------------------------
 
     /** The jar (or directory) a class was loaded from, as its resource URL names it. */
     private fun origin(c: Class<*>): String = c.getResource(c.simpleName + ".class")!!.toString().substringBefore("!/")
 
+    /**
+     * Guards the transform's jar path (compile and unit-test classpaths) on debug: AGP 9 has no release unit-test task.
+     * The dex path (android-classes-directory -> android-classes) and release are checked on the APK itself by
+     * verifyReplacedClasses<Variant> (bridge/build.gradle.kts), which every assemble runs.
+     */
     @Test fun `the WebViewResolver plugins load is the bridge's, the library's copy is gone`() {
         val res = "com/lagradost/cloudstream3/network/WebViewResolver.class"
         // Robolectric's sandbox loader lists its parent's entries again: count distinct origins.
