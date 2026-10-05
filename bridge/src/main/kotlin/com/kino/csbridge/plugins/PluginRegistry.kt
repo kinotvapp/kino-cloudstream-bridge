@@ -25,22 +25,26 @@ import java.lang.reflect.InvocationTargetException
 import java.security.MessageDigest
 import java.util.Collections
 import java.util.IdentityHashMap
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.ZipFile
 
 /**
- * The plugins this bridge holds: `filesDir/plugins/<id>.cs3` plus `index.json` (`[{pluginId, file, sha256, crashed}]`).
+ * The plugins this bridge holds: `filesDir/plugins/<id>.cs3` plus `index.json` (`[{pluginId, file, sha256, crashes}]`).
  *
  * Loading mirrors upstream `PluginManager.loadPlugin` (read-only file, `PathClassLoader`, manifest, plugin class,
  * `filename`, resources, `load(context)` / `load()`), with three differences: a member-level ABI check
  * ([SymbolChecker]) runs before any plugin code; the providers, extractors and click actions a plugin registers are
  * recorded by identity under its Kino id (a snapshot diff around `load()`), so [remove] takes out exactly those and
- * nothing that merely shares a name; and a crash-loop guard: `loading-<id>` exists only while that plugin's code runs
- * its loading, so finding one at start-up means it killed the process: the plugin is then `incompatible` until Kino
- * re-installs it.
+ * nothing that merely shares a name; and a crash-loop guard: `loading-<id>` exists only while that plugin's loading
+ * code runs, so finding one at start-up means the process died inside it. Each such death adds one to the entry's
+ * `crashes`; a successful load or a re-install resets it, and at [CRASHES_TO_DISABLE] consecutive deaths the plugin
+ * is `incompatible` until Kino re-installs it (one OOM kill or unbind mid-load does not disable it).
  *
  * A stored plugin is loaded on first use ([providers]), from inside the op that needs it, so the HTTP its `load()`
- * makes is part of a call Kino serves. All mutation is serialised on one lock: the snapshot diff needs it.
+ * makes is part of a call Kino serves. All mutation is serialised on one lock (the snapshot diff needs it); the lock
+ * is never needed to answer `hello` / `listPlugins` ([stored] reads an immutable snapshot published on every index
+ * write) and the payload is streamed and hashed before taking it.
  */
 class PluginRegistry(
     context: Context,
@@ -52,7 +56,9 @@ class PluginRegistry(
 
     data class InstallResult(val name: String, val version: Int, val providers: List<MainAPI>, val missingSymbols: List<String>)
 
-    private data class Entry(val pluginId: String, val file: String, val sha256: String, val crashed: Boolean = false)
+    private data class Entry(val pluginId: String, val file: String, val sha256: String, val crashes: Int = 0) {
+        val disabled get() = crashes >= CRASHES_TO_DISABLE
+    }
 
     private class Manifest(val name: String?, val pluginClassName: String, val version: Int, val requiresResources: Boolean)
 
@@ -70,10 +76,13 @@ class PluginRegistry(
     private val loaded = ConcurrentHashMap<String, Loaded>()
     @Volatile private var started = false
 
+    /** What [stored] answers: replaced as a whole after every successful index write, read without the lock. */
+    @Volatile private var published: List<CsWire.HelloPlugin> = emptyList()
+
     /**
-     * Once per process (the first `hello`, or whatever op comes first): reads the index, turns every crash marker into
-     * a persisted `crashed` flag, and drops entries whose file is gone or no longer hashes to its sha256, plus stray
-     * temporary and orphan files. No plugin code runs here.
+     * Once per process (the first `hello`, or whatever op comes first): reads the index, counts every crash marker into
+     * the entry's persisted `crashes` (written before the markers are deleted), and drops entries whose file is gone or
+     * no longer hashes to its sha256, plus stray temporary and orphan files. No plugin code runs here.
      */
     fun ensureLoaded() {
         if (started) return
@@ -82,89 +91,111 @@ class PluginRegistry(
             dir.mkdirs()
             index.clear()
             readIndex().forEach { index[it.pluginId] = it }
-            for (f in dir.listFiles().orEmpty()) {
-                when {
-                    f.name.startsWith(MARKER) -> {
-                        val id = f.name.removePrefix(MARKER)
-                        index[id]?.let { index[id] = it.copy(crashed = true) }
-                        f.delete()
-                    }
-                    f.name.startsWith(TMP) -> f.delete()
-                }
+            val markers = dir.listFiles().orEmpty().filter { it.name.startsWith(MARKER) }
+            for (m in markers) {
+                val id = m.name.removePrefix(MARKER)
+                index[id]?.let { index[id] = it.copy(crashes = it.crashes + 1) }
             }
+            dir.listFiles().orEmpty().filter { it.name.startsWith(TMP) }.forEach { deleteFile(it) }
             for (e in index.values.toList()) {
                 val f = File(dir, e.file)
                 if (!f.isFile || sha256Of(f) != e.sha256) { index.remove(e.pluginId); deleteFile(f) }
             }
+            writeIndex() // the crash counts are on disk before the markers that justify them go away
+            markers.forEach { it.delete() }
             val keep = index.values.map { it.file }.toSet() + indexFile.name
             dir.listFiles().orEmpty().filter { it.isFile && it.name !in keep }.forEach { deleteFile(it) }
-            writeIndex()
             started = true
         }
     }
 
-    /** Ids stored, in install order. */
-    fun ids(): List<String> { ensureLoaded(); return synchronized(lock) { index.keys.toList() } }
+    /** Ids stored, in install order. Never waits on an install or a plugin's load(). */
+    fun ids(): List<String> = stored().map { it.id }
 
-    /** Every stored plugin with the sha256 of its file, crashed ones included (Kino must not re-send them in a loop). */
-    fun stored(): List<CsWire.HelloPlugin> {
-        ensureLoaded()
-        return synchronized(lock) { index.values.map { CsWire.HelloPlugin(it.pluginId, it.sha256) } }
-    }
+    /**
+     * Every stored plugin with the sha256 of its file, disabled ones included (Kino must not re-send them in a loop).
+     * Never waits on an install or a plugin's load(): `hello` runs on a binder thread.
+     */
+    fun stored(): List<CsWire.HelloPlugin> { ensureLoaded(); return published }
 
     /**
      * Verifies, ABI-checks, stores and loads one `.cs3`. A plugin with missing symbols is answered with them and is not
-     * stored (a previously installed version stays). Plugin throwables propagate after cleanup, so the caller maps them
-     * (`incompatible` for linkage errors, `plugin_error` otherwise).
+     * stored; a new version whose load() fails is rolled back to the previous file. In both cases the installed version
+     * stays. Plugin throwables propagate after cleanup, so the caller maps them (`incompatible` for linkage errors,
+     * `plugin_error` otherwise).
      */
     fun install(pluginId: String, cs3: InputStream, sha256: String): InstallResult {
         ensureLoaded()
         val name = SafeNames.fileName(pluginId) ?: throw RegistryException(CsWire.Err.BAD_REQUEST, "plugin id")
         if (!SHA256.matches(sha256)) throw RegistryException(CsWire.Err.BAD_REQUEST, "sha256")
-        synchronized(lock) {
-            dir.mkdirs()
-            val tmp = File(dir, "$TMP$name")
-            try {
-                deleteFile(tmp)
-                if (copyHashing(cs3, tmp) != sha256) throw RegistryException(CsWire.Err.BAD_REQUEST, "sha256 mismatch")
-                val manifest = readManifest(tmp)
-                val missing = try { SymbolChecker(parentLoader).missing(tmp) } catch (e: IllegalArgumentException) {
-                    throw RegistryException(CsWire.Err.BAD_REQUEST, "not a .cs3")
-                }
-                val displayName = manifest.name ?: pluginId
-                if (missing.isNotEmpty()) return InstallResult(displayName, manifest.version, emptyList(), missing)
-
-                removeLocked(pluginId)
-                val target = File(dir, name)
-                if (!tmp.renameTo(target)) throw IOException("rename failed")
-                // Android 14 refuses to load a writable dex file.
-                if (!target.setReadOnly()) { deleteFile(target); throw IOException("setReadOnly failed") }
-                // Indexed before load(): if load() kills the process, the marker then names a known entry.
-                index[pluginId] = Entry(pluginId, name, sha256)
-                writeIndex()
-                val l = try {
-                    loadLocked(pluginId, target, manifest)
-                } catch (t: Throwable) {
-                    index.remove(pluginId); writeIndex(); deleteFile(target)
-                    throw t
-                }
-                return InstallResult(displayName, manifest.version, l.providers, emptyList())
-            } finally {
-                deleteFile(tmp)
+        dir.mkdirs()
+        // Unique per call and outside the lock: a slow payload never blocks another op, two installs never share it.
+        val tmp = File(dir, "$TMP$name-${UUID.randomUUID()}")
+        try {
+            if (copyHashing(cs3, tmp) != sha256) throw RegistryException(CsWire.Err.BAD_REQUEST, "sha256 mismatch")
+            val manifest = readManifest(tmp)
+            val missing = try { SymbolChecker(parentLoader).missing(tmp) } catch (e: IllegalArgumentException) {
+                throw RegistryException(CsWire.Err.BAD_REQUEST, "not a .cs3")
             }
+            val displayName = manifest.name ?: pluginId
+            if (missing.isNotEmpty()) return InstallResult(displayName, manifest.version, emptyList(), missing)
+            synchronized(lock) {
+                val l = replaceLocked(pluginId, name, sha256, tmp, manifest)
+                return InstallResult(displayName, manifest.version, l.providers, emptyList())
+            }
+        } finally {
+            deleteFile(tmp)
+        }
+    }
+
+    /** Swaps [tmp] in for [pluginId]; the previous version's file and entry come back if the new one does not load. */
+    private fun replaceLocked(pluginId: String, name: String, sha256: String, tmp: File, manifest: Manifest): Loaded {
+        unloadLocked(pluginId)
+        val target = File(dir, name)
+        val previous = index[pluginId]
+        val backup = File(dir, "$TMP$name-previous-${UUID.randomUUID()}").takeIf { previous != null && target.isFile }
+        var backedUp = false
+        try {
+            if (backup != null) { if (!target.renameTo(backup)) throw IOException("backup failed"); backedUp = true }
+            deleteFile(target)
+            if (!tmp.renameTo(target)) throw IOException("rename failed")
+            // Android 14 refuses to load a writable dex file.
+            if (!target.setReadOnly()) throw IOException("setReadOnly failed")
+            // Indexed before load(): if load() kills the process, the marker then names a known entry.
+            index[pluginId] = Entry(pluginId, name, sha256)
+            writeIndex()
+            val l = loadLocked(pluginId, target, manifest)
+            backup?.let { deleteFile(it) }
+            return l
+        } catch (t: Throwable) {
+            // Best effort, step by step: nothing here may replace the original throwable.
+            if (backup == null || backedUp) runCatching { deleteFile(target) } // a failed backup left the old file in place
+            if (backup != null && backedUp) runCatching { if (!backup.renameTo(target)) deleteFile(backup) }
+            runCatching {
+                if (previous != null && target.isFile) index[pluginId] = previous else index.remove(pluginId)
+            }
+            runCatching { writeIndex() }
+            throw t
         }
     }
 
     /** `beforeUnload()`, then exactly this id's registrations out of CloudStream's lists, then the file. Unknown ids: no-op. */
     fun remove(pluginId: String) {
+        val name = SafeNames.fileName(pluginId) ?: throw RegistryException(CsWire.Err.BAD_REQUEST, "plugin id")
         ensureLoaded()
-        synchronized(lock) { removeLocked(pluginId) }
+        synchronized(lock) {
+            unloadLocked(pluginId)
+            val e = index.remove(pluginId)
+            deleteFile(File(dir, e?.file ?: name))
+            File(dir, "$MARKER$pluginId").delete()
+            if (e != null) writeIndex()
+        }
     }
 
     /**
      * The providers [pluginId] registered, loading it first if this process has not yet (inside the caller's op).
-     * @throws RegistryException `not_installed` when it is not stored, `incompatible` when it crashed the bridge while
-     * loading or no longer links against this bridge.
+     * @throws RegistryException `not_installed` when it is not stored, `incompatible` when it killed the bridge in
+     * [CRASHES_TO_DISABLE] consecutive loads or no longer links against this bridge.
      */
     fun providers(pluginId: String): List<MainAPI> {
         ensureLoaded()
@@ -172,7 +203,7 @@ class PluginRegistry(
         synchronized(lock) {
             loaded[pluginId]?.let { return it.providers }
             val e = index[pluginId] ?: throw RegistryException(CsWire.Err.NOT_INSTALLED, "plugin")
-            if (e.crashed) throw RegistryException(CsWire.Err.INCOMPATIBLE, "crashed the bridge while loading; re-install it")
+            if (e.disabled) throw RegistryException(CsWire.Err.INCOMPATIBLE, "crashed the bridge while loading; re-install it")
             val f = File(dir, e.file)
             val manifest = try { readManifest(f) } catch (x: RegistryException) { throw RegistryException(CsWire.Err.INCOMPATIBLE, "manifest") }
             // The bridge may have been updated since the install: check again before running its code.
@@ -182,15 +213,11 @@ class PluginRegistry(
         }
     }
 
-    private fun removeLocked(pluginId: String) {
+    private fun unloadLocked(pluginId: String) {
         loaded.remove(pluginId)?.let { l ->
             try { l.plugin.beforeUnload() } catch (_: Throwable) {}
             unregister(l.plugin, l.path, l.providers, l.extractors, l.actions)
         }
-        val e = index.remove(pluginId)
-        if (e != null) { deleteFile(File(dir, e.file)); writeIndex() }
-        SafeNames.fileName(pluginId)?.let { deleteFile(File(dir, it)) }
-        File(dir, "$MARKER$pluginId").delete()
     }
 
     /** Upstream's load sequence, guarded by the crash marker and bracketed by the registration snapshot. */
@@ -231,6 +258,8 @@ class PluginRegistry(
                 added(VideoClickActionHolder.allVideoClickActions, beforeActions))
             loaded[pluginId] = l
             done = l
+            // Consecutive deaths only: a load that completed resets the count (best effort; the load itself succeeded).
+            index[pluginId]?.takeIf { it.crashes != 0 }?.let { index[pluginId] = it.copy(crashes = 0); runCatching { writeIndex() } }
             return l
         } finally {
             if (done == null) {
@@ -241,9 +270,13 @@ class PluginRegistry(
         }
     }
 
+    /** By identity against what this plugin registered: upstream's removePluginMapping compares with equals(). */
     private fun unregister(plugin: BasePlugin?, path: String, providers: List<MainAPI>, extractors: List<ExtractorApi>, actions: List<VideoClickAction>) {
         val p = identitySet(providers); val x = identitySet(extractors); val a = identitySet(actions)
-        providers.forEach { APIHolder.removePluginMapping(it) }
+        if (p.isNotEmpty()) {
+            APIHolder.apis.withLock { APIHolder.apis = APIHolder.apis.filter { it !in p } }
+            APIHolder.apiMap = null // rebuilt from `apis` on the next name lookup
+        }
         APIHolder.allProviders.withLock { APIHolder.allProviders.removeAll { it in p } }
         extractorApis.withLock { extractorApis.removeAll { it in x } }
         VideoClickActionHolder.allVideoClickActions.withLock { VideoClickActionHolder.allVideoClickActions.removeAll { it in a } }
@@ -310,7 +343,7 @@ class PluginRegistry(
             val file = o.getString("file")
             val sha = o.getString("sha256")
             // The file name is never trusted from disk: it must be the one SafeNames derives from the id.
-            if (SafeNames.fileName(id) != file || !SHA256.matches(sha)) null else Entry(id, file, sha, o.optBoolean("crashed", false))
+            if (SafeNames.fileName(id) != file || !SHA256.matches(sha)) null else Entry(id, file, sha, o.optInt("crashes", 0).coerceAtLeast(0))
         }
     } catch (_: Exception) {
         emptyList()
@@ -318,10 +351,11 @@ class PluginRegistry(
 
     private fun writeIndex() {
         val a = JSONArray()
-        index.values.forEach { a.put(JSONObject().put("pluginId", it.pluginId).put("file", it.file).put("sha256", it.sha256).put("crashed", it.crashed)) }
-        val tmp = File(dir, "${TMP}index.json")
+        index.values.forEach { a.put(JSONObject().put("pluginId", it.pluginId).put("file", it.file).put("sha256", it.sha256).put("crashes", it.crashes)) }
+        val tmp = File(dir, "${TMP}index-${UUID.randomUUID()}.json")
         tmp.writeText(a.toString())
         if (!tmp.renameTo(indexFile)) { tmp.delete(); throw IOException("index write failed") }
+        published = index.values.map { CsWire.HelloPlugin(it.pluginId, it.sha256) }
     }
 
     private fun sha256Of(f: File): String = f.inputStream().use { input ->
@@ -341,6 +375,8 @@ class PluginRegistry(
         private const val MAX_MANIFEST_BYTES = 64 * 1024
         private const val MARKER = "loading-"
         private const val TMP = ".tmp-"
+        /** Consecutive loads that killed the process before the plugin is disabled until re-installed. */
+        const val CRASHES_TO_DISABLE = 2
         private val SHA256 = Regex("^[0-9a-f]{64}$")
     }
 }

@@ -45,11 +45,15 @@ class BridgeService : Service() {
                 return JSONObject(CsWire.error(CsWire.Err.PROTOCOL, "bridge speaks ${CsWire.PROTOCOL_VERSION}"))
                     .put("protocolVersion", CsWire.PROTOCOL_VERSION).toString()
             }
+            // Runs on this binder thread; a storage failure must not escape it (a checked exception would kill the process).
+            val plugins = try { Ops.helloPlugins(this@BridgeService) } catch (_: Exception) {
+                return CsWire.error(CsWire.Err.UNAVAILABLE, "plugin storage")
+            }
             HostLink.host = host
             return JSONObject().put("protocolVersion", CsWire.PROTOCOL_VERSION)
                 .put("bridgeVersionCode", BuildConfig.VERSION_CODE.toLong())
                 .put("upstreamCommit", BuildConfig.UPSTREAM_COMMIT).put("kotlinVersion", KotlinVersion.CURRENT.toString())
-                .put("plugins", CsWire.helloPluginsToJson(Ops.helloPlugins(this@BridgeService))).toString()
+                .put("plugins", CsWire.helloPluginsToJson(plugins)).toString()
         }
 
         override fun call(requestJson: String, payload: ParcelFileDescriptor?, reply: IReply) {

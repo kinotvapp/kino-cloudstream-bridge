@@ -20,11 +20,11 @@ object Ops {
         instance ?: synchronized(this) { instance ?: PluginRegistry(context.applicationContext ?: context).also { instance = it } }
 
     /**
-     * Plugins the bridge holds, for `hello`: id + sha256 of the stored .cs3 (re-hashed once per process). Runs on a
-     * binder thread, so a storage failure answers "nothing held" (Kino then re-sends) instead of escaping the call.
+     * Plugins the bridge holds, for `hello`: id + sha256 of the stored .cs3 (re-hashed once per process). Never waits
+     * on an install or a plugin's load(). Throws when the bridge's storage cannot be read; the service answers
+     * `unavailable` then, never an empty list (Kino would re-send every plugin).
      */
-    fun helloPlugins(context: Context): List<CsWire.HelloPlugin> =
-        try { registry(context).stored() } catch (_: Exception) { emptyList() }
+    fun helloPlugins(context: Context): List<CsWire.HelloPlugin> = registry(context).stored()
 
     /** Runs one op and returns its `done` JSON. [emit] sends `event` JSON. May throw; the service maps throwables to errors. */
     suspend fun run(context: Context, req: CsWire.OpRequest, payload: ParcelFileDescriptor?, emit: (String) -> Unit): String = try {

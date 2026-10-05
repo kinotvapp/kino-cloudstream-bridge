@@ -54,3 +54,17 @@ class ThrowingPlugin : Plugin() {
 
 /** Not a BasePlugin at all. */
 class NotAPlugin
+
+/** load() blocks until the test releases it: an untrusted plugin that hangs. */
+class BlockingPlugin : Plugin() {
+    override fun load(context: Context) {
+        registerMainAPI(FixtureApi())
+        entered.countDown()
+        release.await(10, java.util.concurrent.TimeUnit.SECONDS)
+    }
+    companion object {
+        @Volatile var entered = java.util.concurrent.CountDownLatch(1)
+        @Volatile var release = java.util.concurrent.CountDownLatch(1)
+        fun reset() { entered = java.util.concurrent.CountDownLatch(1); release = java.util.concurrent.CountDownLatch(1) }
+    }
+}

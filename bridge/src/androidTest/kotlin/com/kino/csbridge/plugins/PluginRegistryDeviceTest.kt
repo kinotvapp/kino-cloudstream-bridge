@@ -71,7 +71,7 @@ class PluginRegistryDeviceTest {
         assertTrue(dir.listFiles().orEmpty().none { it.name.endsWith(".cs3") || it.name.startsWith("loading-") })
     }
 
-    @Test fun storedPluginLoadsLazilyAndAMarkerMakesItIncompatible() {
+    @Test fun storedPluginLoadsLazilyAndTwoMarkersMakeItIncompatible() {
         val f = cs3(DexFixtures.pluginDex())
         registry().installFile("cloudstream-dex-a", f)
         // New process: what the old one registered is gone; the file and the index stay.
@@ -81,6 +81,10 @@ class PluginRegistryDeviceTest {
         assertEquals("DexFixture", r.providers("cloudstream-dex-a").single().name)
 
         APIHolder.allProviders.withLock { APIHolder.allProviders.removeAll { it.javaClass.name == "fixture.DexApi" } }
+        registries.clear()
+        // Two consecutive loads that died with the process (one alone is forgiven).
+        File(dir, "loading-cloudstream-dex-a").writeText("")
+        registry().ensureLoaded()
         registries.clear()
         File(dir, "loading-cloudstream-dex-a").writeText("")
         val crashed = registry()

@@ -5,6 +5,7 @@ import android.content.Context
 import com.kino.csbridge.contract.CsWire
 import com.kino.csbridge.plugins.fixture.FixtureApi
 import com.kino.csbridge.plugins.fixture.FixtureExtractor
+import com.kino.csbridge.plugins.fixture.BlockingPlugin
 import com.kino.csbridge.plugins.fixture.FixturePlugin
 import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.utils.extractorApis
@@ -21,6 +22,8 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import java.io.File
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 @RunWith(RobolectricTestRunner::class)
 class PluginRegistryTest {
@@ -172,26 +175,108 @@ class PluginRegistryTest {
         assertTrue(dir.listFiles()!!.none { it.name.startsWith("loading-") })
     }
 
-    @Test fun `crash-loop guard - a marker left by a crash makes the plugin incompatible until it is re-installed`() {
+    /** A new process finds the marker a load left when the previous process died inside it. */
+    private fun crashDuringLoad(id: String) { simulateProcessDeath(); File(dir, "loading-$id").writeText("") }
+
+    private fun incompatible(r: PluginRegistry, id: String) =
+        assertEquals(CsWire.Err.INCOMPATIBLE, assertThrows(PluginRegistry.RegistryException::class.java) { r.providers(id) }.code)
+
+    @Test fun `crash-loop guard - one interrupted load is forgiven and a successful load resets the count`() {
         val f = cs3()
         registry().installFile("cloudstream-a", f)
-        simulateProcessDeath()
-        File(dir, "loading-cloudstream-a").writeText("") // the process died inside load()
-        val r = registry()
-        r.ensureLoaded()
+        crashDuringLoad("cloudstream-a")
+        val r = registry(); r.ensureLoaded()
+        assertFalse(File(dir, "loading-cloudstream-a").exists())
+        assertEquals(1, JSONArray(File(dir, "index.json").readText()).getJSONObject(0).getInt("crashes"))
+        assertEquals(1, r.providers("cloudstream-a").size) // an OOM kill or an unbind mid-load does not disable it
+        assertEquals(0, JSONArray(File(dir, "index.json").readText()).getJSONObject(0).getInt("crashes"))
+        // Not consecutive any more: one more death is again only the first.
+        crashDuringLoad("cloudstream-a")
+        assertEquals(1, registry().providers("cloudstream-a").size)
+    }
+
+    @Test fun `crash-loop guard - two consecutive interrupted loads disable the plugin until it is re-installed`() {
+        val f = cs3()
+        registry().installFile("cloudstream-a", f)
+        crashDuringLoad("cloudstream-a")
+        registry().ensureLoaded() // count 1, and the process dies again before any successful load
+        crashDuringLoad("cloudstream-a")
+        val r = registry(); r.ensureLoaded()
         assertFalse(File(dir, "loading-cloudstream-a").exists())
         // Still listed with its sha, so Kino does not re-send the same file in a loop.
         assertEquals(listOf(CsWire.HelloPlugin("cloudstream-a", DexFixtures.sha256(f))), r.stored())
-        val e = assertThrows(PluginRegistry.RegistryException::class.java) { r.providers("cloudstream-a") }
-        assertEquals(CsWire.Err.INCOMPATIBLE, e.code)
+        incompatible(r, "cloudstream-a")
         assertEquals(emptyList<FixtureApi>(), fixtureProviders())
         // Survives another restart.
         simulateProcessDeath()
-        val r2 = registry(); r2.ensureLoaded()
-        assertEquals(CsWire.Err.INCOMPATIBLE, assertThrows(PluginRegistry.RegistryException::class.java) { r2.providers("cloudstream-a") }.code)
-        // Kino re-installs: loads again.
+        val r2 = registry()
+        incompatible(r2, "cloudstream-a")
+        // Kino re-installs: loads again, count back to zero.
         assertEquals(1, r2.installFile("cloudstream-a", f).providers.size)
-        assertEquals(1, r2.providers("cloudstream-a").size)
+        assertEquals(0, JSONArray(File(dir, "index.json").readText()).getJSONObject(0).getInt("crashes"))
+        simulateProcessDeath()
+        assertEquals(1, registry().providers("cloudstream-a").size)
+    }
+
+    @Test fun `a crash marker of plugin A leaves plugin B loadable after a restart`() {
+        val f = cs3()
+        registry().apply { installFile("cloudstream-a", f); installFile("cloudstream-b", f) }
+        crashDuringLoad("cloudstream-a")
+        registry().ensureLoaded()
+        crashDuringLoad("cloudstream-a")
+        val r = registry()
+        incompatible(r, "cloudstream-a")
+        assertEquals(1, r.providers("cloudstream-b").size)
+        assertEquals(0, JSONArray(File(dir, "index.json").readText()).getJSONObject(1).getInt("crashes"))
+    }
+
+    @Test fun `a new version whose load fails is rolled back to the previous one`() {
+        val r = registry()
+        val old = cs3()
+        r.installFile("cloudstream-a", old)
+        assertThrows(IllegalStateException::class.java) {
+            r.installFile("cloudstream-a", cs3(com.kino.csbridge.plugins.fixture.ThrowingPlugin::class.java.name))
+        }
+        assertEquals(listOf(CsWire.HelloPlugin("cloudstream-a", DexFixtures.sha256(old))), r.stored())
+        assertEquals(DexFixtures.sha256(old), DexFixtures.sha256(File(dir, "cloudstream-a.cs3")))
+        assertFalse(File(dir, "cloudstream-a.cs3").canWrite())
+        assertTrue(dir.listFiles()!!.none { it.name.startsWith(".tmp-") || it.name.startsWith("loading-") })
+        // The previous version loads again (lazily), with only its own provider registered.
+        assertEquals(1, r.providers("cloudstream-a").size)
+        assertEquals(1, fixtureProviders().size)
+        // And after a restart, too.
+        simulateProcessDeath()
+        assertEquals(1, registry().providers("cloudstream-a").size)
+    }
+
+    @Test fun `hello and list never wait on a plugin load that hangs, nor on another install`() {
+        val r = registry()
+        val stable = cs3()
+        r.installFile("cloudstream-stable", stable)
+        BlockingPlugin.reset()
+        val pool = Executors.newFixedThreadPool(3)
+        try {
+            val hung = pool.submit<Any> { r.installFile("cloudstream-hung", cs3(BlockingPlugin::class.java.name)) }
+            assertTrue("load() never started", BlockingPlugin.entered.await(5, TimeUnit.SECONDS))
+            // A second install streams and hashes outside the lock, then queues behind the hung load.
+            val queued = pool.submit<Any> { r.installFile("cloudstream-queued", cs3()) }
+            val hello = pool.submit<List<CsWire.HelloPlugin>> { r.stored() }
+            val ids = hello.get(2, TimeUnit.SECONDS).map { it.id }
+            assertTrue(ids.contains("cloudstream-stable"))
+            assertEquals(ids, r.ids())
+            assertFalse(queued.isDone)
+            BlockingPlugin.release.countDown()
+            hung.get(5, TimeUnit.SECONDS); queued.get(5, TimeUnit.SECONDS)
+            assertEquals(listOf("cloudstream-stable", "cloudstream-hung", "cloudstream-queued"), r.ids())
+        } finally {
+            BlockingPlugin.release.countDown()
+            pool.shutdownNow()
+        }
+    }
+
+    @Test fun `remove of an id SafeNames refuses is a bad request`() {
+        assertEquals(CsWire.Err.BAD_REQUEST, assertThrows(PluginRegistry.RegistryException::class.java) { registry().remove("../index.json") }.code)
+        assertEquals(CsWire.Err.BAD_REQUEST, assertThrows(PluginRegistry.RegistryException::class.java) { registry().remove("cloudstream-A") }.code)
     }
 
     @Test fun `ensureLoaded drops entries whose file no longer matches its sha`() {
