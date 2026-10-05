@@ -159,7 +159,8 @@ object HostWebViewResolver {
         }
         val capture = parseAnswer(answer) ?: run { log("webview ${start.host}: malformed answer"); return Outcome.Failed(MALFORMED) }
         capture.userAgent?.let { WebViewResolver.webViewUserAgent = it }
-        if (capture.cookies.isNotEmpty()) WebCookies.put(ctx.pluginId, (capture.finalUrl ?: start).host, capture.cookies)
+        // Filed only under the page's known final host: cookies of an unknown host are never this host's.
+        if (capture.cookies.isNotEmpty() && capture.finalUrl != null) WebCookies.put(ctx.pluginId, capture.finalUrl.host, capture.cookies)
         return Outcome.Got(capture)
     }
 

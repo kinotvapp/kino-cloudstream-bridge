@@ -26,6 +26,8 @@ import kotlinx.coroutines.job
 import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.coroutineContext
 
@@ -37,16 +39,27 @@ class BridgeService : Service() {
     internal var runOp: suspend (CsWire.OpRequest, ParcelFileDescriptor?, (String) -> Boolean) -> String =
         { req, payload, emit -> Ops.run(this, req, payload, emit) }
 
-    /**
-     * Op bodies and replies, on this service's own threads (never Dispatchers.IO, which plugin code may fill). Plugin code
-     * never runs here (it runs on PluginWork's pool or the registry's threads), so stuck plugins cannot take them.
-     */
     /** The pipe for a large result; tests swap it for one whose reader never reads. */
     internal var streamPipes: () -> StreamPipe = { ResultStream.pipe() }
     /** A streamed result gets what its op has left, within these bounds (PROTOCOL.md). Tests shrink them. */
     @Volatile internal var minStreamMs = 5_000L
     @Volatile internal var maxStreamMs = 60_000L
 
+    /**
+     * Stream writes, on threads of their own: a Kino that reads slowly (or not at all) holds one of these for up to
+     * [maxStreamMs], never an op thread, so every other op's answer (a deadline's included) still goes out on time.
+     * At most [STREAM_THREADS] streams at once; another large result is answered `unavailable` instead.
+     */
+    private val streamExecutor = Executors.newFixedThreadPool(STREAM_THREADS) { r -> Thread(r, "bridge-stream").apply { isDaemon = true } }
+    private val streamSlots = Semaphore(STREAM_THREADS)
+
+    /** True when no stream write is running (tests wait for it). */
+    internal fun streamsIdle(): Boolean = streamSlots.availablePermits() == STREAM_THREADS
+
+    /**
+     * Op bodies and replies, on this service's own threads (never Dispatchers.IO, which plugin code may fill). Plugin code
+     * never runs here (it runs on PluginWork's pool or the registry's threads), so stuck plugins cannot take them.
+     */
     private val executor = Executors.newFixedThreadPool(SERVICE_THREADS) { r -> Thread(r, "bridge-ops").apply { isDaemon = true } }
     private val scope = CoroutineScope(SupervisorJob() + executor.asCoroutineDispatcher())
     /** Deadline timers: never blocked by anything, so a deadline always fires. */
@@ -130,6 +143,7 @@ class BridgeService : Service() {
         scope.cancel()
         timers.cancel()
         executor.shutdown()
+        streamExecutor.shutdown()
         super.onDestroy()
     }
 
@@ -142,8 +156,9 @@ class BridgeService : Service() {
 
     /**
      * Ends the op with exactly one `done` or `doneStream` (PROTOCOL.md): up to [CsWire.MAX_INLINE_RESULT_CHARS] inline,
-     * up to [CsWire.MAX_STREAM_RESULT_BYTES] of UTF-8 through a pipe written here, on this service's thread, within what
-     * the op has left ([minStreamMs]..[maxStreamMs]), and anything larger as a short too_large `done`.
+     * up to [CsWire.MAX_STREAM_RESULT_BYTES] of UTF-8 through a pipe written on a stream thread within what the op has
+     * left ([minStreamMs]..[maxStreamMs]), and anything larger as a short too_large `done`. With every stream thread
+     * busy, a large result is answered `unavailable` (before any doneStream).
      */
     private fun safeDone(r: IReply, json: String, ctx: CallContext) {
         if (json.length <= CsWire.MAX_INLINE_RESULT_CHARS) return safeInline(r, json)
@@ -151,16 +166,30 @@ class BridgeService : Service() {
         if (json.length > CsWire.MAX_STREAM_RESULT_BYTES) return safeInline(r, TOO_LARGE)
         val bytes = json.toByteArray(Charsets.UTF_8)
         if (bytes.size > CsWire.MAX_STREAM_RESULT_BYTES) return safeInline(r, TOO_LARGE)
-        val pipe = try { streamPipes() } catch (_: Exception) { return safeInline(r, CsWire.error(CsWire.Err.UNAVAILABLE, "result pipe")) }
+        if (!streamSlots.tryAcquire()) return safeInline(r, CsWire.error(CsWire.Err.UNAVAILABLE, "result streams busy"))
+        var handedOver = false
         try {
-            r.doneStream(pipe.readEnd)
-        } catch (e: RemoteException) {
-            runCatching { pipe.closeWrite(ResultStream.ERR_WRITE) }; runCatching { pipe.closeRead() }
-            // Not delivered: the same single too_large fallback as a refused done (a dead peer makes it fail harmlessly).
-            if (e !is DeadObjectException || r.asBinder().isBinderAlive) try { r.done(TOO_LARGE) } catch (_: RemoteException) {}
-            return
+            val pipe = try { streamPipes() } catch (_: Exception) { return safeInline(r, CsWire.error(CsWire.Err.UNAVAILABLE, "result pipe")) }
+            try {
+                r.doneStream(pipe.readEnd)
+            } catch (e: RemoteException) {
+                runCatching { pipe.closeWrite(ResultStream.ERR_WRITE) }; runCatching { pipe.closeRead() }
+                // Not delivered: the same single too_large fallback as a refused done (a dead peer makes it fail harmlessly).
+                if (e !is DeadObjectException || r.asBinder().isBinderAlive) try { r.done(TOO_LARGE) } catch (_: RemoteException) {}
+                return
+            }
+            val window = ResultStream.windowMs(ctx.remainingMs(), minStreamMs, maxStreamMs)
+            try {
+                streamExecutor.execute {
+                    try { ResultStream.write(pipe, bytes, window) } finally { streamSlots.release() }
+                }
+                handedOver = true
+            } catch (_: RejectedExecutionException) { // the service is shutting down: the reader sees a broken stream
+                runCatching { pipe.closeWrite(ResultStream.ERR_WRITE) }; runCatching { pipe.closeRead() }
+            }
+        } finally {
+            if (!handedOver) streamSlots.release()
         }
-        ResultStream.write(pipe, bytes, ResultStream.windowMs(ctx.remainingMs(), minStreamMs, maxStreamMs))
     }
 
     /**
@@ -186,6 +215,7 @@ class BridgeService : Service() {
         private const val ID_PREFIX = "cloudstream-"
 
         private const val SERVICE_THREADS = 4
+        private const val STREAM_THREADS = 2
         private val TOO_LARGE = CsWire.error(CsWire.Err.TOO_LARGE, "result too large")
         private val QUERY_OR_FRAGMENT = Regex("[?#]\\S*")
 

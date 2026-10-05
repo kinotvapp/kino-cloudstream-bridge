@@ -165,7 +165,7 @@ class BridgeServiceTest {
     }
 
     /** Waits for every op of the service to end (an op's job ends after its done or its stream write). */
-    private fun awaitIdle(svc: BridgeService, ms: Long = 10_000) = waitUntil("ops still running", ms) { svc.jobs.isEmpty() }
+    private fun awaitIdle(svc: BridgeService, ms: Long = 10_000) = waitUntil("ops still running", ms) { svc.jobs.isEmpty() && svc.streamsIdle() }
 
     @Test fun `a result up to the inline cap goes in done, one char more goes through doneStream`() {
         val s = bind(true); val svc = service!!
@@ -231,6 +231,35 @@ class BridgeServiceTest {
         svc.runOp = { _, _, _ -> "{}" }
         val more = (1..4).map { i -> FakeReply().also { s.call(req(CsWire.Op.SEARCH, "m$i"), null, it) } }
         more.forEach { assertEquals("{}", it.await()) }
+    }
+
+    /** A stream pipe on a real OS pipe whose reader never reads; [ended] records how its write end was closed. */
+    private fun stuckPipe(ended: MutableList<String?>): StreamPipe {
+        val nio = java.nio.channels.Pipe.open()
+        return StreamPipe(ParcelFileDescriptor.createPipe()[0], java.nio.channels.Channels.newOutputStream(nio.sink()),
+            java.nio.channels.Channels.newInputStream(nio.source()), { err -> ended += err; nio.sink().close() }, { nio.source().close() })
+    }
+
+    @Test fun `stream writes never hold op threads, and a third concurrent stream is answered unavailable`() {
+        val s = bind(true); val svc = service!!
+        val ended = CopyOnWriteArrayList<String?>()
+        svc.streamPipes = { stuckPipe(ended) }
+        svc.minStreamMs = 2_000; svc.maxStreamMs = 2_000
+        svc.runOp = { _, _, _ -> "z".repeat(1024 * 1024) }
+        val stuck = (1..2).map { i -> FakeReply().also { s.call(req(CsWire.Op.SEARCH, "s$i"), null, it) } }
+        stuck.forEach { it.awaitAny() }
+        // Both stream threads are stuck on readers that never read: the op threads are all free.
+        waitUntil("op jobs still running") { svc.jobs.isEmpty() }
+        val third = FakeReply(); val t0 = System.nanoTime()
+        s.call(req(CsWire.Op.SEARCH, "s3"), null, third)
+        assertEquals(CsWire.Err.UNAVAILABLE, CsWire.errorOf(third.await())!!.first)
+        assertTrue(third.streams.isEmpty())
+        svc.runOp = { _, _, _ -> "{}" }
+        val more = (1..4).map { i -> FakeReply().also { s.call(req(CsWire.Op.SEARCH, "m$i"), null, it) } }
+        more.forEach { assertEquals("{}", it.await()) }
+        assertTrue("answers waited for the streams", (System.nanoTime() - t0) / 1_000_000 < 1_500)
+        awaitIdle(svc, 6_000)
+        assertEquals(listOf<String?>("deadline", "deadline"), ended.toList())
     }
 
     @Test fun `a doneStream Binder refuses gets exactly one too_large done`() {

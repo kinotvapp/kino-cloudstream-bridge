@@ -35,8 +35,11 @@ import java.util.concurrent.locks.ReentrantLock
  * - When the solve fails, the check page itself is returned (read into memory before the solve, so no second request),
  *   and for [FAILED_TTL_MS] that plugin and host are not solved again: their checks are answered with the check page
  *   without a Kino page. Requests that waited for a solve that failed return too, without solving. A solve that only
- *   ran out because the op ended (cancel, deadline) or because Kino's one hidden page was busy is not remembered.
- * - A solve counts only when the page ended on the request's host (cookies Kino read for another host are not this one's).
+ *   ran out because the op ended (cancel, deadline), for a local reason (no time left for a page, Kino not connected or
+ *   unreachable) or because Kino's one hidden page was busy is not remembered: only a page that ended without a usable
+ *   clearance and Kino's `timeout` / `blocked` / `browser_unavailable` are.
+ * - A solve counts only when the page ended on the request's host (cookies Kino read for another host are not this one's,
+ *   and a page whose final address is unknown counts as another host).
  * - Cloudflare's own cookies (`cf_clearance`, `__cf_bm`, any `cf_*` / `__cf*`) from the solved or saved set override the
  *   request's: a plugin that copied [getCookieHeaders] earlier must not send a stale clearance. Every other cookie of the
  *   request wins, as upstream.
@@ -81,6 +84,13 @@ class CloudflareKiller : Interceptor {
             }
             failedAt[key] = System.nanoTime()
         }
+
+        /** Kino answers about the site itself: the page ran out, the host was refused, or this device can't open it. */
+        private val SITE_FAILURES = setOf(CsWire.Err.TIMEOUT, CsWire.Err.BLOCKED, CsWire.Err.BROWSER_UNAVAILABLE)
+
+        /** A page that ended without a usable clearance, or one of [SITE_FAILURES]; never a local failure or `busy`. */
+        private fun saysSomethingAboutTheSite(outcome: HostWebViewResolver.Outcome): Boolean =
+            outcome is HostWebViewResolver.Outcome.Got || (outcome as HostWebViewResolver.Outcome.Failed).code in SITE_FAILURES
 
         /** Cloudflare's own cookie names: the ones a solve renews. */
         internal fun isCloudflareCookie(name: String): Boolean = name.startsWith("cf_") || name.startsWith("__cf")
@@ -176,12 +186,13 @@ class CloudflareKiller : Interceptor {
             }
         }
         val capture = (outcome as? HostWebViewResolver.Outcome.Got)?.capture
-        val onHost = capture != null && (capture.finalUrl == null || capture.finalUrl.host.equals(host, ignoreCase = true))
+        // A page whose final address is unknown or not https is not on this host.
+        val onHost = capture?.finalUrl?.host.equals(host, ignoreCase = true)
         val cookies = capture?.cookies?.takeIf { onHost && hasClearance(it) } ?: run {
             log("browser check for $host not solved")
-            // Only a real failure is remembered: not an op that ended under it, nor Kino's one page being busy.
-            val busy = (outcome as? HostWebViewResolver.Outcome.Failed)?.code == CsWire.Err.BUSY
-            if (!ctx.isOver() && !busy) markFailed(key)
+            // Only an outcome that says something about the site is remembered (never a local reason, Kino busy, or an
+            // op that ended under it).
+            if (!ctx.isOver() && saysSomethingAboutTheSite(outcome)) markFailed(key)
             return null
         }
         failedAt.remove(key)

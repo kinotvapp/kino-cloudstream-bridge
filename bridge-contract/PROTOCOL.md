@@ -1,6 +1,6 @@
 # Kino ⇄ CloudStream bridge protocol (v2)
 
-Apache-2.0. This folder is copied verbatim into both repos; a change in either place is a protocol change: bump
+Apache-2.0 (full text in `LICENSE`, next to this file; the rest of the bridge repository is GPL-3.0). This folder is copied verbatim into both repos; a change in either place is a protocol change: bump
 `CsWire.PROTOCOL_VERSION`. Both sides require the exact version (no fallback): v2 replaced v1 before either shipped.
 
 - Every JSON object carries no secrets; repo URLs never appear (Kino sends `.cs3` bytes, not URLs).
@@ -118,15 +118,20 @@ Request:
 
 At least one of `match` / `waitForCookie`. Unknown keys are ignored. Anything else wrong is `bad_request`.
 
-When the page ends:
+When the page ends (`match` and `alsoMatch` are searched anywhere in the URL, `Matcher.find`, for every request the
+WebView reports, the main frame and its redirects included):
 
 - `match` alone: at the first request whose URL matches it (the primary match).
 - `captureAll`: Kino collects every request whose URL matches `match` or any `alsoMatch` (deduplicated by URL, at most
   20) and ends once the primary match was seen and no new matching request came for 1 s (`SETTLE_MS`), or at 20.
 - `waitForCookie`: once the WebView holds that cookie for the page's current host. With `match` (and `captureAll`),
-  only when both conditions hold.
+  only when both conditions hold; with `waitForCookie` and `captureAll`, settle starts once both hold.
+- Once the primary match was seen (and the cookie, with `waitForCookie`), the page ends successfully
+  (`timedOut: false`) at settle or at `timeoutMs`, whichever comes first.
 - Otherwise at `timeoutMs`: `{"error":{"code":"timeout"}}`, or, with `returnCookiesOnTimeout`, the reply below with
   what was captured so far, the current cookies and `"timedOut": true`.
+- Kino answers within `timeoutMs` + 4 s (at most 3 s waiting for its one hidden page, then `busy`); the bridge stops
+  waiting 2 s after that.
 
 Reply:
 
@@ -142,12 +147,15 @@ Reply:
   `headers` the request's headers as the WebView saw them, ≤ 64, values ≤ 8192 chars, no CR/LF. `[]` for a cookie-only
   page. URLs ≤ 8192 chars, http or https (the bridge uses only https ones).
 - `cookies`: the WebView's cookies for `finalUrl`'s host only (what `CookieManager.getCookie(finalUrl)` gives), read
-  before Kino wipes the WebView: ≤ 64, name ≤ 256 chars, value 1..4096 chars, no `;`/CR/LF. `{}` when none.
+  before Kino wipes the WebView: ≤ 64, name ≤ 256 chars, value 1..4096 chars, no `;`/CR/LF, names + values ≤ 16 384
+  chars in all (`MAX_COOKIES_TOTAL_CHARS`; past it, cookies other than Cloudflare's `cf_*` / `__cf*` are dropped
+  first). `{}` when none.
 - `userAgent`: the WebView's user agent (the one Cloudflare ties `cf_clearance` to), ≤ 512 chars, `""` if unknown.
-- `finalUrl`: the top page's last address. `timedOut`: true only on a `returnCookiesOnTimeout` timeout reply.
-- Error codes: `refused` (caller is not the bridge), `bad_request`, `not_allowed` (no live op the person started),
-  `blocked` (host not allowed, not https, a private address, a navigation off https), `busy` (another hidden page is
-  open), `timeout`, `browser_unavailable` (no WebView on the device), `unavailable` (Kino failed or stopped).
+- `finalUrl`: the top page's last address, https (a reply with any other `finalUrl` is malformed). `timedOut`: true only on a `returnCookiesOnTimeout` timeout reply.
+- Error codes (`CsWire.Err`): `refused` (caller is not the bridge), `bad_request`, `not_allowed` (no live op the
+  person started), `blocked` (host not allowed, not https, a private address, a navigation off https), `busy` (another
+  hidden page is open), `timeout`, `browser_unavailable` (no WebView on the device), `unavailable` (Kino failed or
+  stopped).
 
 ## Errors
 

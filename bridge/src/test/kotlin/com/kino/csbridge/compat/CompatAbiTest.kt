@@ -76,7 +76,29 @@ class CompatAbiTest {
         assertEquals("bg", m.backgroundPosterUrl)
         assertEquals("https://a.example/m", m.uniqueUrl)
         assertNull(m.contentRating)
-        defaults(MovieLoadResponse::class.java, *types) // the synthetic form old extensions call exists
+    }
+
+    /** Bits [from]..[to] set: "use the default" for those parameter indexes. */
+    private fun mask(from: Int, to: Int): Int = (from..to).fold(0) { acc, i -> acc or (1 shl i) }
+
+    @Test
+    fun movieOldDefaultsConstructorFillsNonNullDefaults() {
+        val types = arrayOf(
+            S, S, S, TvType::class.java, S, S, I, S, I, L, I, L, L, L,
+            Boolean::class.javaPrimitiveType!!, M, M, S,
+        )
+        // name, url, apiName, type, dataUrl given (no default in the old declaration); 5..17 default.
+        val m = defaults(MovieLoadResponse::class.java, *types).newInstance(
+            "Name", "https://a.example/m", "Api", TvType.Movie, "dataUrl",
+            null, null, null, null, null, null, null, null, null, false, null, null, null,
+            mask(5, 17), null,
+        )
+        assertEquals("dataUrl", m.dataUrl)
+        assertTrue(m.trailers.isEmpty())
+        assertEquals(false, m.comingSoon)
+        assertTrue(m.syncData.isEmpty())
+        assertNull(m.score)
+        assertEquals("https://a.example/m", m.uniqueUrl)
     }
 
     @Test
@@ -91,7 +113,26 @@ class CompatAbiTest {
         )
         assertEquals(TvType.Live, l.type)
         assertEquals(50, l.score!!.toInt(100))
-        defaults(LiveStreamLoadResponse::class.java, *types)
+    }
+
+    @Test
+    fun liveOldDefaultsConstructorFillsNonNullDefaults() {
+        val types = arrayOf(
+            S, S, S, S, S, I, S, TvType::class.java, I, L, I, L, L, L,
+            Boolean::class.javaPrimitiveType!!, M, M, S,
+        )
+        // name, url, apiName, dataUrl given; 4..17 default, `type = TvType.Live` (index 7) included.
+        val l = defaults(LiveStreamLoadResponse::class.java, *types).newInstance(
+            "Ch", "https://a.example/c", "Api", "dataUrl",
+            null, null, null, null, null, null, null, null, null, null, false, null, null, null,
+            mask(4, 17), null,
+        )
+        assertEquals(TvType.Live, l.type)
+        assertEquals("dataUrl", l.dataUrl)
+        assertTrue(l.trailers.isEmpty())
+        assertEquals(false, l.comingSoon)
+        assertTrue(l.syncData.isEmpty())
+        assertEquals("https://a.example/c", l.uniqueUrl)
     }
 
     @Test
@@ -111,7 +152,29 @@ class CompatAbiTest {
         assertEquals(listOf(ep), t.episodes)
         assertEquals(ShowStatus.Ongoing, t.showStatus)
         assertEquals(100, t.score!!.toInt(100))
-        defaults(TvSeriesLoadResponse::class.java, *types)
+    }
+
+    @Test
+    fun tvSeriesOldDefaultsConstructorFillsNonNullDefaults() {
+        val types = arrayOf(
+            S, S, S, TvType::class.java, L, S, I, S, ShowStatus::class.java, I, L, I, L, L, L,
+            Boolean::class.javaPrimitiveType!!, M, M,
+            Class.forName("com.lagradost.cloudstream3.NextAiring"), L, S,
+        )
+        @Suppress("DEPRECATION_ERROR")
+        val ep = Episode("e1")
+        // name, url, apiName, type, episodes given; 5..20 default.
+        val t = defaults(TvSeriesLoadResponse::class.java, *types).newInstance(
+            "Show", "https://a.example/s", "Api", TvType.TvSeries, listOf(ep),
+            null, null, null, null, null, null, null, null, null, null, false, null, null, null, null, null,
+            mask(5, 20), null,
+        )
+        assertEquals(listOf(ep), t.episodes)
+        assertTrue(t.trailers.isEmpty())
+        assertEquals(false, t.comingSoon)
+        assertTrue(t.syncData.isEmpty())
+        assertNull(t.showStatus)
+        assertEquals("https://a.example/s", t.uniqueUrl)
     }
 
     @Test

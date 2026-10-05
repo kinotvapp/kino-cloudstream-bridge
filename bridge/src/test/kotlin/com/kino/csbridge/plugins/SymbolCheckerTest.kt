@@ -33,6 +33,9 @@ class SymbolCheckerTest {
 
     @Test fun `current Episode constructor resolves`() = assertEquals(emptyList<String>(), missing(DexFixtures.currentEpisodeDex()))
 
+    @Test fun `old Episode default constructor resolves through the compat constructor`() =
+        assertEquals(emptyList<String>(), missing(DexFixtures.oldEpisodeDex()))
+
     @Test fun `a member that stays refused is reported exactly`() {
         assertEquals(listOf(DexFixtures.GET_APIS_AS_LIST), missing(DexFixtures.refusedSymbolDex()))
     }

@@ -41,6 +41,13 @@ object DexFixtures {
     val EPISODE_CTOR_CURRENT = listOf(STRING, STRING, "Ljava/lang/Integer;", "Ljava/lang/Integer;", STRING,
         "Lcom/lagradost/cloudstream3/Score;", STRING, "Ljava/lang/Long;", "Ljava/lang/Integer;")
 
+    /**
+     * The `$default` Episode constructor older plugins were compiled against (rating: Int?): absent at the pinned
+     * upstream, restored by the compat constructors (BRIDGE.md "Compat ABI"), so it must resolve.
+     */
+    val EPISODE_CTOR_OLD = listOf(STRING, STRING, "Ljava/lang/Integer;", "Ljava/lang/Integer;", STRING,
+        "Ljava/lang/Integer;", STRING, "Ljava/lang/Long;", "I", "Lkotlin/jvm/internal/DefaultConstructorMarker;")
+
     const val API_HOLDER = "Lcom/lagradost/cloudstream3/APIHolder;"
 
     /**
@@ -105,6 +112,12 @@ object DexFixtures {
     fun currentEpisodeDex(type: String = "Lfixture/Current;"): ByteArray = dex(runner(type, 10, listOf(
         newInstance(0, EPISODE),
         invokeRange(Opcode.INVOKE_DIRECT_RANGE, mref(EPISODE, "<init>", EPISODE_CTOR_CURRENT, "V"), 10),
+    )))
+
+    /** A dex calling the OLD `$default` Episode constructor: resolves through the compat constructor. */
+    fun oldEpisodeDex(type: String = "Lfixture/Old;"): ByteArray = dex(runner(type, 11, listOf(
+        newInstance(0, EPISODE),
+        invokeRange(Opcode.INVOKE_DIRECT_RANGE, mref(EPISODE, "<init>", EPISODE_CTOR_OLD, "V"), 11),
     )))
 
     /** A dex calling `APIHolder.INSTANCE.getApis()` as `List` ([GET_APIS_AS_LIST]): must be refused. */

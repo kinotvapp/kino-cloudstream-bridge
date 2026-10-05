@@ -1,4 +1,4 @@
-// Apache-2.0. Shared verbatim by Kino and the CloudStream bridge (see ../../../../PROTOCOL.md).
+// Apache-2.0. Shared verbatim by Kino and the CloudStream bridge (see bridge-contract/PROTOCOL.md; license: bridge-contract/LICENSE).
 package com.kino.csbridge.contract
 
 import android.os.ParcelFileDescriptor
@@ -45,6 +45,12 @@ object CsWire {
         const val STREAM_BROKEN = "bridge_stream_broken"
         /** `IHost.webView` only: another hidden page is open in Kino. */
         const val BUSY = "busy"
+        /** `IHost.webView` only: no live op the person started. */
+        const val NOT_ALLOWED = "not_allowed"
+        /** `IHost.webView` only: host not allowed, not https, a private address, or a navigation off https. */
+        const val BLOCKED = "blocked"
+        /** `IHost.webView` only: the device has no WebView. */
+        const val BROWSER_UNAVAILABLE = "browser_unavailable"
     }
 
     /**
@@ -93,6 +99,8 @@ object CsWire {
         const val MAX_COOKIES = 64
         const val MAX_COOKIE_NAME_CHARS = 256
         const val MAX_COOKIE_VALUE_CHARS = 4096
+        /** Names + values of one reply's cookies together; past it, cookies other than Cloudflare's (`cf_*`, `__cf*`) go first. */
+        const val MAX_COOKIES_TOTAL_CHARS = 16 * 1024
         const val MAX_USER_AGENT_CHARS = 512
         /** First-load headers Kino never sets from a request. */
         val FORBIDDEN_FIRST_LOAD_HEADERS = setOf("host", "content-length", "transfer-encoding", "connection", "cookie")
@@ -210,7 +218,8 @@ object CsWire {
         val c = o.optJSONObject("cookies") ?: return null
         val cookies = cookiesWithinLimits(c.keys().asSequence().mapNotNull { k -> (c.opt(k) as? String)?.let { k to it } }.toMap(LinkedHashMap()))
         val ua = (o.opt("userAgent") as? String)?.takeIf { validUserAgent(it) } ?: ""
-        val finalUrl = (o.opt("finalUrl") as? String)?.takeIf { it.length <= MAX_URL_CHARS } ?: return null
+        val finalUrl = (o.opt("finalUrl") as? String)
+            ?.takeIf { it.length <= MAX_URL_CHARS && it.startsWith("https://", ignoreCase = true) } ?: return null
         val timedOut = o.opt("timedOut") as? Boolean ?: return null
         WebViewReply(requests, cookies, ua, finalUrl, timedOut)
     }.getOrNull()
@@ -230,15 +239,24 @@ object CsWire {
         return out
     }
 
+    /**
+     * Valid cookies, at most [WebView.MAX_COOKIES], names + values at most [WebView.MAX_COOKIES_TOTAL_CHARS] in all:
+     * Cloudflare's own cookies (`cf_*`, `__cf*`) are kept first, the others fill what is left, in order.
+     */
     private fun cookiesWithinLimits(c: Map<String, String>): Map<String, String> {
-        val out = LinkedHashMap<String, String>()
-        for ((k, v) in c) {
-            if (out.size >= WebView.MAX_COOKIES) break
-            if (k.isEmpty() || k.length > WebView.MAX_COOKIE_NAME_CHARS || k.any { it.isWhitespace() || it in ",;=" }) continue
-            if (v.isEmpty() || v.length > WebView.MAX_COOKIE_VALUE_CHARS || v.any { it == '\r' || it == '\n' || it == ';' }) continue
-            out[k] = v
+        val valid = c.filter { (k, v) ->
+            k.isNotEmpty() && k.length <= WebView.MAX_COOKIE_NAME_CHARS && k.none { it.isWhitespace() || it in ",;=" } &&
+                v.isNotEmpty() && v.length <= WebView.MAX_COOKIE_VALUE_CHARS && v.none { it == '\r' || it == '\n' || it == ';' }
         }
-        return out
+        fun cloudflare(name: String) = name.startsWith("cf_") || name.startsWith("__cf")
+        val kept = HashSet<String>()
+        var chars = 0
+        for (pass in 0..1) for ((k, v) in valid) {
+            if (cloudflare(k) != (pass == 0) || kept.size >= WebView.MAX_COOKIES) continue
+            if (chars + k.length + v.length > WebView.MAX_COOKIES_TOTAL_CHARS) continue
+            kept += k; chars += k.length + v.length
+        }
+        return valid.filterKeys { it in kept } // the reply's own order
     }
 
     private fun validUserAgent(ua: String) = ua.length <= WebView.MAX_USER_AGENT_CHARS && ua.none { it == '\n' || it == '\r' }

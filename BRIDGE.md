@@ -44,6 +44,9 @@ stay in `bridge/symbol-allowlist.txt`; an extension that needs them is refused, 
 GPL-3.0, like upstream (see `LICENSE`). Source for any APK: this repository at the tag matching
 the APK's `versionName`.
 
+Exception: `bridge-contract/` (the AIDL and wire protocol shared with Kino) is Apache-2.0, full text in
+`bridge-contract/LICENSE`.
+
 ## Build
 
 ```

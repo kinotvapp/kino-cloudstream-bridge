@@ -1,6 +1,7 @@
 # Symbols from src/test/resources/cs3-symbols.tsv that the bridge does not provide, one per line: <symbol> <reason>.
 # Every row here is upstream :library ABI drift: the symbol is absent at the pinned commit 4e2516d (no :app
-# class is missing). Restoring them needs an edit to upstream :library or bridge-owned copies (not yet permitted). scripts/symbol-coverage.py fails on a stale row (one that resolves now).
+# class is missing). The rows left are refused on purpose, by the owner's decision (BRIDGE.md "Compat ABI"): dead-site
+# extractors and APIHolder.getApis(). scripts/symbol-coverage.py fails on a stale row (one that resolves now).
 # Each reason ends with [plugins_all/plugins_es]: how many of the 583 / 66 (Spanish) measured plugins use the symbol.
 com.lagradost.cloudstream3.extractors.Cinestart	extractor class absent from upstream :library at 4e2516d; fails on stock CloudStream too [1/1]
 com.lagradost.cloudstream3.extractors.Cinestart.<init>()V	extractor class absent from upstream :library at 4e2516d; fails on stock CloudStream too [1/1]

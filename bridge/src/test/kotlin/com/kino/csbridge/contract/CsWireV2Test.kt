@@ -106,6 +106,32 @@ class CsWireV2Test {
         assertNull(CsWire.parseWebViewReply(JSONObject(CsWire.webViewReply(r)).apply { remove("timedOut") }.toString()))
     }
 
+    @Test fun `a reply's cookies are capped at 16K chars in all, Cloudflare's kept first`() {
+        val big = (1..64).associate { "c$it" to "v".repeat(4096) } + mapOf("cf_clearance" to "x".repeat(4000), "__cf_bm" to "y".repeat(100))
+        val out = CsWire.webViewReply(CsWire.WebViewReply(emptyList(), big, "UA", "https://a.example/", false))
+        assertTrue(out.length <= CsWire.MAX_INLINE_RESULT_CHARS)
+        val cookies = CsWire.parseWebViewReply(out)!!.cookies
+        assertTrue(cookies.entries.sumOf { it.key.length + it.value.length } <= CsWire.WebView.MAX_COOKIES_TOTAL_CHARS)
+        assertEquals("x".repeat(4000), cookies["cf_clearance"])
+        assertEquals("y".repeat(100), cookies["__cf_bm"])
+        assertEquals(listOf("c1", "c2"), cookies.keys.filter { it.startsWith("c") && !it.startsWith("cf_") })
+        // The reader applies the same cap to whatever it is sent.
+        val raw = JSONObject(out).put("cookies", JSONObject(big as Map<*, *>)).toString()
+        assertEquals(cookies, CsWire.parseWebViewReply(raw)!!.cookies)
+    }
+
+    @Test fun `a reply whose finalUrl is not https is malformed`() {
+        val r = CsWire.WebViewReply(emptyList(), emptyMap(), "UA", "https://a.example/", false)
+        for (bad in listOf("http://a.example/", "", "about:blank")) {
+            assertNull(bad, CsWire.parseWebViewReply(JSONObject(CsWire.webViewReply(r)).put("finalUrl", bad).toString()))
+        }
+    }
+
+    @Test fun `webView error codes are shared constants`() {
+        assertEquals(listOf("busy", "not_allowed", "blocked", "browser_unavailable"),
+            listOf(CsWire.Err.BUSY, CsWire.Err.NOT_ALLOWED, CsWire.Err.BLOCKED, CsWire.Err.BROWSER_UNAVAILABLE))
+    }
+
     @Test fun `a webView reply too long for one done drops trailing requests`() {
         val big = (1..20).map { CsWire.CapturedRequest("https://cdn.example/" + "p".repeat(8000) + it, "GET", emptyMap()) }
         val out = CsWire.webViewReply(CsWire.WebViewReply(big, emptyMap(), "UA", "https://a.example/", false))

@@ -46,6 +46,8 @@ class PluginRegistryDeviceTest {
         assertEquals(emptyList<String>(), SymbolChecker(loader).missing(cs3(DexFixtures.currentEpisodeDex())))
         assertEquals(emptyList<String>(), SymbolChecker(loader).missing(cs3(DexFixtures.pluginDex())))
         assertEquals(listOf(DexFixtures.GET_APIS_AS_LIST), SymbolChecker(loader).missing(cs3(DexFixtures.refusedSymbolDex())))
+        // Restored by the compat constructors: resolves on ART too.
+        assertEquals(emptyList<String>(), SymbolChecker(loader).missing(cs3(DexFixtures.oldEpisodeDex())))
     }
 
     @Test fun realDexPluginRegistersUnderItsIdAndUnloadsCleanly() {

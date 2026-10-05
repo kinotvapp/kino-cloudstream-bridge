@@ -483,6 +483,44 @@ class HostWebViewResolverTest {
         assertEquals(1, host.requests.size)
     }
 
+    @Test fun `Kino not connected is a local failure, not remembered for the site`() {
+        HostWebViewResolver.host = { null } // NO_HOST
+        assertEquals(503, intercept(CloudflareKiller(), FakeChain(Request.Builder().url("https://a.example/").build(), cfSite("ok"))).code)
+        serve(cfAnswer("ok"))
+        assertEquals(200, intercept(CloudflareKiller(), FakeChain(Request.Builder().url("https://a.example/2").build(), cfSite("ok"))).code)
+        assertEquals(1, host.requests.size)
+    }
+
+    @Test fun `too little time left for a page is a local failure, not remembered for the site`() {
+        serve(cfAnswer("ok"))
+        // 5 s left: under the 1.5 s margin + 4 s overhead + 1 s page Kino needs (NO_TIME), and the op is still alive.
+        val c = ctx(deadlineMs = 5_000)
+        CallContext.threadLocal.set(c)
+        val first = try {
+            CloudflareKiller().intercept(FakeChain(Request.Builder().url("https://a.example/").build(), cfSite("ok")))
+        } finally { CallContext.threadLocal.set(null) }
+        assertEquals(503, first.code)
+        assertTrue("no page was asked", host.requests.isEmpty())
+        assertEquals(200, intercept(CloudflareKiller(), FakeChain(Request.Builder().url("https://a.example/2").build(), cfSite("ok"))).code)
+        assertEquals(1, host.requests.size)
+    }
+
+    @Test fun `Kino's timeout and blocked answers are remembered for the site`() {
+        for (code in listOf(CsWire.Err.TIMEOUT, CsWire.Err.BLOCKED)) {
+            CloudflareKiller.resetForTest()
+            serve { CsWire.error(code, "x") }
+            intercept(CloudflareKiller(), FakeChain(Request.Builder().url("https://a.example/").build(), cfSite("ok")))
+            intercept(CloudflareKiller(), FakeChain(Request.Builder().url("https://a.example/2").build(), cfSite("ok")))
+            assertEquals(code, 1, host.requests.size)
+        }
+    }
+
+    @Test fun `a reply whose final address is not https solves nothing and files no cookies`() {
+        serve { o -> JSONObject(cfAnswer("ok")(o)).put("finalUrl", "http://a.example/").toString() }
+        assertEquals(503, intercept(CloudflareKiller(), FakeChain(Request.Builder().url("https://a.example/").build(), cfSite("ok"))).code)
+        assertNull(WebCookies.get("cloudstream-x", "a.example"))
+    }
+
     @Test fun `the per-host solve locks are released once nobody holds or waits for them`() {
         serveAfter(300, cfAnswer("ok"))
         val killer = CloudflareKiller()
