@@ -136,10 +136,17 @@ val writeOracleClasspath by tasks.registering {
         out.get().asFile.apply { parentFile.mkdirs(); writeText(lines.joinToString("\n") + "\n") }
     }
 }
+val symbolCoverageSelfTest by tasks.registering(Exec::class) {
+    description = "Unit tests of the symbol oracle's class-file reader, resolution walk and allowlist parser."
+    group = "verification"
+    val script = rootProject.file("scripts/test_symbol_coverage.py")
+    inputs.files(script, rootProject.file("scripts/symbol-coverage.py"))
+    commandLine("python3", script.absolutePath)
+}
 val symbolCoverage by tasks.registering(Exec::class) {
     description = "Fails when a symbol real CloudStream plugins link against is missing from the bridge classpath."
     group = "verification"
-    dependsOn(writeOracleClasspath)
+    dependsOn(writeOracleClasspath, symbolCoverageSelfTest)
     val script = rootProject.file("scripts/symbol-coverage.py")
     val tsv = file("src/test/resources/cs3-symbols.tsv")
     val allow = file("symbol-allowlist.txt")

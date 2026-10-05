@@ -15,14 +15,17 @@ Inputs (any mix, first occurrence of a class wins, like a classpath):
   - .dex files, and .apk / .zip files containing classes*.dex (for the release/minified check later)
   - --classpath-file FILE: one such path per line (written by the :bridge Gradle task)
 
+A member that the walk finds first in a class where it is private counts as missing (it would not link).
 Exit 1 when a symbol is missing and not in the allowlist, or when an allowlist row is stale (it resolves now),
-or malformed (no reason). Allowlist rows: `<symbol><TAB or spaces><one-line reason>`; `#` starts a comment line.
+malformed (no reason), duplicated, or not in the symbol list. Classpath entries that do not exist are printed. Allowlist rows: `<symbol><TAB or spaces><one-line reason>`; `#` starts a comment line.
 """
 import argparse
 import os
 import struct
 import sys
 import zipfile
+
+ACC_PRIVATE = 0x0002
 
 
 # ---------------------------------------------------------------------------------------------- class info
@@ -34,8 +37,8 @@ class ClassInfo:
         self.name = name          # internal name: com/x/Outer$Inner
         self.super = sup          # internal name or None
         self.ifaces = ifaces      # list of internal names
-        self.methods = methods    # set of (name, descriptor)
-        self.fields = fields      # set of (name, type descriptor)
+        self.methods = methods    # {(name, descriptor): access flags}
+        self.fields = fields      # {(name, type descriptor): access flags}
 
 
 def parse_class_file(buf):
@@ -78,13 +81,13 @@ def parse_class_file(buf):
     def members(off):
         n = struct.unpack_from('>H', buf, off)[0]
         off += 2
-        out = set()
+        out = {}
         for _ in range(n):
-            _a, ni, di, na = struct.unpack_from('>HHHH', buf, off)
+            acc, ni, di, na = struct.unpack_from('>HHHH', buf, off)
             off += 8
             for _ in range(na):
                 off += 6 + struct.unpack_from('>I', buf, off + 2)[0]
-            out.add((utf8[ni], utf8[di]))
+            out[(utf8[ni], utf8[di])] = acc
         return out, off
 
     fields, off = members(off)
@@ -140,22 +143,22 @@ def parse_dex(buf):
         if ioff:
             n = struct.unpack_from('<I', buf, ioff)[0]
             ifaces = [internal(types[struct.unpack_from('<H', buf, ioff + 4 + 2 * k)[0]]) for k in range(n)]
-        dm, df = set(), set()
+        dm, df = {}, {}
         if cdoff:
             o = cdoff
             sf, o = _uleb(buf, o); inf, o = _uleb(buf, o); dms, o = _uleb(buf, o); vms, o = _uleb(buf, o)
             for cnt in (sf, inf):
                 idx = 0
                 for _ in range(cnt):
-                    d, o = _uleb(buf, o); _, o = _uleb(buf, o)
+                    d, o = _uleb(buf, o); acc, o = _uleb(buf, o)
                     idx += d
-                    df.add(fields[idx])
+                    df[fields[idx]] = acc
             for cnt in (dms, vms):
                 idx = 0
                 for _ in range(cnt):
-                    d, o = _uleb(buf, o); _, o = _uleb(buf, o); _, o = _uleb(buf, o)
+                    d, o = _uleb(buf, o); acc, o = _uleb(buf, o); _, o = _uleb(buf, o)
                     idx += d
-                    dm.add(methods[idx])
+                    dm[methods[idx]] = acc
         out.append(ClassInfo(internal(types[ci]), internal(types[sup]) if sup != 0xFFFFFFFF else None,
                              ifaces, dm, df))
     return out
@@ -202,10 +205,12 @@ class Classpath:
             self._cache[name] = loader() if loader else None
         return self._cache[name]
 
-    def has_member(self, owner, kind, key):
-        """Owner or any supertype declares the member. Returns (found, owner_exists)."""
+    def resolve(self, owner, kind, key):
+        """Walk owner, then supertypes (super_class chain and interfaces). Returns None when found and linkable,
+        else why not: 'no owner class', 'not declared', or 'private in <class>' (the runtime resolves the first
+        declaration it meets, and a private one fails the access check, so that counts as missing)."""
         if self.get(owner) is None:
-            return False, False
+            return 'no owner class'
         seen, queue = set(), [owner]
         while queue:
             c = queue.pop(0)
@@ -215,11 +220,13 @@ class Classpath:
             info = self.get(c)
             if info is None:
                 continue
-            if key in (info.methods if kind == 'M' else info.fields):
-                return True, True
+            members = info.methods if kind == 'M' else info.fields
+            if key in members:
+                return f'private in {c}' if members[key] & ACC_PRIVATE else None
             queue.append(info.super)
             queue.extend(info.ifaces)
-        return False, True
+        return 'not declared'
+
 
 
 # ---------------------------------------------------------------------------------------------- symbols
@@ -267,6 +274,9 @@ def read_allowlist(path):
             if len(parts) < 2 or not parts[1].strip():
                 bad.append(f'{path}:{n}: no reason given: {s}')
                 continue
+            if parts[0] in allow:
+                bad.append(f'{path}:{n}: duplicate row: {parts[0]}')
+                continue
             allow[parts[0]] = parts[1].strip()
     return allow, bad
 
@@ -296,10 +306,9 @@ def main():
     missing, allowed, stale = [], [], []
     for r in rows:
         owner, key = parse_symbol(r['kind'], r['symbol'])
-        if key is None:
-            ok = cp.get(owner) is not None
-        else:
-            ok, _ = cp.has_member(owner, r['kind'], key)
+        why = ('no class' if cp.get(owner) is None else None) if key is None else cp.resolve(owner, r['kind'], key)
+        r['why'] = why
+        ok = why is None
         if ok:
             if r['symbol'] in allow:
                 stale.append(r['symbol'])
@@ -312,8 +321,10 @@ def main():
     by_kind = {k: sum(1 for r in rows if r['kind'] == k) for k in 'TMF'}
     print(f'symbol-coverage: {len(rows)} symbols ({by_kind["T"]} T, {by_kind["M"]} M, {by_kind["F"]} F), '
           f'{len(entries) - len(skipped)} classpath entries')
+    for e in skipped:
+        print(f'SKIPPED\tclasspath entry does not exist: {e}')
     for r in missing:
-        print(f'MISSING\t{r["kind"]}\t{r["symbol"]}\tplugins={r["plugins_all"]}\tes={r["plugins_es"]}')
+        print(f'MISSING\t{r["kind"]}\t{r["symbol"]}\tplugins={r["plugins_all"]}\tes={r["plugins_es"]}\t{r["why"]}')
     if allowed:
         ak = {k: sum(1 for r in allowed if r['kind'] == k) for k in 'TMF'}
         es = sorted(float(r['pct_es']) for r in allowed)
