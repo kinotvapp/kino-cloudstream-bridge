@@ -1,0 +1,133 @@
+package com.kino.csbridge
+
+import android.content.Context
+import androidx.preference.PreferenceManager
+import com.kino.csbridge.prefs.FakeKinoStorage
+import com.lagradost.cloudstream3.CloudStreamApp
+import com.lagradost.cloudstream3.ExceptionHandler
+import com.lagradost.cloudstream3.plugins.PLUGINS_KEY
+import com.lagradost.cloudstream3.plugins.PluginManager
+import com.lagradost.cloudstream3.utils.DataStore.getDefaultSharedPrefs
+import com.lagradost.cloudstream3.utils.DataStore.getSharedPrefs
+import com.lagradost.cloudstream3.utils.PREFERENCES_NAME
+import org.json.JSONObject
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import java.io.File
+
+@RunWith(RobolectricTestRunner::class)
+class BridgeAppTest {
+    private val app = RuntimeEnvironment.getApplication()
+    private val kino = FakeKinoStorage()
+
+    @Before fun setUp() { HostLink.host = kino }
+
+    @After fun tearDown() { HostLink.host = null; CallContext.threadLocal.remove() }
+
+    private fun <T> asPlugin(block: () -> T): T {
+        CallContext.threadLocal.set(CallContext("call-1", PLUGIN, CallContext.deadlineFromNow(60_000)))
+        try { return block() } finally { CallContext.threadLocal.remove() }
+    }
+
+    /**
+     * LOUD GUARD. CloudStreamApp.onCreate installs an uncaught-exception handler that calls exitProcess(1) (a plugin's
+     * stray throw would kill the bridge) and the class is final with a private context setter: BridgeApp must never be
+     * one, and its context must be set reflectively. If this fails, do not "fix" it by subclassing.
+     */
+    @Test fun `BridgeApp is not a CloudStreamApp and never installs its exitProcess handler`() {
+        assertTrue(app is BridgeApp)
+        assertFalse(CloudStreamApp::class.java.isAssignableFrom(BridgeApp::class.java))
+        assertFalse(Thread.getDefaultUncaughtExceptionHandler() is ExceptionHandler)
+        assertEquals(null, CloudStreamApp.exceptionHandler)
+    }
+
+    /**
+     * LOUD GUARD for the reflective context: if upstream renames CloudStreamApp.Companion.setContext or the `_context`
+     * field, getKey/setKey and every plugin reading CloudStreamApp.context silently become no-ops. R8 keeps both
+     * (proguard-rules.pro).
+     */
+    @Test fun `CloudStreamApp context and the library context are the bridge app once it started`() {
+        assertSame(app, CloudStreamApp.context)
+        assertSame(app, com.lagradost.api.getContext())
+        val setter = CloudStreamApp.Companion::class.java.getDeclaredMethod("setContext", Context::class.java)
+        assertNotNull(setter)
+        assertNotNull(CloudStreamApp::class.java.getDeclaredField("_context"))
+    }
+
+    @Test fun `initForBridge sets both contexts again from scratch`() {
+        CloudStreamApp::class.java.getDeclaredField("_context").apply { isAccessible = true }.set(null, null)
+        com.lagradost.api.setContext(null)
+        assertEquals(null, CloudStreamApp.context)
+        assertEquals(null, com.lagradost.api.getContext())
+        CloudStreamApp.initForBridge(app)
+        assertSame(app, CloudStreamApp.context)
+        assertSame(app, com.lagradost.api.getContext())
+    }
+
+    @Test fun `upstream setKey and getKey land in the calling plugin's Kino storage`() {
+        asPlugin { CloudStreamApp.setKey("folder/path", mapOf("a" to 1)) }
+        val stored = kino.stores[PLUGIN]!!["folder/path"]!!
+        assertEquals("s", JSONObject(stored).getString("t"))
+        assertEquals(mapOf("a" to 1), asPlugin { CloudStreamApp.getKey<Map<String, Int>>("folder/path") })
+        assertEquals(listOf("folder/path"), asPlugin { CloudStreamApp.getKeys("folder") })
+        asPlugin { CloudStreamApp.removeKey("folder/path") }
+        assertTrue(kino.stores[PLUGIN]!!.isEmpty())
+    }
+
+    @Test fun `PluginManager getPluginsOnline reads through Kino too`() {
+        kino.stores.getOrPut(PLUGIN) { LinkedHashMap() }[PLUGINS_KEY] = JSONObject().put("t", "s")
+            .put("v", """[{"internalName":"X","url":null,"isOnline":true,"filePath":"/x.cs3","version":3}]""").toString()
+        val online = asPlugin { PluginManager.getPluginsOnline() }
+        assertEquals("X", online.single().internalName)
+    }
+
+    @Test fun `rebuild_preference is the Kino-backed prefs, every other name is memory only`() {
+        assertEquals("rebuild_preference", PREFERENCES_NAME)
+        asPlugin {
+            app.getSharedPrefs().edit().putString("k", "v").commit()
+            assertEquals("v", app.getSharedPrefs().getString("k", null))
+        }
+        assertEquals(listOf("set", "get"), kino.ops.map { it.getString("op") })
+        kino.ops.clear()
+        asPlugin {
+            app.getDefaultSharedPrefs().edit().putString("k", "v").commit()
+            PreferenceManager.getDefaultSharedPreferences(app).edit().putInt("n", 1).commit()
+            app.getSharedPreferences("anything", Context.MODE_PRIVATE).edit().putBoolean("b", true).commit()
+            assertTrue(app.getSharedPreferences("anything", Context.MODE_PRIVATE).getBoolean("b", false))
+            assertEquals(1, PreferenceManager.getDefaultSharedPreferences(app).getInt("n", 0))
+        }
+        assertTrue(kino.ops.isEmpty())
+        assertSame(app.getSharedPreferences(PREFERENCES_NAME, 0), app.getSharedPreferences(PREFERENCES_NAME, 0))
+    }
+
+    @Test fun `nothing is written in the bridge's data dir`() {
+        val dataDir = app.dataDir
+        fun files() = dataDir.walkTopDown().filter(File::isFile).map { it.relativeTo(dataDir).path }.toSet()
+        Ops.registry(app).ids() // the plugin registry's own index is not plugin state: created before the snapshot
+        val before = files()
+        asPlugin {
+            CloudStreamApp.setKey("k", "v")
+            CloudStreamApp.setKey(PLUGINS_KEY, arrayOf<String>())
+            app.getDefaultSharedPrefs().edit().putString("x", "y").commit()
+            app.getSharedPreferences("other", 0).edit().putString("x", "y").commit()
+            app.getSharedPreferences(PREFERENCES_NAME, 0).edit().putLong("l", 1).apply()
+        }
+        CloudStreamApp.setKey("unattributed", "v") // no call, no single plugin: memory
+        assertEquals(emptySet<String>(), files() - before)
+        assertFalse(File(dataDir, "shared_prefs/$PREFERENCES_NAME.xml").exists())
+        assertTrue(kino.stores[PLUGIN]!!.containsKey("k"))
+    }
+
+    private companion object {
+        const val PLUGIN = "cloudstream-app-test-cccccc"
+    }
+}
