@@ -3,6 +3,8 @@ package com.kino.csbridge.net
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.DeadObjectException
+import android.os.Parcel
+import android.os.Parcelable
 import android.os.ParcelFileDescriptor
 import com.kino.csbridge.CallContext
 import com.kino.csbridge.HostLink
@@ -302,6 +304,54 @@ class IpcInterceptorTest {
     @Test fun `URLs in Kino's messages are cut to host and first segment`() {
         assertEquals("boom https://h.example/a end", IpcInterceptor.scrubUrls("boom https://h.example/a/b/c?token=s#f end"))
         assertEquals("https://h.example", IpcInterceptor.scrubUrls("https://h.example?x=1"))
+        assertEquals("at HTTPS://h.example/a", IpcInterceptor.scrubUrls("at HTTPS://user:tok3n@h.example/a/b?q=1"))
+        assertEquals("Http://h.example", IpcInterceptor.scrubUrls("Http://u@h.example#frag"))
+    }
+
+    /** Records whether our cleanup closed a pipe end (status packet) or released it through writeToParcel (silent). */
+    private class Recording(inner: ParcelFileDescriptor) : ParcelFileDescriptor(inner) {
+        @Volatile var closed = false
+        @Volatile var parcelFlags: Int? = null
+        @Volatile private var inParcel = false
+        // Robolectric's shadow writeToParcel calls close() itself (AOSP closes with Status.SILENCE instead): only a
+        // close() from outside writeToParcel is ours.
+        override fun close() { if (!inParcel) closed = true; super.close() }
+        override fun writeToParcel(out: Parcel, flags: Int) {
+            parcelFlags = flags; inParcel = true
+            try { super.writeToParcel(out, flags) } finally { inParcel = false }
+        }
+    }
+
+    @Test fun `our copy of the sink's write end is released without a status, never closed`() {
+        // On a device a close() would put Status.OK on the comm channel ahead of Kino's closeWithError or death, and
+        // checkError() reads only the first packet. Robolectric can't show the packet; Task 9 checks it on a device.
+        serve("https://a.example/s" to Route(body = "ok".toByteArray()))
+        val writeEnds = CopyOnWriteArrayList<Recording>()
+        val shim = IpcInterceptor(pipes = {
+            ParcelFileDescriptor.createReliablePipe().let { arrayOf(it[0], Recording(it[1]).also { r -> writeEnds += r }) }
+        })
+        val client = OkHttpClient.Builder().addInterceptor(shim).eventListenerFactory(CallCapture).build()
+        assertEquals("ok", inCall { client.newCall(Request.Builder().url("https://a.example/s").build()).execute().body.string() })
+        val w = writeEnds.single()
+        assertFalse("close() would send a status packet", w.closed)
+        assertEquals(Parcelable.PARCELABLE_WRITE_RETURN_VALUE, w.parcelFlags)
+    }
+
+    @Test fun `a client listing the shim twice still makes one IPC`() {
+        serve("https://a.example/twice" to Route())
+        val add = Interceptor { it.proceed(it.request().newBuilder().header("X-After", "1").build()) }
+        val client = app.baseClient.newBuilder().addInterceptor(IpcInterceptor()).addInterceptor(add).build()
+        inCall { client.newCall(Request.Builder().url("https://a.example/twice").build()).execute().close() }
+        assertTrue(host.metas.single().headers.contains("X-After" to "1"))
+    }
+
+    @Test fun `a crashing plugin interceptor is an IOException, not a dead process`() {
+        serve("https://a.example/crash" to Route())
+        val npe = Interceptor { it.connection()!!; it.proceed(it.request()) }
+        assertTrue(assertIo { inCall { app.get("https://a.example/crash", interceptor = npe) } }.message!!.contains("NullPointerException"))
+        val ise = Interceptor { error("plugin bug") }
+        assertIo { inCall { app.get("https://a.example/crash", interceptor = ise) } }
+        assertTrue(host.metas.isEmpty())
     }
 
     private fun okhttp() = app.baseClient

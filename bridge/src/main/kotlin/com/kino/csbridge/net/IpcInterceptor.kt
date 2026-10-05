@@ -1,6 +1,8 @@
 package com.kino.csbridge.net
 
+import android.os.Parcel
 import android.os.ParcelFileDescriptor
+import android.os.Parcelable
 import android.util.Log
 import com.kino.csbridge.CallContext
 import com.kino.csbridge.HostLink
@@ -56,7 +58,11 @@ import java.util.concurrent.TimeUnit
  * after), so calls they start themselves (CloudflareKiller's `app.baseClient.newCall()`) belong to the same Kino
  * call. The client is read through [RedirectFlag.clientOf]. If that read fails, only the IPC runs.
  */
-class IpcInterceptor(private val host: () -> IHost? = { HostLink.host }) : Interceptor {
+class IpcInterceptor(
+    private val host: () -> IHost? = { HostLink.host },
+    /** Pipe factory; tests swap it to watch how our descriptor copies are released. */
+    internal val pipes: () -> Array<ParcelFileDescriptor> = { ParcelFileDescriptor.createReliablePipe() },
+) : Interceptor {
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val call = chain.call()
@@ -76,12 +82,15 @@ class IpcInterceptor(private val host: () -> IHost? = { HostLink.host }) : Inter
         }
     }
 
-    /** Application interceptors after this one (found by identity), then the network interceptors. */
+    /**
+     * Application interceptors after this one (found by identity), then the network interceptors; every
+     * [IpcInterceptor] is left out, so a client that lists the shim twice still makes one IPC per `proceed`.
+     */
     private fun downstreamOf(client: OkHttpClient): List<Interceptor> {
         val appInterceptors = client.interceptors
         val i = appInterceptors.indexOfFirst { it === this }
         if (i < 0) return emptyList()
-        return appInterceptors.subList(i + 1, appInterceptors.size) + client.networkInterceptors
+        return (appInterceptors.subList(i + 1, appInterceptors.size) + client.networkInterceptors).filterNot { it is IpcInterceptor }
     }
 
     /**
@@ -110,7 +119,7 @@ class IpcInterceptor(private val host: () -> IHost? = { HostLink.host }) : Inter
         override fun proceed(request: Request): Response =
             if (index < interceptors.size) {
                 val next = BridgeChain(interceptors, index + 1, request, call, ctx, follow, connectMs, readMs, writeMs, explicitMs)
-                interceptors[index].intercept(next)
+                guarded(interceptors[index]) { it.intercept(next) }
             } else {
                 exchange(request, call, ctx, follow, explicitMs)
             }
@@ -122,6 +131,22 @@ class IpcInterceptor(private val host: () -> IHost? = { HostLink.host }) : Inter
 
         private fun copy(connect: Int = connectMs, read: Int = readMs, write: Int = writeMs, explicit: Int): BridgeChain =
             BridgeChain(interceptors, index, request, call, ctx, follow, connect, read, write, explicit)
+    }
+
+    /**
+     * A plugin interceptor's own failure (NPE from `connection()!!`, IllegalStateException, a linkage error) becomes
+     * an IOException: on an OkHttp dispatcher thread anything else would be rethrown and kill the bridge process.
+     * Only VM errors other than stack overflow pass through.
+     */
+    private inline fun guarded(i: Interceptor, block: (Interceptor) -> Response): Response = try {
+        block(i)
+    } catch (e: IOException) {
+        throw e
+    } catch (e: VirtualMachineError) {
+        if (e !is StackOverflowError) throw e
+        throw IOException("bridge: plugin interceptor ${i.javaClass.simpleName} failed: ${e.javaClass.simpleName}", e)
+    } catch (e: Throwable) {
+        throw IOException("bridge: plugin interceptor ${i.javaClass.simpleName} failed: ${e.javaClass.simpleName}", e)
     }
 
     /** One IPC: [req] to Kino, its answer back as an OkHttp response streaming from the sink pipe. */
@@ -137,8 +162,8 @@ class IpcInterceptor(private val host: () -> IHost? = { HostLink.host }) : Inter
             followRedirects = follow, timeoutMs = timeoutMs(ctx, call, explicitMs), hasBody = body != null,
         )
 
-        val sink = ParcelFileDescriptor.createReliablePipe() // [0] we read, [1] Kino writes
-        val bodyPipe = body?.let { ParcelFileDescriptor.createReliablePipe() } // [0] Kino reads, [1] the writer thread
+        val sink = pipes() // [0] we read, [1] Kino writes
+        val bodyPipe = body?.let { pipes() } // [0] Kino reads, [1] the writer thread
         // The writer thread owns bodyPipe[1] alone: it ends when the bytes are written or every read end is gone.
         if (body != null) startBodyWriter(bodyPipe!![1], body)
         val waiter = ReplyWaiter()
@@ -148,8 +173,9 @@ class IpcInterceptor(private val host: () -> IHost? = { HostLink.host }) : Inter
             closeQuietly(sink[0])
             fail(req.url, "Kino unreachable (${e.javaClass.simpleName})", e)
         } finally {
-            // Binder duplicated these for Kino; our copies must go or the reader never sees EOF.
-            closeQuietly(sink[1]); closeQuietly(bodyPipe?.get(0))
+            // Binder duplicated these for Kino; our copies must go or the reader never sees EOF, and they must go
+            // SILENTLY (see releaseSilently): a close() would put our own status on the comm channel ahead of Kino's.
+            releaseSilently(sink[1]); releaseSilently(bodyPipe?.get(0))
         }
 
         val replyJson = try {
@@ -283,10 +309,31 @@ class IpcInterceptor(private val host: () -> IHost? = { HostLink.host }) : Inter
         const val MAX_RESPONSE_BODY = 5 * 1024 * 1024
         private const val POLL_MS = 100L
         private const val TAG = "CsBridgeHttp"
-        private val URL = Regex("(https?://[^/\\s?#]+)(/[^/\\s?#]*)?\\S*")
+        private val URL = Regex("(https?://)(?:[^/\\s?#@]*@)?([^/\\s?#]+)(/[^/\\s?#]*)?\\S*", RegexOption.IGNORE_CASE)
 
-        /** Every URL in [s] cut to scheme + host + first path segment. */
-        internal fun scrubUrls(s: String): String = s.replace(URL) { m -> m.groupValues[1] + m.groupValues[2] }
+        /** Every URL in [s] cut to scheme + host + first path segment; userinfo (`user:token@`) dropped. */
+        internal fun scrubUrls(s: String): String = s.replace(URL) { m -> m.groupValues[1] + m.groupValues[2] + m.groupValues[3] }
+
+        /**
+         * Releases our copy of a reliable-pipe end WITHOUT a status packet. Both copies (ours and the one Binder gave
+         * Kino) share one comm channel, and `checkError()` reads only the first packet: a `close()` here would send
+         * Status.OK ahead of Kino's `closeWithError` or death (sink), or make our body writer skip its own OK so
+         * Kino's reader sees "remote side is dead" at EOF (request body). AOSP (API 36 ParcelFileDescriptor):
+         * `writeToParcel` with PARCELABLE_WRITE_RETURN_VALUE ends in `closeWithStatus(Status.SILENCE)`, which closes
+         * the fd and comm fd without writing; the Parcel's own dups go with `recycle()`. If that fails we fall back to
+         * close(): a lost error status beats a leaked writer that keeps the reader from ever seeing EOF.
+         */
+        internal fun releaseSilently(pfd: ParcelFileDescriptor?) {
+            if (pfd == null) return
+            val p = Parcel.obtain()
+            try {
+                pfd.writeToParcel(p, Parcelable.PARCELABLE_WRITE_RETURN_VALUE)
+            } catch (_: Throwable) {
+                closeQuietly(pfd)
+            } finally {
+                p.recycle()
+            }
+        }
 
         private fun log(msg: String) { runCatching { Log.w(TAG, msg) } }
         private fun closeQuietly(pfd: ParcelFileDescriptor?) { runCatching { pfd?.close() } }
