@@ -23,9 +23,10 @@ android {
         buildConfigField("String", "KOTLIN_VERSION", "\"${KotlinVersion.CURRENT}\"")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
+    testOptions { unitTests.isIncludeAndroidResources = true }
     buildFeatures { aidl = true; buildConfig = true }
     sourceSets["main"].aidl.srcDir("../bridge-contract/aidl")
-    sourceSets["main"].java.srcDir("../bridge-contract/kotlin")
+    sourceSets["main"].kotlin.directories.add(file("../bridge-contract/kotlin").absolutePath)
     compileOptions {
         isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17
