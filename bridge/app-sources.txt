@@ -9,8 +9,8 @@ com/lagradost/cloudstream3/CloudStreamApp.kt
 com/lagradost/cloudstream3/AcraApplication.kt
 com/lagradost/cloudstream3/utils/DataStore.kt
 
-# Networking helpers plugins construct
-com/lagradost/cloudstream3/network/CloudflareKiller.kt
+# network/CloudflareKiller.kt is NOT here: it opens a WebView and clears CookieManager. Its bridge-owned replacement
+# (same ABI) is stubs/CloudflareKiller.kt and solves Cloudflare through Kino's hidden WebView (IHost.webView).
 
 # Small value types used across the app API
 com/lagradost/cloudstream3/utils/Event.kt

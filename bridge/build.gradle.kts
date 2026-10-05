@@ -1,4 +1,9 @@
 // GPL-3.0 (this fork). Headless CloudStream runtime for Kino. See BRIDGE.md.
+import java.util.zip.ZipEntry
+import java.util.zip.ZipFile
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
+
 plugins {
     // AGP 9 compiles Kotlin itself (built-in Kotlin), as upstream's :app does: no kotlin.android plugin.
     alias(libs.plugins.android.application)
@@ -63,6 +68,96 @@ val copyAppSources by tasks.registering(Sync::class) {
 // it compiles (srcDir() is deprecated there). preBuild runs before every compile task, so the copy is in place.
 android.sourceSets["main"].kotlin.directories.add(upstreamAppSrc.get().asFile.absolutePath)
 tasks.named("preBuild") { dependsOn(copyAppSources) }
+
+// ---- Upstream :library classes the bridge replaces ------------------------------------------------------------
+// The library's Android WebViewResolver creates a real WebView, which this process must never do. The bridge has its
+// own class with the same name and ABI (src/main/kotlin/com/kino/csbridge/stubs/WebViewResolver.kt) that asks Kino's
+// hidden WebView instead (IHost.webView). The library's compiled copy (the class and its inner classes, NOT the
+// WebViewResolver_androidKt helpers) is dropped from every classpath of this module by an artifact transform on the
+// :library class artifacts: upstream sources stay untouched, and `android { packaging }` cannot drop classes.
+// Library extractors that call WebViewResolver (StreamWish, Filemoon, ...) get the bridge's class too.
+val replacedLibraryClasses = listOf("com/lagradost/cloudstream3/network/WebViewResolver")
+val replacedClassesDropped = Attribute.of("com.kino.csbridge.replacedClassesDropped", Boolean::class.javaObjectType)
+
+abstract class DropReplacedLibraryClasses : TransformAction<DropReplacedLibraryClasses.Parameters> {
+    interface Parameters : TransformParameters {
+        /** Internal class names (`a/b/C`): `a/b/C.class` and every `a/b/C$*.class` are dropped. */
+        @get:Input val classNames: ListProperty<String>
+    }
+
+    @get:InputArtifact @get:PathSensitive(PathSensitivity.NAME_ONLY)
+    abstract val inputArtifact: Provider<FileSystemLocation>
+
+    override fun transform(outputs: TransformOutputs) {
+        val input = inputArtifact.get().asFile
+        val names = parameters.classNames.get()
+        fun dropped(path: String) = path.endsWith(".class") && names.any { path == "$it.class" || path.startsWith("$it\$") }
+        when {
+            input.isDirectory -> {
+                val files = input.walkTopDown().filter { it.isFile }.toList()
+                if (files.none { dropped(it.relativeTo(input).invariantSeparatorsPath) }) { outputs.dir(input); return }
+                val out = outputs.dir(input.name + "-bridge")
+                files.forEach { f ->
+                    val rel = f.relativeTo(input).invariantSeparatorsPath
+                    if (!dropped(rel)) f.copyTo(out.resolve(rel), overwrite = true)
+                }
+            }
+            input.isFile && input.name.endsWith(".jar") -> {
+                val any = ZipFile(input).use { z -> z.entries().asSequence().any { dropped(it.name) } }
+                if (!any) { outputs.file(input); return }
+                val out = outputs.file(input.nameWithoutExtension + "-bridge.jar")
+                ZipInputStream(input.inputStream().buffered()).use { zin ->
+                    ZipOutputStream(out.outputStream().buffered()).use { zout ->
+                        while (true) {
+                            val e = zin.nextEntry ?: break
+                            if (dropped(e.name)) continue
+                            zout.putNextEntry(ZipEntry(e.name))
+                            zin.copyTo(zout)
+                            zout.closeEntry()
+                        }
+                    }
+                }
+            }
+            else -> outputs.file(input)
+        }
+    }
+}
+
+// Gradle only runs a transform when no variant matches as is, and a variant that says nothing about an attribute
+// matches any requested value. So :library's class variants must SAY they still hold the replaced classes. That is
+// declared here, on :library's model, from this script (library/build.gradle.kts is upstream and stays untouched).
+// Only the class-artifact secondary variants carry it (never the configuration: graph resolution would then pick
+// :library's JVM target instead); every other :library artifact matches as is, and consumers that don't ask for the
+// attribute (upstream :app) see no difference.
+// Gradle refuses two transform chains of the same length, and AGP can reach dex both from these variants and from
+// :library's primary `jar` variant. So the directory is stripped straight into AGP's `android-classes` (the input of its
+// dexing), one step shorter than any other chain; jar requests (compile, unit tests) get the stripped classes jar.
+// HostWebViewResolverTest checks the result: one WebViewResolver on the test classpath, the bridge's.
+val strippedClassVariants = mapOf(
+    "android-classes-jar" to "android-classes-jar",
+    "android-classes-directory" to "android-classes", // AGP's variant name is "android-classes-directory-A...": prefix
+)
+project(":library").configurations.matching { it.name == "androidRuntimeElements" || it.name == "androidApiElements" }.configureEach {
+    outgoing.variants.matching { v -> strippedClassVariants.keys.any { v.name == it || v.name.startsWith("$it-") } }.configureEach {
+        attributes.attribute(replacedClassesDropped, false)
+    }
+}
+
+dependencies {
+    attributesSchema { attribute(replacedClassesDropped) }
+    strippedClassVariants.forEach { (from, to) ->
+        registerTransform(DropReplacedLibraryClasses::class) {
+            this.from.attribute(ArtifactTypeDefinition.ARTIFACT_TYPE_ATTRIBUTE, from).attribute(replacedClassesDropped, false)
+            this.to.attribute(ArtifactTypeDefinition.ARTIFACT_TYPE_ATTRIBUTE, to).attribute(replacedClassesDropped, true)
+            parameters { classNames.set(replacedLibraryClasses) }
+        }
+    }
+}
+configurations.configureEach {
+    if (isCanBeResolved && (name.endsWith("RuntimeClasspath") || name.endsWith("CompileClasspath"))) {
+        attributes.attribute(replacedClassesDropped, true)
+    }
+}
 
 tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinJvmCompile>().configureEach {
     compilerOptions {

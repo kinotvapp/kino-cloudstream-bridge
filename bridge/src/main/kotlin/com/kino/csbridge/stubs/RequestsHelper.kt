@@ -1,4 +1,4 @@
-// Headless stand-in for upstream app/src/main/java/com/lagradost/cloudstream3/network/RequestsHelper.kt: same ABI, no UI. Members the included upstream CloudflareKiller.kt uses.
+// Headless stand-in for upstream app/src/main/java/com/lagradost/cloudstream3/network/RequestsHelper.kt: same ABI, no UI. Members the bridge's CloudflareKiller uses.
 // Upstream's buildDefaultClient/initClient (DNS-over-HTTPS settings, disk cache) are left out: the bridge's HTTP
 // client is set up by the bridge itself, never from upstream's preferences.
 package com.lagradost.cloudstream3.network
