@@ -31,8 +31,11 @@ internal object ProviderOps {
     const val MAX_SUBTITLE_EVENTS = 100
     /** One event's JSON past this is dropped (and not counted): binder's async space is shared with the `done`. */
     const val MAX_EVENT_CHARS = 16 * 1024
-    /** All events of one op together: past this, events are dropped and not counted. */
-    const val MAX_EVENTS_TOTAL_CHARS = 150_000
+    /**
+     * All events of one op together: past this, events are dropped and not counted. About 200 KB as parcels, plus a done
+     * of up to 240 KB, stays under binder's ~508 KB oneway space.
+     */
+    const val MAX_EVENTS_TOTAL_CHARS = 100_000
     /**
      * A `load` answer longer than this is rebuilt leaner (no episode posters and descriptions, then no names). Below the
      * service's result cap, which keeps a `done` parcel (2 bytes a char) well inside binder's oneway space.

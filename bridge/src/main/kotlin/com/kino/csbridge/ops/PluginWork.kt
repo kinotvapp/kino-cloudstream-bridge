@@ -56,11 +56,15 @@ internal object PluginWork {
      *
      * [onLateResult] gets a result Kino was never told about: one that finished after the op stopped waiting, or in the
      * instant before the hand-over. It runs on [registryDispatcher] (install uses it to roll back).
+     *
+     * [onDispose] runs once the work has completed, whichever way: returned, threw, or cancelled before it started (then
+     * [block] never runs, so resources it would have closed are closed here).
      */
     suspend fun <T> run(
         pluginId: String,
         on: CoroutineDispatcher = dispatcher,
         onLateResult: ((T) -> Unit)? = null,
+        onDispose: (() -> Unit)? = null,
         block: suspend () -> T,
     ): T {
         val ctx = currentCoroutineContext().minusKey(Job) + on
@@ -70,6 +74,7 @@ internal object PluginWork {
             if (!state.compareAndSet(RUNNING, FINISHED)) late(onLateResult, r)
             r
         }
+        if (onDispose != null) work.invokeOnCompletion { runCatching { onDispose() } }
         var delivered = false
         try {
             val r = work.await()

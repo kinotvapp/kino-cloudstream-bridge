@@ -52,37 +52,54 @@ object Ops {
     }
 
     /** Per plugin: one install, remove or rollback at a time, and how many installs and removes have started. */
+    /**
+     * Per plugin: one install, remove or rollback at a time, and a generation that only a real change bumps (an install
+     * that stored a version, a remove of a stored plugin, a rollback), always inside that plugin's lock.
+     */
     private val mutationLocks = ConcurrentHashMap<String, Any>()
-    private val mutationSeq = ConcurrentHashMap<String, AtomicLong>()
+    private val mutationGen = ConcurrentHashMap<String, AtomicLong>()
     private fun lockOf(id: String) = mutationLocks.computeIfAbsent(id) { Any() }
-    private fun seqOf(id: String) = mutationSeq.computeIfAbsent(id) { AtomicLong() }
+    private fun genOf(id: String) = mutationGen.computeIfAbsent(id) { AtomicLong() }
+
+    /** Tests swap it to observe the install's own descriptor. */
+    @Volatile internal var dupPayload: (ParcelFileDescriptor) -> ParcelFileDescriptor = { it.dup() }
 
     private suspend fun remove(reg: PluginRegistry, id: String): String {
-        seqOf(id).incrementAndGet()
         val stuck = PluginWork.busy(id)
         return PluginWork.run(id, on = PluginWork.registryDispatcher) {
-            synchronized(lockOf(id)) { reg.remove(id, beforeUnload = !stuck) }
+            synchronized(lockOf(id)) {
+                val existed = id in reg.ids()
+                reg.remove(id, beforeUnload = !stuck)
+                if (existed) genOf(id).incrementAndGet()
+            }
             JSONObject().put("ok", true).toString()
         }
     }
 
     /**
-     * Installs on the registry's threads, from a dup of the payload that the work owns: the service closes its own fd
-     * when the op ends, and a late install never reads a closed (or reused) descriptor. An install that lands after Kino
-     * stopped waiting (deadline, cancel) is rolled back, unless a newer install or remove of the same plugin has started
-     * since, so Kino is never told "failed" about a plugin that stays installed.
+     * Installs on the registry's threads, from a dup of the payload that the work owns and closes when it completes
+     * (run, failed, or cancelled before it started): the service closes its own fd when the op ends, and a late install
+     * never reads a closed (or reused) descriptor. An install that lands after Kino stopped waiting (deadline, cancel) is
+     * rolled back, unless the plugin really changed since (a newer stored install or a remove); a retry that failed
+     * validation changes nothing and does not stop the rollback. So Kino is never told "failed" about a plugin that
+     * stays installed.
      */
     private suspend fun install(reg: PluginRegistry, req: CsWire.OpRequest, payload: ParcelFileDescriptor?): String {
         val pfd = payload ?: return CsWire.error(CsWire.Err.BAD_REQUEST, "payload")
         val id = req.pluginId
-        val mine = seqOf(id).incrementAndGet()
         val stuck = PluginWork.busy(id)
-        val own = pfd.dup()
-        val rollback: (Pair<String, Boolean>) -> Unit = { (_, stored) ->
-            if (stored) synchronized(lockOf(id)) { if (seqOf(id).get() == mine) reg.remove(id) }
+        val own = dupPayload(pfd)
+        // The generation this install created, or -1 when it stored nothing.
+        val rollback: (Pair<String, Long>) -> Unit = { (_, gen) ->
+            if (gen >= 0) synchronized(lockOf(id)) {
+                if (genOf(id).get() == gen) { reg.remove(id); genOf(id).incrementAndGet() }
+            }
         }
-        return PluginWork.run(id, on = PluginWork.registryDispatcher, onLateResult = rollback) {
-            synchronized(lockOf(id)) { installLocked(reg, req, own, beforeUnload = !stuck) }
+        return PluginWork.run(id, on = PluginWork.registryDispatcher, onLateResult = rollback, onDispose = { runCatching { own.close() } }) {
+            synchronized(lockOf(id)) {
+                val (json, stored) = installLocked(reg, req, own, beforeUnload = !stuck)
+                json to (if (stored) genOf(id).incrementAndGet() else -1L)
+            }
         }.first
     }
 

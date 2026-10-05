@@ -33,6 +33,7 @@ class OpsInstallTest {
     }
 
     @After fun tearDown() {
+        Ops.dupPayload = { it.dup() }
         Ops.instance?.let { r -> r.ids().forEach { r.remove(it) } }
         Ops.instance = null
         APIHolder.allProviders.withLock { APIHolder.allProviders.removeAll { it is FixtureApi } }
@@ -144,6 +145,72 @@ class OpsInstallTest {
             assertTrue(APIHolder.allProviders.withLock { APIHolder.allProviders.none { it is FixtureApi } })
         } finally {
             BlockingPlugin.release.countDown()
+        }
+    }
+
+    @Test fun `an install cancelled before it starts still closes its own descriptor`() {
+        val f = DexFixtures.cs3(File.createTempFile("fixture", ".cs3"), listOf(DexFixtures.currentEpisodeDex()),
+            DexFixtures.manifest("Cuevana", FixturePlugin::class.java.name, 7))
+        // A descriptor that records its close (the wrapper constructor shares the dup's fd).
+        val closes = java.util.concurrent.atomic.AtomicInteger()
+        val dups = java.util.concurrent.atomic.AtomicInteger()
+        Ops.dupPayload = { dups.incrementAndGet(); object : ParcelFileDescriptor(it.dup()) { override fun close() { closes.incrementAndGet(); super.close() } } }
+        val release = java.util.concurrent.CountDownLatch(1)
+        try {
+            runBlocking {
+                // Both registry threads busy: the install below is queued and cancelled before it starts.
+                repeat(2) {
+                    kotlinx.coroutines.withTimeoutOrNull(50) {
+                        PluginWork.run("cloudstream-other", on = PluginWork.registryDispatcher) { release.await(20, java.util.concurrent.TimeUnit.SECONDS) }
+                    }
+                }
+                val pfd = ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
+                val answer = kotlinx.coroutines.withTimeoutOrNull(200) {
+                    val req = CsWire.parseOpRequest(CsWire.opRequest(CsWire.Op.INSTALL, "c1", "cloudstream-fx", 5000,
+                        JSONObject().put("sha256", DexFixtures.sha256(f))))!!
+                    Ops.run(context, req, pfd) { true }
+                }
+                assertEquals(null, answer)
+                pfd.close()
+            }
+            assertEquals(1, dups.get())
+            // A cancelled, never-started task completes once a registry thread frees up and skips its body.
+            release.countDown()
+            waitUntil("the install's own descriptor was left open") { closes.get() >= 1 }
+            assertEquals(emptyList<CsWire.HelloPlugin>(), Ops.helloPlugins(context)) // never ran
+        } finally {
+            release.countDown()
+            PluginWork.resetForTest()
+        }
+    }
+
+    @Test fun `a retry that fails validation does not stop a late install's rollback`() {
+        BlockingPlugin.reset()
+        val f = DexFixtures.cs3(File.createTempFile("blocking", ".cs3"), listOf(DexFixtures.currentEpisodeDex()),
+            DexFixtures.manifest("Lento", BlockingPlugin::class.java.name, 1))
+        val retryPool = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            val pfd = ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
+            val answer = runBlocking {
+                kotlinx.coroutines.withTimeoutOrNull(300) {
+                    val req = CsWire.parseOpRequest(CsWire.opRequest(CsWire.Op.INSTALL, "c1", "cloudstream-slow", 5000,
+                        JSONObject().put("sha256", DexFixtures.sha256(f))))!!
+                    Ops.run(context, req, pfd) { true }
+                }
+            }
+            assertEquals(null, answer)
+            pfd.close()
+            assertTrue("load() never started", BlockingPlugin.entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // Kino retries with a sha256 that does not match: refused, nothing changes.
+            val retry = retryPool.submit<String> {
+                op(CsWire.Op.INSTALL, JSONObject().put("sha256", "f".repeat(64)), f, id = "cloudstream-slow")
+            }
+            BlockingPlugin.release.countDown()
+            assertEquals(CsWire.Err.BAD_REQUEST, CsWire.errorOf(retry.get(10, java.util.concurrent.TimeUnit.SECONDS))!!.first)
+            waitUntil("the late install was not rolled back") { BlockingPlugin.unloads.get() == 1 && "cloudstream-slow" !in Ops.instance!!.ids() }
+        } finally {
+            BlockingPlugin.release.countDown()
+            retryPool.shutdown()
         }
     }
 }
