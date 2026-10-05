@@ -1,0 +1,232 @@
+package com.kino.csbridge.net
+
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.DeadObjectException
+import android.os.ParcelFileDescriptor
+import com.kino.csbridge.CallContext
+import com.kino.csbridge.HostLink
+import com.kino.csbridge.contract.CsWire
+import com.kino.csbridge.contract.IHost
+import com.kino.csbridge.contract.IHttpReply
+import com.kino.csbridge.contract.IReply
+import com.lagradost.cloudstream3.UnsafeSSL
+import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.insecureApp
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.asContextElement
+import kotlinx.coroutines.runBlocking
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
+import org.junit.After
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
+import java.io.IOException
+import java.util.concurrent.CopyOnWriteArrayList
+import kotlin.concurrent.thread
+
+@RunWith(RobolectricTestRunner::class)
+class IpcInterceptorTest {
+    /** What the fake Kino answers for one URL; [reply] = false means it never answers. */
+    data class Route(
+        val status: Int = 200, val headers: List<Pair<String, String>> = emptyList(), val body: ByteArray = ByteArray(0),
+        val finalUrl: String? = null, val error: String? = null, val reply: Boolean = true, val dieAfterSend: Boolean = false,
+    )
+
+    /** A fake Kino serving from [routes]; records each meta and request body it received. */
+    private class FakeHost(val routes: Map<String, Route>) : IHost.Stub() {
+        val metas = CopyOnWriteArrayList<CsWire.HttpMeta>()
+        val bodies = CopyOnWriteArrayList<ByteArray?>()
+        @Volatile var alive = true
+        @Volatile var deadOnSend = false
+
+        override fun isBinderAlive(): Boolean = alive
+
+        override fun request(metaJson: String, requestBodyIn: ParcelFileDescriptor?, responseSinkIn: ParcelFileDescriptor, reply: IHttpReply) {
+            if (deadOnSend) throw DeadObjectException()
+            // In process there is no parcel: duplicate the descriptors, as Binder does for a real Kino.
+            val requestBody = requestBodyIn?.dup()
+            val responseSink = responseSinkIn.dup()
+            val meta = CsWire.parseHttpMeta(metaJson)!!
+            metas += meta
+            // Robolectric's pipe is a temp file shared by both ends, not a blocking OS pipe: a read before the writer is
+            // done sees EOF. So the fake lets the request body writer finish first, and writes a response body before
+            // answering (a real Kino answers first and streams after; the interceptor reads only after the answer).
+            thread {
+                if (requestBody != null) Thread.sleep(300)
+                bodies += requestBody?.let { ParcelFileDescriptor.AutoCloseInputStream(it).use { s -> s.readBytes() } }
+                val r = routes[meta.url] ?: Route(status = 404)
+                when {
+                    r.dieAfterSend -> { alive = false; runCatching { responseSink.close() } }
+                    !r.reply -> {} // silent: keeps the sink open, never answers
+                    r.error != null -> { reply.response(CsWire.error(r.error, "boom https://x.example/a?token=secret")); responseSink.close() }
+                    else -> {
+                        ParcelFileDescriptor.AutoCloseOutputStream(responseSink).use { it.write(r.body) }
+                        reply.response(JSONObject().put("status", r.status).put("message", "M").put("headers", CsWire.headersToJson(r.headers))
+                            .put("finalUrl", r.finalUrl ?: meta.url).toString())
+                    }
+                }
+            }
+        }
+        override fun webView(requestJson: String?, reply: IReply?) {}
+        override fun storage(opJson: String?): String = "{}"
+    }
+
+    private lateinit var host: FakeHost
+
+    private fun serve(vararg routes: Pair<String, Route>): FakeHost = FakeHost(routes.toMap()).also { host = it; HostLink.host = it }
+
+    private fun <T> inCall(ctx: CallContext = CallContext("call-1", "cloudstream-x", CallContext.deadlineFromNow(10_000)), block: suspend () -> T): T =
+        runBlocking(ctx + CallContext.threadLocal.asContextElement(ctx)) { block() }
+
+    @Before fun setUp() { NetworkShim.install() }
+    @After fun tearDown() { HostLink.host = null }
+
+    @Test fun `get returns body and repeated set-cookie headers`() {
+        serve("https://a.example/p?q=1" to Route(
+            headers = listOf("Set-Cookie" to "a=1", "Content-Type" to "text/html", "Set-Cookie" to "b=2"),
+            body = "hello".toByteArray(), finalUrl = "https://b.example/final",
+        ))
+        val r = inCall { app.get("https://a.example/p?q=1") }
+        assertEquals(200, r.code)
+        assertEquals("hello", r.text)
+        assertEquals(listOf("a=1", "b=2"), r.okhttpResponse.headers("Set-Cookie"))
+        val h = r.okhttpResponse.headers
+        assertEquals(listOf("Set-Cookie", "Content-Type", "Set-Cookie"), (0 until h.size).map { h.name(it) })
+        assertEquals("https://b.example/final", r.url)
+        val m = host.metas.single()
+        assertEquals("call-1", m.callId); assertEquals("cloudstream-x", m.pluginId); assertEquals("GET", m.method)
+        assertTrue(m.followRedirects); assertFalse(m.hasBody)
+        assertTrue("deadline bounds the timeout", m.timeoutMs in 1..10_000)
+    }
+
+    @Test fun `allowRedirects=false reaches Kino as followRedirects=false`() {
+        serve("https://a.example/r" to Route(status = 302, headers = listOf("Location" to "https://b.example/")))
+        val r = inCall { app.get("https://a.example/r", allowRedirects = false) }
+        assertEquals(302, r.code)
+        assertFalse(host.metas.single().followRedirects)
+    }
+
+    @OptIn(UnsafeSSL::class)
+    @Test fun `insecureApp goes through Kino too`() {
+        serve("https://a.example/i" to Route(body = "x".toByteArray()))
+        assertEquals("x", inCall { insecureApp.get("https://a.example/i", verify = false) }.text)
+        assertEquals(1, host.metas.size)
+    }
+
+    @Test fun `post body arrives through the pipe`() {
+        serve("https://a.example/post" to Route(body = "ok".toByteArray()))
+        val payload = """{"k":"v"}"""
+        val r = inCall { app.post("https://a.example/post", requestBody = payload.toRequestBody("application/json".toMediaType())) }
+        assertEquals("ok", r.text)
+        val m = host.metas.single()
+        assertTrue(m.hasBody); assertEquals("POST", m.method)
+        assertTrue(m.headers.any { it.first.equals("Content-Type", true) && it.second.startsWith("application/json") })
+        assertArrayEquals(payload.toByteArray(), host.bodies.single())
+    }
+
+    @Test fun `request body over 1 MB is refused before sending`() {
+        serve()
+        val big = ByteArray(IpcInterceptor.MAX_REQUEST_BODY + 1)
+        assertIo { inCall { app.post("https://a.example/big", requestBody = big.toRequestBody()) } }
+        assertTrue(host.metas.isEmpty())
+    }
+
+    @Test fun `response body over 5 MB fails while reading`() {
+        serve("https://a.example/huge" to Route(body = ByteArray(IpcInterceptor.MAX_RESPONSE_BODY + 1)))
+        assertIo { inCall { app.get("https://a.example/huge").okhttpResponse.body.bytes() } }
+    }
+
+    @Test fun `request outside a call is refused`() {
+        serve("https://a.example/" to Route())
+        val e = assertIo { runBlocking { app.get("https://a.example/") } }
+        assertTrue(e.message!!.contains("outside a Kino call"))
+        assertTrue(host.metas.isEmpty())
+    }
+
+    @Test fun `no host bound is an IOException`() {
+        HostLink.host = null
+        assertIo { inCall { app.get("https://a.example/") } }
+    }
+
+    @Test fun `Kino dying mid-request surfaces IOException within the deadline`() {
+        serve("https://a.example/die" to Route(dieAfterSend = true))
+        val t0 = System.nanoTime()
+        assertTrue(assertIo { inCall { app.get("https://a.example/die") } }.message!!.contains("Kino died"))
+        assertTrue("took ${ms(t0)} ms", ms(t0) < 3_000)
+    }
+
+    @Test fun `dead binder on send is an IOException`() {
+        serve().deadOnSend = true
+        assertTrue(assertIo { inCall { app.get("https://a.example/") } }.message!!.contains("DeadObjectException"))
+    }
+
+    @Test fun `silent Kino ends at the call deadline`() {
+        serve("https://a.example/silent" to Route(reply = false))
+        val t0 = System.nanoTime()
+        val e = assertIo { inCall(CallContext("call-2", "cloudstream-x", CallContext.deadlineFromNow(700))) { app.get("https://a.example/silent") } }
+        assertTrue(e.message!!.contains("deadline"))
+        assertTrue("took ${ms(t0)} ms", ms(t0) in 500..3_000)
+    }
+
+    @Test fun `cancelling the op stops the wait`() {
+        serve("https://a.example/silent" to Route(reply = false))
+        val ctx = CallContext("call-3", "cloudstream-x", CallContext.deadlineFromNow(60_000))
+        val job = Job().also { ctx.job = it }
+        thread { Thread.sleep(300); job.cancel() }
+        val t0 = System.nanoTime()
+        // Blocking OkHttp from the op's thread: the interceptor itself must notice the cancellation.
+        val e = assertIo { inCall(ctx) { okhttp().newCall(Request.Builder().url("https://a.example/silent").build()).execute() } }
+        assertTrue(e.message!!.contains("cancel"))
+        assertTrue("took ${ms(t0)} ms", ms(t0) < 3_000)
+    }
+
+    @Test fun `Kino error reply is an IOException without the query`() {
+        serve("https://a.example/e" to Route(error = CsWire.Err.REFUSED))
+        val e = assertIo { inCall { app.get("https://a.example/e") } }
+        assertTrue(e.message!!.contains("refused"))
+        assertFalse(e.message!!.contains("secret"))
+    }
+
+    @Test fun `redirect flag is read from the bundled OkHttp`() {
+        // FAILS LOUDLY when an OkHttp bump breaks the reflective read: allowRedirects=false would then silently follow.
+        val req = Request.Builder().url("https://a.example/").build()
+        assertEquals(false, RedirectFlag.read(OkHttpClient.Builder().followRedirects(false).build().newCall(req)))
+        assertEquals(true, RedirectFlag.read(OkHttpClient().newCall(req)))
+    }
+
+    @Test fun `direct OkHttpClient() has no network`() {
+        // Robolectric sanity check only (the JVM has a network): the app holds no INTERNET permission. Task 9 proves it on a device.
+        val ctx = RuntimeEnvironment.getApplication()
+        assertEquals(PackageManager.PERMISSION_DENIED, ctx.checkSelfPermission(Manifest.permission.INTERNET))
+        val requested = ctx.packageManager.getPackageInfo(ctx.packageName, PackageManager.GET_PERMISSIONS).requestedPermissions.orEmpty()
+        assertFalse(Manifest.permission.INTERNET in requested)
+    }
+
+    @Test fun `install puts the shim on both clients`() {
+        @OptIn(UnsafeSSL::class)
+        val clients = listOf(app.baseClient, insecureApp.baseClient)
+        clients.forEach { c -> assertNotNull(c.interceptors.singleOrNull { it is IpcInterceptor }) }
+    }
+
+    private fun okhttp() = app.baseClient
+
+    private fun ms(t0: Long) = (System.nanoTime() - t0) / 1_000_000
+
+    private fun assertIo(block: () -> Unit): IOException {
+        try { block() } catch (e: IOException) { return e }
+        fail("expected IOException"); throw AssertionError()
+    }
+}

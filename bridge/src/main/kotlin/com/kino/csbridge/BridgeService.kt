@@ -56,7 +56,7 @@ class BridgeService : Service() {
             if (!callerCheck(Binder.getCallingUid())) return refuse(reply, payload, CsWire.Err.REFUSED, "caller")
             val req = CsWire.parseOpRequest(requestJson)
             if (req == null || (req.op != CsWire.Op.LIST && !req.pluginId.startsWith(ID_PREFIX))) return refuse(reply, payload, CsWire.Err.BAD_REQUEST, "request")
-            val ctx = CallContext(req.callId, req.pluginId)
+            val ctx = CallContext(req.callId, req.pluginId, CallContext.deadlineFromNow(req.deadlineMs))
             synchronized(jobs) {
                 if (jobs.containsKey(req.callId)) return refuse(reply, payload, CsWire.Err.BAD_REQUEST, "duplicate callId")
                 // ATOMIC: the body always starts, so a cancel that races the launch still ends in one `done`.
@@ -64,6 +64,7 @@ class BridgeService : Service() {
                     // Our deadline is a timer that cancels OUR job, so a plugin's own withTimeout or stray
                     // CancellationException can never be mistaken for it (or for a cancel from Kino).
                     val self = coroutineContext.job
+                    ctx.job = self // the HTTP shim stops waiting on Kino once this job ends
                     val fired = AtomicBoolean(false)
                     val timer = scope.launch { delay(req.deadlineMs); fired.set(true); self.cancel() }
                     val answer = try {
