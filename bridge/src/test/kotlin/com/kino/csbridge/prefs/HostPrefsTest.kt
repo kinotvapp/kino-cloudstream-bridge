@@ -74,8 +74,9 @@ class HostPrefsTest {
     private var host: IHost? = kino
     private val latches = CopyOnWriteArrayList<CountDownLatch>()
 
-    private fun store(timeoutMs: Long = 2_000, maxDirty: Int = HostStore.MAX_DIRTY) =
-        HostStore({ installed }, { host }, readTimeoutMs = timeoutMs, writeTimeoutMs = timeoutMs, maxDirty = maxDirty, log = { logs += it })
+    private fun store(timeoutMs: Long = 2_000, maxDirty: Int = HostStore.MAX_DIRTY, stallMs: Long = HostStore.STALL_MS) =
+        HostStore({ installed }, { host }, readTimeoutMs = timeoutMs, writeTimeoutMs = timeoutMs, maxDirty = maxDirty,
+            stallMs = stallMs, log = { logs += it })
 
     private fun latch() = CountDownLatch(1).also { latches += it }
 
@@ -329,20 +330,56 @@ class HostPrefsTest {
         assertEquals(listOf("set", "set", "set"), kino.opNames())
     }
 
-    @Test fun `past the dirty-key cap, a new key waits for room up to its deadline, then is dropped`() {
+    @Test fun `past the dirty-key cap, apply drops a new key at once and commit waits for room up to its deadline`() {
         kino.block = latch()
         val s = store(timeoutMs = 200, maxDirty = 2)
         val p = HostPrefs(s)
         asPlugin(A) {
             p.edit().putString("a", "1").putString("b", "2").apply()
             p.edit().putString("a", "1b").apply() // an already-dirty key always fits
-            val t0 = System.nanoTime()
+            var t0 = System.nanoTime()
             p.edit().putString("c", "3").apply()
+            assertTrue((System.nanoTime() - t0) / 1_000_000 < 100)
+            assertEquals(1, logs.count { it.contains("too many pending writes") })
+            t0 = System.nanoTime()
+            assertFalse(p.edit().putString("d", "4").commit())
             val ms = (System.nanoTime() - t0) / 1_000_000
             assertTrue("took $ms ms", ms in 150..1_500)
             assertNull(p.getString("c", null)) // never pending: the read goes to (hung) Kino and times out
         }
-        assertTrue(logs.any { it.contains("too many pending writes") })
+        assertEquals(2, logs.count { it.contains("too many pending writes") })
+    }
+
+    @Test fun `a commit with a clear and no live call is bounded by one deadline`() {
+        installed = listOf(A)
+        kino.block = latch()
+        val p = HostPrefs(store(timeoutMs = 300))
+        val t0 = System.nanoTime()
+        assertFalse(p.edit().clear().putString("a", "1").commit())
+        val ms = (System.nanoTime() - t0) / 1_000_000
+        assertTrue("took $ms ms", ms in 250..550)
+    }
+
+    @Test fun `repeated applies of one key on a hung Kino never grow its waiters`() {
+        kino.block = latch()
+        val s = store(timeoutMs = 100)
+        val p = HostPrefs(s)
+        asPlugin(A) {
+            repeat(1_000) { p.edit().putInt("n", it).apply() }
+            assertEquals(999, p.getInt("n", -1))
+        }
+        assertEquals(0, s.waiterCount())
+    }
+
+    @Test fun `a write stuck in Kino is logged as a stall once, with the plugin id only`() {
+        kino.block = latch()
+        val p = HostPrefs(store(stallMs = 100))
+        asPlugin(A) { p.edit().putString("secret-key", "secret-value").apply() }
+        Thread.sleep(600)
+        val stalls = logs.filter { it.contains("storage writer stalled") }
+        assertEquals(1, stalls.size)
+        assertTrue(stalls.single().contains(A))
+        assertFalse(stalls.single().contains("secret"))
     }
 
     @Test fun `a read that blocks on Kino returns the default at its deadline and is logged`() {

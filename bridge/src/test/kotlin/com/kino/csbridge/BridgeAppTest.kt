@@ -104,7 +104,7 @@ class BridgeAppTest {
             app.getSharedPreferences("settings", Context.MODE_PRIVATE).edit().putBoolean("x", true).commit()
         }
         val stored = kino.stores[PLUGIN]!!
-        assertEquals(setOf("settings/k", "\u0000default\u0000k", "\u0000default\u0000n", "\u0000settings\u0000x"), stored.keys)
+        assertEquals(setOf("settings/k", "\u0000/default\u0000k", "\u0000/default\u0000n", "\u0000settings\u0000x"), stored.keys)
         asPlugin {
             // DataStore's folder listing never sees a named key, even one whose name looks like the folder.
             assertEquals(listOf("settings/k"), CloudStreamApp.getKeys("settings"))
@@ -114,7 +114,7 @@ class BridgeAppTest {
             // Clearing rebuild_preference keeps every named key.
             app.getSharedPrefs().edit().clear().commit()
         }
-        assertEquals(setOf("\u0000default\u0000k", "\u0000default\u0000n", "\u0000settings\u0000x"), stored.keys)
+        assertEquals(setOf("\u0000/default\u0000k", "\u0000/default\u0000n", "\u0000settings\u0000x"), stored.keys)
         assertSame(app.getSharedPreferences(PREFERENCES_NAME, 0), app.getSharedPreferences(PREFERENCES_NAME, 0))
     }
 

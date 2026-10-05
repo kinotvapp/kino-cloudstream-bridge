@@ -13,7 +13,7 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Never a CloudStreamApp (see [initForBridge]). Owns where CloudStream code keeps state: every SharedPreferences name
  * lives in Kino, in the calling plugin's `kino.storage` ([HostStore], [HostPrefs]). DataStore's `rebuild_preference`
- * keys are stored as they are; the default prefs are the name "default"; any other name is its own namespace. No
+ * keys are stored as they are; the default prefs are the name "/default" (no real name has a "/"); any other name is its own namespace. No
  * preference file is ever written in the bridge's data dir.
  *
  * Only this Context is routed. A ContextImpl reached another way (`baseContext`, `createConfigurationContext`,
@@ -25,7 +25,7 @@ class BridgeApp : Application() {
     internal val prefsStore by lazy { HostStore({ Ops.registry(this).ids() }) }
     private val views = ConcurrentHashMap<String, HostPrefs>()
 
-    /** Null for `rebuild_preference`, "default" for the default prefs, else the name itself. */
+    /** Null for `rebuild_preference`, "/default" for the default prefs, else the name itself. */
     private fun namespaceOf(name: String?): String? = when (name) {
         PREFERENCES_NAME -> null
         "${packageName}_preferences" -> DEFAULT_NAMESPACE
@@ -54,7 +54,8 @@ class BridgeApp : Application() {
     }
 
     private companion object {
-        const val DEFAULT_NAMESPACE = "default"
+        /** Android refuses "/" in a prefs name, so no plugin-chosen name can ever be this one. */
+        const val DEFAULT_NAMESPACE = "/default"
         /** Map key of the rebuild_preference view: a NUL can never be a namespace the views map gets from a name. */
         const val REBUILD_KEY = "\u0000rebuild"
     }

@@ -42,8 +42,10 @@ import java.util.concurrent.atomic.AtomicLong
  * Kino (no stale cache across devices). apply() never waits; commit() waits for its own writes up to one deadline per
  * commit (the smaller of [writeTimeoutMs] and the op's remaining time) and leaves them queued if it passes. A write
  * without an answer (no host, RemoteException) is tried once more, then dropped with the rest of its batch; an answered
- * refusal is final. Past [maxDirty] pending keys, a new key waits for room up to that deadline, then is dropped.
- * clear() needs Kino's key list (one bounded read). Pending writes die with the process, like Android's apply().
+ * refusal is final. Past [maxDirty] pending keys, a new key is dropped at once by apply() and waits for room up to its
+ * deadline in commit(). The one wait apply() can make: clear() needs Kino's key list (one read bounded by the commit
+ * deadline). A Binder write that has not returned after [stallMs] is logged once ("storage writer stalled"), with the
+ * plugin id only. Pending writes die with the process, like Android's apply().
  *
  * **Reads** go to Kino every time unless a write is pending, each on a bounded executor and waited on at most its
  * deadline; a read without an answer is the default. Logs carry the op, the plugin id and an error code only: never a
@@ -55,6 +57,7 @@ class HostStore(
     private val readTimeoutMs: Long = READ_TIMEOUT_MS,
     private val writeTimeoutMs: Long = WRITE_TIMEOUT_MS,
     private val maxDirty: Int = MAX_DIRTY,
+    private val stallMs: Long = STALL_MS,
     private val log: (String) -> Unit = ::defaultLog,
     private val readExecutor: ExecutorService = sharedReadExecutor,
 ) {
@@ -70,7 +73,14 @@ class HostStore(
     private val room = Object()
     private val memory = ConcurrentHashMap<String, String>()
     private val warned: MutableSet<String> = ConcurrentHashMap.newKeySet()
-    private val writer by lazy { Thread(::drain, "bridge-storage-writer").apply { isDaemon = true; start() } }
+    private val writer by lazy {
+        Thread(::watch, "bridge-storage-watchdog").apply { isDaemon = true; start() }
+        Thread(::drain, "bridge-storage-writer").apply { isDaemon = true; start() }
+    }
+
+    /** The write in flight: when it started (nanoTime, 0 = none) and for which plugin. */
+    @Volatile private var sendingSince = 0L
+    @Volatile private var sendingPlugin = ""
 
     /** The plugin whose Kino storage serves this call, or null for this process's memory. */
     private fun owner(): String? {
@@ -141,15 +151,17 @@ class HostStore(
             return true
         }
         var ok = true
+        // One deadline for the whole commit, the clear's key read included.
+        val budgetMs = minOf(writeTimeoutMs, CallContext.current()?.remainingMs() ?: Long.MAX_VALUE)
+        val deadline = System.nanoTime() + budgetMs * 1_000_000
         val batch = LinkedHashMap<String, String?>()
         if (wipe) {
-            val existing = kinoKeys(id, readTimeoutMs, mine)
+            val left = ((deadline - System.nanoTime()) / 1_000_000).coerceAtLeast(0)
+            val existing = kinoKeys(id, left, mine)
             if (existing == null) { ok = false; log("storage clear dropped: no key list (plugin=$id)") }
             else existing.forEach { batch[it] = null }
         }
         batch.putAll(changes)
-        val budgetMs = minOf(writeTimeoutMs, CallContext.current()?.remainingMs() ?: Long.MAX_VALUE)
-        val deadline = System.nanoTime() + budgetMs * 1_000_000
         val b = Batch()
         val futures = ArrayList<CompletableFuture<Boolean>>()
         for ((key, value) in batch) {
@@ -157,13 +169,18 @@ class HostStore(
                 log("storage set dropped: ${CsWire.Err.TOO_LARGE} (plugin=$id)"); ok = false; continue
             }
             val slot = Slot(id, key)
-            if (!overlay.containsKey(slot) && !awaitRoom(deadline)) {
+            // apply() never waits for room; commit() waits up to its deadline.
+            if (!overlay.containsKey(slot) && !(if (wait) awaitRoom(deadline) else overlay.size < maxDirty)) {
                 log("storage set dropped: too many pending writes (plugin=$id)"); ok = false; continue
             }
-            val f = CompletableFuture<Boolean>()
-            overlay.compute(slot) { _, old -> Pending(value, seq.incrementAndGet(), b, old?.waiters.orEmpty() + f) }
+            // Only commit() waits on a future: repeated applies of one key never grow its waiters.
+            val f = if (wait) CompletableFuture<Boolean>() else null
+            overlay.compute(slot) { _, old ->
+                val carried = old?.waiters.orEmpty()
+                Pending(value, seq.incrementAndGet(), b, if (f == null) carried else carried + f)
+            }
             if (queued.add(slot)) queue.put(slot)
-            futures += f
+            f?.let(futures::add)
         }
         writer.isAlive // started on first use
         if (!wait) return ok
@@ -188,21 +205,34 @@ class HostStore(
 
     private fun drain() {
         while (true) {
-            val slot = try { queue.take() } catch (_: InterruptedException) { return }
-            try {
-                queued.remove(slot)
-                val p = overlay[slot] ?: continue
-                val acked = if (p.batch.failed) {
+            val slot = try { queue.take() } catch (_: InterruptedException) { continue } // the writer never stops
+            queued.remove(slot)
+            val p = overlay[slot] ?: continue
+            val acked = try {
+                if (p.batch.failed) {
                     if (p.batch.dropLogged.compareAndSet(false, true)) {
                         log("storage batch: later writes dropped after an unanswered one (plugin=${slot.pluginId})")
                     }
                     false
                 } else send(slot, p)
-                overlay.remove(slot, p)
-                p.waiters.forEach { it.complete(acked) }
-                synchronized(room) { room.notifyAll() }
             } catch (_: Throwable) {
-                // The writer never dies; the slot is sent again only if written again.
+                false // the writer never dies; this write is dropped like an unanswered one
+            }
+            runCatching { overlay.remove(slot, p) }
+            p.waiters.forEach { runCatching { it.complete(acked) } }
+            synchronized(room) { room.notifyAll() }
+        }
+    }
+
+    /** Logs once per stalled write; the plugin id only. */
+    private fun watch() {
+        var logged = 0L
+        while (true) {
+            try { Thread.sleep((stallMs / 4).coerceIn(10, 1_000)) } catch (_: InterruptedException) { continue }
+            val since = sendingSince
+            if (since != 0L && since != logged && System.nanoTime() - since > stallMs * 1_000_000) {
+                logged = since
+                log("storage writer stalled > ${stallMs / 1_000} s (plugin=$sendingPlugin)")
             }
         }
     }
@@ -213,7 +243,11 @@ class HostStore(
         val body = op(name, slot.pluginId).put("key", slot.key).apply { p.value?.let { put("value", it) } }.toString()
         repeat(2) {
             val h = host()
-            val answer = if (h == null) null else try { h.storage(body) } catch (_: Exception) { null }
+            val answer = if (h == null) null else try {
+                sendingPlugin = slot.pluginId
+                sendingSince = System.nanoTime().coerceAtLeast(1)
+                h.storage(body)
+            } catch (_: Exception) { null } finally { sendingSince = 0L }
             if (answer != null) {
                 val err = CsWire.errorOf(answer) ?: return true
                 log("storage $name refused: ${err.first} (plugin=${slot.pluginId})")
@@ -224,6 +258,9 @@ class HostStore(
         p.batch.failed = true
         return false
     }
+
+    /** Tests only: commit() futures held by pending writes. */
+    internal fun waiterCount(): Int = overlay.values.sumOf { it.waiters.size }
 
     /** Tests only: true once every pending write was acknowledged or dropped. */
     internal fun awaitIdle(timeoutMs: Long): Boolean {
@@ -269,6 +306,8 @@ class HostStore(
         const val WRITE_TIMEOUT_MS = 2_000L
         /** Pending (unacknowledged) keys across all plugins before a new key has to wait for room. */
         const val MAX_DIRTY = 512
+        /** A Binder write in flight longer than this is logged once. */
+        const val STALL_MS = 10_000L
         /** Kino's `kino.storage` holds 256 KB per plugin; a bigger entry could only be refused (and may not fit a Binder parcel). */
         const val MAX_ENTRY_CHARS = 256 * 1024
         private const val ID_PREFIX = "cloudstream-"
