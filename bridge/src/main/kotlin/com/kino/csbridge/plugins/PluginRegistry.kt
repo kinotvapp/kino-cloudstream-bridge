@@ -1,0 +1,346 @@
+package com.kino.csbridge.plugins
+
+import android.content.Context
+import android.content.res.AssetManager
+import android.content.res.Resources
+import com.kino.csbridge.contract.CsWire
+import com.lagradost.cloudstream3.APIHolder
+import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.actions.VideoClickAction
+import com.lagradost.cloudstream3.actions.VideoClickActionHolder
+import com.lagradost.cloudstream3.plugins.BasePlugin
+import com.lagradost.cloudstream3.plugins.PLUGIN_VERSION_NOT_SET
+import com.lagradost.cloudstream3.plugins.Plugin
+import com.lagradost.cloudstream3.plugins.PluginManager
+import com.lagradost.cloudstream3.utils.AtomicList
+import com.lagradost.cloudstream3.utils.ExtractorApi
+import com.lagradost.cloudstream3.utils.extractorApis
+import dalvik.system.PathClassLoader
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.io.IOException
+import java.io.InputStream
+import java.lang.reflect.InvocationTargetException
+import java.security.MessageDigest
+import java.util.Collections
+import java.util.IdentityHashMap
+import java.util.concurrent.ConcurrentHashMap
+import java.util.zip.ZipFile
+
+/**
+ * The plugins this bridge holds: `filesDir/plugins/<id>.cs3` plus `index.json` (`[{pluginId, file, sha256, crashed}]`).
+ *
+ * Loading mirrors upstream `PluginManager.loadPlugin` (read-only file, `PathClassLoader`, manifest, plugin class,
+ * `filename`, resources, `load(context)` / `load()`), with three differences: a member-level ABI check
+ * ([SymbolChecker]) runs before any plugin code; the providers, extractors and click actions a plugin registers are
+ * recorded by identity under its Kino id (a snapshot diff around `load()`), so [remove] takes out exactly those and
+ * nothing that merely shares a name; and a crash-loop guard: `loading-<id>` exists only while that plugin's code runs
+ * its loading, so finding one at start-up means it killed the process: the plugin is then `incompatible` until Kino
+ * re-installs it.
+ *
+ * A stored plugin is loaded on first use ([providers]), from inside the op that needs it, so the HTTP its `load()`
+ * makes is part of a call Kino serves. All mutation is serialised on one lock: the snapshot diff needs it.
+ */
+class PluginRegistry(
+    context: Context,
+    private val parentLoader: ClassLoader = PluginRegistry::class.java.classLoader!!,
+    private val loaderFactory: (File, ClassLoader) -> ClassLoader = { f, parent -> PathClassLoader(f.absolutePath, parent) },
+    private val maxBytes: Long = MAX_CS3_BYTES,
+) {
+    class RegistryException(val code: String, message: String) : Exception(message)
+
+    data class InstallResult(val name: String, val version: Int, val providers: List<MainAPI>, val missingSymbols: List<String>)
+
+    private data class Entry(val pluginId: String, val file: String, val sha256: String, val crashed: Boolean = false)
+
+    private class Manifest(val name: String?, val pluginClassName: String, val version: Int, val requiresResources: Boolean)
+
+    /** What one plugin added to CloudStream's global registries; references to its class loader end with this. */
+    private class Loaded(
+        val plugin: BasePlugin, val path: String, val providers: List<MainAPI>,
+        val extractors: List<ExtractorApi>, val actions: List<VideoClickAction>,
+    )
+
+    private val app: Context = context.applicationContext ?: context
+    private val dir = File(app.filesDir, "plugins")
+    private val indexFile = File(dir, "index.json")
+    private val lock = Any()
+    private val index = LinkedHashMap<String, Entry>()
+    private val loaded = ConcurrentHashMap<String, Loaded>()
+    @Volatile private var started = false
+
+    /**
+     * Once per process (the first `hello`, or whatever op comes first): reads the index, turns every crash marker into
+     * a persisted `crashed` flag, and drops entries whose file is gone or no longer hashes to its sha256, plus stray
+     * temporary and orphan files. No plugin code runs here.
+     */
+    fun ensureLoaded() {
+        if (started) return
+        synchronized(lock) {
+            if (started) return
+            dir.mkdirs()
+            index.clear()
+            readIndex().forEach { index[it.pluginId] = it }
+            for (f in dir.listFiles().orEmpty()) {
+                when {
+                    f.name.startsWith(MARKER) -> {
+                        val id = f.name.removePrefix(MARKER)
+                        index[id]?.let { index[id] = it.copy(crashed = true) }
+                        f.delete()
+                    }
+                    f.name.startsWith(TMP) -> f.delete()
+                }
+            }
+            for (e in index.values.toList()) {
+                val f = File(dir, e.file)
+                if (!f.isFile || sha256Of(f) != e.sha256) { index.remove(e.pluginId); deleteFile(f) }
+            }
+            val keep = index.values.map { it.file }.toSet() + indexFile.name
+            dir.listFiles().orEmpty().filter { it.isFile && it.name !in keep }.forEach { deleteFile(it) }
+            writeIndex()
+            started = true
+        }
+    }
+
+    /** Ids stored, in install order. */
+    fun ids(): List<String> { ensureLoaded(); return synchronized(lock) { index.keys.toList() } }
+
+    /** Every stored plugin with the sha256 of its file, crashed ones included (Kino must not re-send them in a loop). */
+    fun stored(): List<CsWire.HelloPlugin> {
+        ensureLoaded()
+        return synchronized(lock) { index.values.map { CsWire.HelloPlugin(it.pluginId, it.sha256) } }
+    }
+
+    /**
+     * Verifies, ABI-checks, stores and loads one `.cs3`. A plugin with missing symbols is answered with them and is not
+     * stored (a previously installed version stays). Plugin throwables propagate after cleanup, so the caller maps them
+     * (`incompatible` for linkage errors, `plugin_error` otherwise).
+     */
+    fun install(pluginId: String, cs3: InputStream, sha256: String): InstallResult {
+        ensureLoaded()
+        val name = SafeNames.fileName(pluginId) ?: throw RegistryException(CsWire.Err.BAD_REQUEST, "plugin id")
+        if (!SHA256.matches(sha256)) throw RegistryException(CsWire.Err.BAD_REQUEST, "sha256")
+        synchronized(lock) {
+            dir.mkdirs()
+            val tmp = File(dir, "$TMP$name")
+            try {
+                deleteFile(tmp)
+                if (copyHashing(cs3, tmp) != sha256) throw RegistryException(CsWire.Err.BAD_REQUEST, "sha256 mismatch")
+                val manifest = readManifest(tmp)
+                val missing = try { SymbolChecker(parentLoader).missing(tmp) } catch (e: IllegalArgumentException) {
+                    throw RegistryException(CsWire.Err.BAD_REQUEST, "not a .cs3")
+                }
+                val displayName = manifest.name ?: pluginId
+                if (missing.isNotEmpty()) return InstallResult(displayName, manifest.version, emptyList(), missing)
+
+                removeLocked(pluginId)
+                val target = File(dir, name)
+                if (!tmp.renameTo(target)) throw IOException("rename failed")
+                // Android 14 refuses to load a writable dex file.
+                if (!target.setReadOnly()) { deleteFile(target); throw IOException("setReadOnly failed") }
+                // Indexed before load(): if load() kills the process, the marker then names a known entry.
+                index[pluginId] = Entry(pluginId, name, sha256)
+                writeIndex()
+                val l = try {
+                    loadLocked(pluginId, target, manifest)
+                } catch (t: Throwable) {
+                    index.remove(pluginId); writeIndex(); deleteFile(target)
+                    throw t
+                }
+                return InstallResult(displayName, manifest.version, l.providers, emptyList())
+            } finally {
+                deleteFile(tmp)
+            }
+        }
+    }
+
+    /** `beforeUnload()`, then exactly this id's registrations out of CloudStream's lists, then the file. Unknown ids: no-op. */
+    fun remove(pluginId: String) {
+        ensureLoaded()
+        synchronized(lock) { removeLocked(pluginId) }
+    }
+
+    /**
+     * The providers [pluginId] registered, loading it first if this process has not yet (inside the caller's op).
+     * @throws RegistryException `not_installed` when it is not stored, `incompatible` when it crashed the bridge while
+     * loading or no longer links against this bridge.
+     */
+    fun providers(pluginId: String): List<MainAPI> {
+        ensureLoaded()
+        loaded[pluginId]?.let { return it.providers }
+        synchronized(lock) {
+            loaded[pluginId]?.let { return it.providers }
+            val e = index[pluginId] ?: throw RegistryException(CsWire.Err.NOT_INSTALLED, "plugin")
+            if (e.crashed) throw RegistryException(CsWire.Err.INCOMPATIBLE, "crashed the bridge while loading; re-install it")
+            val f = File(dir, e.file)
+            val manifest = try { readManifest(f) } catch (x: RegistryException) { throw RegistryException(CsWire.Err.INCOMPATIBLE, "manifest") }
+            // The bridge may have been updated since the install: check again before running its code.
+            val missing = try { SymbolChecker(parentLoader).missing(f) } catch (x: IllegalArgumentException) { listOf("not a .cs3") }
+            if (missing.isNotEmpty()) throw RegistryException(CsWire.Err.INCOMPATIBLE, "missing ${missing.size}: ${missing.first()}")
+            return loadLocked(pluginId, f, manifest).providers
+        }
+    }
+
+    private fun removeLocked(pluginId: String) {
+        loaded.remove(pluginId)?.let { l ->
+            try { l.plugin.beforeUnload() } catch (_: Throwable) {}
+            unregister(l.plugin, l.path, l.providers, l.extractors, l.actions)
+        }
+        val e = index.remove(pluginId)
+        if (e != null) { deleteFile(File(dir, e.file)); writeIndex() }
+        SafeNames.fileName(pluginId)?.let { deleteFile(File(dir, it)) }
+        File(dir, "$MARKER$pluginId").delete()
+    }
+
+    /** Upstream's load sequence, guarded by the crash marker and bracketed by the registration snapshot. */
+    private fun loadLocked(pluginId: String, file: File, manifest: Manifest): Loaded {
+        val marker = File(dir, "$MARKER$pluginId")
+        marker.writeText("") // before any plugin code: static initialisers run from here on
+        val path = file.absolutePath
+        val beforeProviders = snapshot(APIHolder.allProviders)
+        val beforeExtractors = snapshot(extractorApis)
+        val beforeActions = snapshot(VideoClickActionHolder.allVideoClickActions)
+        var plugin: BasePlugin? = null
+        var done: Loaded? = null
+        try {
+            val loader = loaderFactory(file, parentLoader)
+            val created: Any = try {
+                loader.loadClass(manifest.pluginClassName).getDeclaredConstructor().newInstance()
+            } catch (e: InvocationTargetException) {
+                throw e.cause ?: e
+            }
+            val instance = created as BasePlugin
+            plugin = instance
+            instance.filename = path
+            if (manifest.requiresResources) {
+                // As upstream (stackoverflow 7483568): a hidden constructor and addAssetPath, both reflective.
+                (instance as? Plugin)?.resources = try {
+                    val assets = AssetManager::class.java.getDeclaredConstructor().newInstance()
+                    AssetManager::class.java.getMethod("addAssetPath", String::class.java).invoke(assets, path)
+                    @Suppress("DEPRECATION")
+                    Resources(assets, app.resources.displayMetrics, app.resources.configuration)
+                } catch (t: Throwable) {
+                    throw RegistryException(CsWire.Err.INCOMPATIBLE, "resources")
+                }
+            }
+            synchronized(PluginManager.plugins) { PluginManager.plugins[path] = instance }
+            synchronized(PluginManager.urlPlugins) { PluginManager.urlPlugins[path] = instance }
+            if (instance is Plugin) instance.load(app) else instance.load()
+            val l = Loaded(instance, path, added(APIHolder.allProviders, beforeProviders), added(extractorApis, beforeExtractors),
+                added(VideoClickActionHolder.allVideoClickActions, beforeActions))
+            loaded[pluginId] = l
+            done = l
+            return l
+        } finally {
+            if (done == null) {
+                unregister(plugin, path, added(APIHolder.allProviders, beforeProviders), added(extractorApis, beforeExtractors),
+                    added(VideoClickActionHolder.allVideoClickActions, beforeActions))
+            }
+            marker.delete()
+        }
+    }
+
+    private fun unregister(plugin: BasePlugin?, path: String, providers: List<MainAPI>, extractors: List<ExtractorApi>, actions: List<VideoClickAction>) {
+        val p = identitySet(providers); val x = identitySet(extractors); val a = identitySet(actions)
+        providers.forEach { APIHolder.removePluginMapping(it) }
+        APIHolder.allProviders.withLock { APIHolder.allProviders.removeAll { it in p } }
+        extractorApis.withLock { extractorApis.removeAll { it in x } }
+        VideoClickActionHolder.allVideoClickActions.withLock { VideoClickActionHolder.allVideoClickActions.removeAll { it in a } }
+        synchronized(PluginManager.plugins) { if (PluginManager.plugins[path] === plugin) PluginManager.plugins.remove(path) }
+        synchronized(PluginManager.urlPlugins) { PluginManager.urlPlugins.values.removeAll { it === plugin } }
+    }
+
+    private fun <T> snapshot(list: AtomicList<T>): Set<T> = identitySet(list.withLock { list.toList() })
+    private fun <T> added(list: AtomicList<T>, before: Set<T>): List<T> = list.withLock { list.filter { it !in before }.toList() }
+    private fun <T> identitySet(items: Collection<T>): MutableSet<T> = Collections.newSetFromMap(IdentityHashMap<T, Boolean>()).apply { addAll(items) }
+
+    private fun copyHashing(input: InputStream, out: File): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        var total = 0L
+        out.outputStream().use { o ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = input.read(buf)
+                if (n < 0) break
+                total += n
+                if (total > maxBytes) throw RegistryException(CsWire.Err.TOO_LARGE, "plugin larger than ${maxBytes shr 20} MB")
+                md.update(buf, 0, n)
+                o.write(buf, 0, n)
+            }
+        }
+        return md.digest().toHex()
+    }
+
+    private fun readManifest(f: File): Manifest = try {
+        ZipFile(f).use { z ->
+            // Read from the zip, not loader.getResourceAsStream: a parent-first loader could answer with another manifest.json.
+            val entry = z.getEntry("manifest.json") ?: throw RegistryException(CsWire.Err.BAD_REQUEST, "no manifest.json")
+            if (entry.size > MAX_MANIFEST_BYTES) throw RegistryException(CsWire.Err.BAD_REQUEST, "manifest.json too large")
+            val text = z.getInputStream(entry).use { it.readNBytesCompat(MAX_MANIFEST_BYTES) }.toString(Charsets.UTF_8)
+            val o = JSONObject(text)
+            val cls = o.optString("pluginClassName").takeIf { it.isNotBlank() && it != "null" }
+                ?: throw RegistryException(CsWire.Err.BAD_REQUEST, "manifest.json without pluginClassName")
+            Manifest(o.optString("name").takeIf { o.has("name") && !o.isNull("name") && it.isNotBlank() }?.take(200), cls,
+                if (o.has("version") && !o.isNull("version")) o.optInt("version", PLUGIN_VERSION_NOT_SET) else PLUGIN_VERSION_NOT_SET,
+                o.optBoolean("requiresResources", false))
+        }
+    } catch (e: RegistryException) {
+        throw e
+    } catch (e: Exception) {
+        throw RegistryException(CsWire.Err.BAD_REQUEST, "not a .cs3")
+    }
+
+    private fun InputStream.readNBytesCompat(cap: Int): ByteArray {
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(8192)
+        while (true) {
+            val n = read(buf)
+            if (n < 0) return out.toByteArray()
+            if (out.size() + n > cap) throw RegistryException(CsWire.Err.BAD_REQUEST, "manifest.json too large")
+            out.write(buf, 0, n)
+        }
+    }
+
+    private fun readIndex(): List<Entry> = try {
+        val a = JSONArray(indexFile.readText())
+        (0 until a.length()).mapNotNull { i ->
+            val o = a.getJSONObject(i)
+            val id = o.getString("pluginId")
+            val file = o.getString("file")
+            val sha = o.getString("sha256")
+            // The file name is never trusted from disk: it must be the one SafeNames derives from the id.
+            if (SafeNames.fileName(id) != file || !SHA256.matches(sha)) null else Entry(id, file, sha, o.optBoolean("crashed", false))
+        }
+    } catch (_: Exception) {
+        emptyList()
+    }
+
+    private fun writeIndex() {
+        val a = JSONArray()
+        index.values.forEach { a.put(JSONObject().put("pluginId", it.pluginId).put("file", it.file).put("sha256", it.sha256).put("crashed", it.crashed)) }
+        val tmp = File(dir, "${TMP}index.json")
+        tmp.writeText(a.toString())
+        if (!tmp.renameTo(indexFile)) { tmp.delete(); throw IOException("index write failed") }
+    }
+
+    private fun sha256Of(f: File): String = f.inputStream().use { input ->
+        val md = MessageDigest.getInstance("SHA-256")
+        val buf = ByteArray(64 * 1024)
+        while (true) { val n = input.read(buf); if (n < 0) break; md.update(buf, 0, n) }
+        md.digest().toHex()
+    }
+
+    /** Stored files are read-only; deleting needs only the directory to be writable, but restore write first for safety. */
+    private fun deleteFile(f: File) { if (f.exists()) { f.setWritable(true); f.delete() } }
+
+    private fun ByteArray.toHex() = joinToString("") { "%02x".format(it) }
+
+    companion object {
+        const val MAX_CS3_BYTES = 20L shl 20
+        private const val MAX_MANIFEST_BYTES = 64 * 1024
+        private const val MARKER = "loading-"
+        private const val TMP = ".tmp-"
+        private val SHA256 = Regex("^[0-9a-f]{64}$")
+    }
+}

@@ -26,6 +26,9 @@ android {
     buildFeatures { aidl = true; buildConfig = true }
     sourceSets["main"].aidl.srcDir("../bridge-contract/aidl")
     sourceSets["main"].kotlin.directories.add(file("../bridge-contract/kotlin").absolutePath)
+    // Test helpers both the JVM tests and the on-device tests compile (dexlib2-written .cs3 fixtures).
+    sourceSets["test"].kotlin.directories.add(file("src/sharedTest/kotlin").absolutePath)
+    sourceSets["androidTest"].kotlin.directories.add(file("src/sharedTest/kotlin").absolutePath)
     compileOptions {
         isCoreLibraryDesugaringEnabled = true
         sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17
@@ -103,6 +106,7 @@ dependencies {
     testImplementation("org.robolectric:robolectric:4.16") // not in upstream's catalog; test only
     androidTestImplementation(libs.ext.junit)
     androidTestImplementation(libs.core)
+    androidTestImplementation("androidx.test:runner:1.7.0") // AndroidJUnitRunner; same AndroidX Test release as ext-junit 1.3.0
 }
 
 // ---- Symbol-coverage oracle (scripts/symbol-coverage.py) -------------------------------------------------
