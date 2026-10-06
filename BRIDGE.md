@@ -82,8 +82,8 @@ installs it from the `:plugins` process (androidx.startup's installer runs in a 
 
 ## CI
 
-`.github/workflows/kino-ci.yml` (pushes to `kino-bridge`, pull requests, by hand): script tests, `:bridge:testDebugUnitTest`,
-`:bridge:symbolCoverage`, `:bridge:assembleDebug`, and an **unsigned** `:bridge:assembleRelease` with
+`.github/workflows/kino-ci.yml` (pushes to `kino-bridge`, pull requests, by hand): script tests, `:bridge:check` (unit tests,
+`symbolCoverage`, `lintDebug`), `:bridge:assembleDebug`, and an **unsigned** `:bridge:assembleRelease` with
 `verifyPluginAbiRelease`. It reads no secret and uploads no APK (test reports only, on failure). Releases are signed and
 published by a person on the Mac with `:bridge:assembleRelease`, which runs `verifyPluginAbiRelease` first; take the APK
 only from a successful `assembleRelease` run, never from a bare `packageRelease` (it writes the APK before the check
@@ -159,7 +159,8 @@ merge it in, because that would double the history and the next bump would count
 
 1. Review the branch and fix what the report asks, as new commits on it.
 2. Make sure the current release is tagged (`bridge-v<versionName>`, see "Releasing") so its sources stay reachable.
-3. `git branch -f kino-bridge upstream-bump/<sha>`.
+3. Remove the bump worktree (`git worktree remove <path>`), then, in the worktree that has `kino-bridge` checked out,
+   `git reset --hard upstream-bump/<sha>` (`git branch -f` refuses a checked-out branch).
 4. `git push --force-with-lease origin kino-bridge`.
 5. Bump `bridgeVersionCode`, then release as above.
 
