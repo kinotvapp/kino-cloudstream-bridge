@@ -204,10 +204,10 @@ class PluginRegistry(
      * `beforeUnload()` (unless [beforeUnload] is false: the caller knows the plugin is stuck), then exactly this id's
      * registrations out of CloudStream's lists, then the file. Unknown ids: no-op.
      */
-    fun remove(pluginId: String, beforeUnload: Boolean = true) {
+    fun remove(pluginId: String, beforeUnload: Boolean = true, maxWaitMs: Long = Long.MAX_VALUE) {
         val name = SafeNames.fileName(pluginId) ?: throw RegistryException(CsWire.Err.BAD_REQUEST, "plugin id")
         ensureLoaded()
-        withPluginLock(pluginId) {
+        withPluginLock(pluginId, maxWaitMs) {
             unloadLocked(pluginId, beforeUnload)
             synchronized(indexLock) {
                 val e = index.remove(pluginId)
@@ -223,14 +223,18 @@ class PluginRegistry(
 
     /**
      * Runs [block] holding [pluginId]'s lock. The wait is in short slices and ends with `timeout` once the op this thread
-     * serves is over (deadline, cancel): a waiter behind a hung load never outlives its op. Without an op (start-up,
-     * rollback, tests) it waits.
+     * serves is over (deadline, cancel), or after [maxWaitMs]: a waiter behind a hung load never outlives its op, and
+     * one without an op (a late rollback) gives up after its own bound. Start-up and tests pass no bound.
      */
-    private fun <T> withPluginLock(pluginId: String, block: () -> T): T {
+    private fun <T> withPluginLock(pluginId: String, maxWaitMs: Long = Long.MAX_VALUE, block: () -> T): T {
         val l = pluginLocks.computeIfAbsent(pluginId) { ReentrantLock() }
         val ctx = CallContext.current()
+        val start = System.nanoTime()
         while (!l.tryLock(LOCK_SLICE_MS, TimeUnit.MILLISECONDS)) {
             if (ctx?.isOver() == true) throw RegistryException(CsWire.Err.TIMEOUT, "plugin busy")
+            if (maxWaitMs != Long.MAX_VALUE && (System.nanoTime() - start) / 1_000_000 >= maxWaitMs) {
+                throw RegistryException(CsWire.Err.TIMEOUT, "plugin busy")
+            }
         }
         try {
             return block()
@@ -318,6 +322,7 @@ class PluginRegistry(
                 mine(VideoClickActionHolder.allVideoClickActions, beforeActions, own, pluginId) { it.actions }, own)
             loaded[pluginId] = l
             done = l
+            syncApis()
             // Consecutive deaths only: a load that completed resets the count (best effort; the load itself succeeded).
             synchronized(indexLock) {
                 index[pluginId]?.takeIf { it.crashes != 0 }?.let { index[pluginId] = it.copy(crashes = 0); runCatching { writeIndex() } }
@@ -353,19 +358,31 @@ class PluginRegistry(
     /** By identity against what this plugin registered: upstream's removePluginMapping compares with equals(). */
     private fun unregister(plugin: BasePlugin?, path: String, providers: List<MainAPI>, extractors: List<ExtractorApi>, actions: List<VideoClickAction>) {
         val p = identitySet(providers); val x = identitySet(extractors); val a = identitySet(actions)
-        // One allProviders critical section, the lock getApiFromNameNull holds while it pairs apiMap with apis: a
-        // concurrent name lookup sees either the old list and map or the new list with no map, never a mix.
         APIHolder.allProviders.withLock {
-            if (p.isNotEmpty()) {
-                APIHolder.apis.withLock { APIHolder.apis = APIHolder.apis.filter { it !in p } }
-                APIHolder.apiMap = null // rebuilt from `apis` on the next name lookup
-            }
             APIHolder.allProviders.removeAll { it in p }
+            syncApisLocked()
         }
         extractorApis.withLock { extractorApis.removeAll { it in x } }
         VideoClickActionHolder.allVideoClickActions.withLock { VideoClickActionHolder.allVideoClickActions.removeAll { it in a } }
         synchronized(PluginManager.plugins) { if (PluginManager.plugins[path] === plugin) PluginManager.plugins.remove(path) }
         synchronized(PluginManager.urlPlugins) { PluginManager.urlPlugins.values.removeAll { it === plugin } }
+    }
+
+    /**
+     * Rebuilds CloudStream's name index (`APIHolder.apis`, `apiMap`) from `allProviders`, under `allProviders`' lock
+     * (the one getApiFromNameNull holds while it pairs apiMap with apis, so a lookup never sees a mix).
+     *
+     * Why: `apis` is a var whose lock is the list object its own critical section replaces (upstream
+     * addPluginMapping / removePluginMapping), so two concurrent updates can read the same base and one is lost. Loads
+     * and removes of different plugins now overlap, and a lost remove would keep a removed plugin's provider (and its
+     * class loader) in `apis`. Every load and unregister ends with this rebuild, so a lost update never outlives the
+     * last op that overlapped it. The bridge registers no provider of its own outside `allProviders`.
+     */
+    private fun syncApis() = APIHolder.allProviders.withLock { syncApisLocked() }
+
+    private fun syncApisLocked() {
+        APIHolder.apis = AtomicList(APIHolder.allProviders.toList())
+        APIHolder.apiMap = null // rebuilt from `apis` on the next name lookup
     }
 
     private fun <T> snapshot(list: AtomicList<T>): Set<T> = identitySet(list.withLock { list.toList() })

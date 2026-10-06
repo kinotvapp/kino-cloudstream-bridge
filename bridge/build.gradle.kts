@@ -31,6 +31,8 @@ android {
         versionName = (project.findProperty("bridgeVersionName") as String?) ?: "0.1.0"
         buildConfigField("String", "UPSTREAM_COMMIT", "\"$upstreamCommit\"")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        // Every target device (and Kino's audience) is ARM; x86 is emulator-only.
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
     testOptions { unitTests.isIncludeAndroidResources = true }
     buildFeatures { aidl = true; buildConfig = true }
@@ -208,10 +210,14 @@ dependencies {
     implementation(libs.rhino)
     implementation(libs.bundles.cryptography)
     implementation(libs.bundles.coil)
-    implementation(libs.conscrypt.android)
+    // No Conscrypt (upstream :app adds it for TLS on Android 9): this process has no network, every TLS session is Kino's,
+    // and no measured plugin links against org.conscrypt. verifyPluginAbi<Variant> fails if it comes back.
     implementation(libs.core.ktx)
     implementation(libs.annotation)
     implementation(libs.preference.ktx)
+    // Already in the APK through androidx; declared because BridgeApp installs the baseline profile itself (the
+    // startup initializer runs in a process the bridge never starts). Same version the graph resolves.
+    implementation("androidx.profileinstaller:profileinstaller:1.4.1")
     // Deprecated by upstream but still given to plugins; literal versions exactly as upstream's :app declares them.
     implementation("com.google.code.gson:gson:2.11.0")
     implementation("me.xdrop:fuzzywuzzy:1.4.0")
@@ -340,31 +346,58 @@ abstract class VerifyReplacedClasses : DefaultTask() {
 }
 
 // ---- Guard 3: the plugin ABI in the APK's dex (release: after R8) ------------------------------------------------
-// The symbol oracle (cs3-symbols.tsv minus symbol-allowlist.txt) and release-symbols.tsv (what the bridge itself needs
-// by name: reflection targets, the compat constructors and their $default forms) run against the variant's dex + the
-// boot classpath. A keep-rule gap in proguard-rules.pro then fails the build, not a plugin on a TV. Wired into
-// assemble<Variant> for minified variants (debug has no R8 step; symbolCoverage covers its classpath).
+// Three checks on the variant's dex (scripts/symbol-coverage.py), so a keep-rule gap fails the build, not a plugin on a TV:
+//  1. the symbol oracle (cs3-symbols.tsv minus symbol-allowlist.txt; com.lagradost.* only, as measured) + the boot
+//     classpath;
+//  2. release-symbols.tsv: what the bridge itself needs by name (reflection targets, the compat constructors and their
+//     $default forms, the WebViewResolver_androidKt helpers);
+//  3. parity with the debug APK: every public class, and every public/protected member of it, under the packages
+//     plugins link against ([pluginFacingPrefixes]: the libraries of research §5, androidx, and the desugared JDK j$)
+//     must be in this dex too; compiler/R8 lambda artifacts are ignored. This is what guards the library keep rules.
+// Also: no org.conscrypt class or libconscrypt_jni.so in the APK, and no oracle row naming it (the bridge does no TLS:
+// Kino does; see the dependency block). For minified variants it runs before assemble, bundle and install, and after
+// package (python3 is a build requirement for release). Debug has no R8 step; symbolCoverage covers its classpath.
+val pluginFacingPrefixes = listOf(
+    "com/lagradost/", "kotlin/", "kotlinx/", "okhttp3/", "okio/", "org/jsoup/", "com/fleeksoft/", "com/fasterxml/jackson/",
+    "org/mozilla/", "io/ktor/", "dev/whyoleg/cryptography/", "com/google/gson/", "me/xdrop/", "coil3/", "org/schabi/newpipe/",
+    "androidx/", "j\$/",
+)
+
 abstract class VerifyPluginAbi : DefaultTask() {
     @get:InputFiles @get:PathSensitive(PathSensitivity.NONE) abstract val apkDir: DirectoryProperty
+    /** The debug APK, the reference for the parity check. */
+    @get:InputFiles @get:PathSensitive(PathSensitivity.NONE) abstract val referenceApkDir: DirectoryProperty
     @get:InputFiles @get:PathSensitive(PathSensitivity.NONE) abstract val bootClasspath: ConfigurableFileCollection
     @get:InputFile @get:PathSensitive(PathSensitivity.NONE) abstract val script: RegularFileProperty
     @get:InputFile @get:PathSensitive(PathSensitivity.NONE) abstract val symbols: RegularFileProperty
     @get:InputFile @get:PathSensitive(PathSensitivity.NONE) abstract val allowlist: RegularFileProperty
     @get:InputFile @get:PathSensitive(PathSensitivity.NONE) abstract val reflective: RegularFileProperty
+    @get:Input abstract val parityPrefixes: ListProperty<String>
+    @get:Input abstract val forbiddenPrefixes: ListProperty<String>
     @get:OutputFile abstract val report: RegularFileProperty
     @get:Inject abstract val execOps: ExecOperations
 
+    private fun apkIn(dir: DirectoryProperty): List<File> =
+        dir.get().asFile.walkTopDown().filter { it.isFile && it.name.endsWith(".apk") }.toList()
+
     @TaskAction fun verify() {
-        val apks = apkDir.get().asFile.walkTopDown().filter { it.isFile && it.name.endsWith(".apk") }.toList()
+        val apks = apkIn(apkDir)
         if (apks.isEmpty()) throw GradleException("verifyPluginAbi: no APK in ${apkDir.get().asFile}")
+        val reference = apkIn(referenceApkDir).singleOrNull()
+            ?: throw GradleException("verifyPluginAbi: expected one reference (debug) APK in ${referenceApkDir.get().asFile}")
         val lines = mutableListOf<String>()
         for (apk in apks) {
+            val natives = ZipFile(apk).use { z -> z.entries().asSequence().map { it.name }.filter { it.endsWith("/libconscrypt_jni.so") }.toList() }
+            if (natives.isNotEmpty()) throw GradleException("verifyPluginAbi ${apk.name}: Conscrypt is back in the APK: $natives")
             val out = ByteArrayOutputStream()
             val result = execOps.exec {
                 commandLine(
                     listOf("python3", script.get().asFile.absolutePath, "--symbols", symbols.get().asFile.absolutePath,
                         "--allowlist", allowlist.get().asFile.absolutePath, "--reflective", reflective.get().asFile.absolutePath,
-                        apk.absolutePath) + bootClasspath.files.map { it.absolutePath },
+                        "--parity-reference", reference.absolutePath, "--parity-apk", apk.absolutePath) +
+                        parityPrefixes.get().flatMap { listOf("--parity-prefix", it) } +
+                        forbiddenPrefixes.get().flatMap { listOf("--forbid-prefix", it) } +
+                        apk.absolutePath + bootClasspath.files.map { it.absolutePath },
                 )
                 standardOutput = out; errorOutput = out
                 isIgnoreExitValue = true
@@ -377,9 +410,11 @@ abstract class VerifyPluginAbi : DefaultTask() {
     }
 }
 
+val apkOfVariant = mutableMapOf<String, Provider<Directory>>()
 androidComponents.onVariants { variant ->
     val cap = variant.name.replaceFirstChar { it.uppercase() }
     val apk = variant.artifacts.get(com.android.build.api.artifact.SingleArtifact.APK)
+    apkOfVariant[variant.name] = apk
     val verify = tasks.register<VerifyReplacedClasses>("verifyReplacedClasses$cap") {
         description = "Fails when the $cap APK holds the library's WebViewResolver or calls WebView/CookieManager."
         group = "verification"
@@ -390,13 +425,31 @@ androidComponents.onVariants { variant ->
         description = "Fails when a symbol plugins link against (or the bridge reaches by name) is missing from the $cap dex."
         group = "verification"
         apkDir.set(apk)
+        // Read when the task is configured: every variant is registered by then.
+        referenceApkDir.set(provider { apkOfVariant.getValue("debug") }.flatMap { it })
+        dependsOn("packageDebug")
         bootClasspath.from(oracleBootClasspath)
         script.set(rootProject.file("scripts/symbol-coverage.py"))
         symbols.set(file("src/test/resources/cs3-symbols.tsv"))
         allowlist.set(file("symbol-allowlist.txt"))
         reflective.set(file("release-symbols.tsv"))
+        parityPrefixes.set(pluginFacingPrefixes)
+        forbiddenPrefixes.set(listOf("org/conscrypt/"))
         report.set(layout.buildDirectory.file("verifyPluginAbi/${variant.name}.txt"))
     }
     val minified = (variant as? com.android.build.api.variant.CanMinifyCode)?.isMinifyEnabled == true
-    tasks.matching { it.name == "assemble$cap" }.configureEach { dependsOn(verify); if (minified) dependsOn(abi) }
+    tasks.matching { it.name == "assemble$cap" }.configureEach { dependsOn(verify) }
+    if (minified) {
+        // Every way a release APK leaves the build: assemble, bundle, install; and package runs it right after.
+        tasks.matching { it.name in setOf("assemble$cap", "bundle$cap", "install$cap") }.configureEach { dependsOn(abi) }
+        tasks.matching { it.name == "package$cap" }.configureEach { finalizedBy(abi) }
+    }
+}
+
+// The desugared JDK (j$) ships whole, as upstream ships it (upstream does not minify): L8 otherwise keeps only what the
+// bridge itself uses, and a plugin linking a j$ class would work on debug and fail on release. AGP 9.1.1 has no public
+// setting; L8DexDesugarLibTask's keepRulesConfigurations (internal API) takes extra rule lines. verifyPluginAbiRelease's
+// parity check covers j$/, so an AGP bump that breaks this fails the build.
+tasks.withType<com.android.build.gradle.internal.tasks.L8DexDesugarLibTask>().configureEach {
+    keepRulesConfigurations.add("-keep class j\$.** { *; }")
 }

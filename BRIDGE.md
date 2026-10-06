@@ -59,7 +59,12 @@ Version: `-PbridgeVersionCode=N -PbridgeVersionName=X.Y.Z`.
 
 Release is minified, but plugins link against this APK by name at runtime, so `bridge/proguard-rules.pro` keeps the
 whole plugin-facing API (CloudStream, NiceHttp and the libraries plugins use) unrenamed and unoptimised; R8 only drops
-what nothing can reach. `assembleRelease` runs `verifyPluginAbiRelease`: the symbol oracle plus
-`bridge/release-symbols.tsv` (the bridge's own reflection targets and the compat constructors with their `$default`
-forms) against the release dex, so a keep-rule gap fails the build. `src/main/baseline-prof.txt` is a hand-written
-baseline profile of the cold bind/hello/first-load path.
+what nothing can reach. The desugared JDK (`j$`) ships whole, as upstream ships it. `verifyPluginAbiRelease` runs before
+`assembleRelease`, `bundleRelease` and `installRelease` (and after `packageRelease`) and checks the release dex: the
+symbol oracle (the `com.lagradost.*` symbols measured in real plugins), `bridge/release-symbols.tsv` (the bridge's own
+reflection targets and the compat constructors with their `$default` forms), and parity with the debug APK for every
+public class and public/protected member of the packages plugins link against, `j$` included. It builds the debug APK
+as its reference and needs `python3` on the build machine. The APK carries ARM natives only (`arm64-v8a`,
+`armeabi-v7a`) and no Conscrypt: the bridge has no network, Kino does every TLS session.
+`src/main/baseline-prof.txt` is a hand-written baseline profile of the cold bind/hello/first-load path; `BridgeApp`
+installs it from the `:plugins` process (androidx.startup's installer runs in a process the bridge never starts).

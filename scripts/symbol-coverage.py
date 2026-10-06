@@ -17,6 +17,13 @@ Inputs (any mix, first occurrence of a class wins, like a classpath):
 
 A member that the walk finds first in a class where it is private counts as missing (it would not link).
 
+Parity (release vs debug): --parity-reference REF_APK with --parity-prefix P (repeatable, internal-name prefixes such as
+`kotlin/`): every public class under those prefixes in REF_APK, and every public or protected method and field of it,
+must exist in the checked APK (a member may also resolve through a supertype, on the positional classpath: give the
+checked APK and the boot classpath there too). Compiler and R8 lambda artifacts are ignored (`$$` synthesized classes such as
+`$$ExternalSyntheticLambda0`, and members named `lambda$...`, `...$lambda$N`, `$r8$lambda$...`): no plugin links
+against those. --forbid-prefix P (repeatable): no class under P may be in the checked APK, and no symbol row may name it.
+
 --reflective FILE (repeatable): symbols the bridge itself reaches by reflection (getDeclaredMethod / getDeclaredField /
 getMethod on the class that declares it), so R8 must keep them: TSV `kind<TAB>symbol<TAB>reason`, same symbol syntax.
 Such a member counts only when the owner class itself declares it, with any access (private is fine: the bridge calls
@@ -36,9 +43,10 @@ ACC_PRIVATE = 0x0002
 # ---------------------------------------------------------------------------------------------- class info
 
 class ClassInfo:
-    __slots__ = ('name', 'super', 'ifaces', 'methods', 'fields')
+    __slots__ = ('name', 'super', 'ifaces', 'methods', 'fields', 'access')
 
-    def __init__(self, name, sup, ifaces, methods, fields):
+    def __init__(self, name, sup, ifaces, methods, fields, access=0x1):
+        self.access = access      # class access flags
         self.name = name          # internal name: com/x/Outer$Inner
         self.super = sup          # internal name or None
         self.ifaces = ifaces      # list of internal names
@@ -78,7 +86,7 @@ def parse_class_file(buf):
     def cname(idx):
         return utf8[classes[idx]] if idx else None
 
-    _acc, this_i, super_i, n_if = struct.unpack_from('>HHHH', buf, off)
+    acc, this_i, super_i, n_if = struct.unpack_from('>HHHH', buf, off)
     off += 8
     ifaces = [cname(struct.unpack_from('>H', buf, off + 2 * k)[0]) for k in range(n_if)]
     off += 2 * n_if
@@ -97,7 +105,7 @@ def parse_class_file(buf):
 
     fields, off = members(off)
     methods, off = members(off)
-    return ClassInfo(cname(this_i), cname(super_i), ifaces, methods, fields)
+    return ClassInfo(cname(this_i), cname(super_i), ifaces, methods, fields, acc)
 
 
 def _uleb(buf, off):
@@ -143,7 +151,7 @@ def parse_dex(buf):
 
     out = []
     for i in range(cls_sz):
-        (ci, _acc, sup, ioff, _, _, cdoff, _) = struct.unpack_from('<8I', buf, cls_off + 32 * i)
+        (ci, cacc, sup, ioff, _, _, cdoff, _) = struct.unpack_from('<8I', buf, cls_off + 32 * i)
         ifaces = []
         if ioff:
             n = struct.unpack_from('<I', buf, ioff)[0]
@@ -165,7 +173,7 @@ def parse_dex(buf):
                     idx += d
                     dm[methods[idx]] = acc
         out.append(ClassInfo(internal(types[ci]), internal(types[sup]) if sup != 0xFFFFFFFF else None,
-                             ifaces, dm, df))
+                             ifaces, dm, df, cacc))
     return out
 
 
@@ -308,12 +316,49 @@ def read_reflective(path):
     return rows
 
 
+def _is_lambda_artifact(name):
+    return name.startswith('lambda$') or '$lambda$' in name or name.startswith('$r8$lambda$')
+
+
+def parity_missing(ref, checked, prefixes, resolver=None):
+    """What [ref] (internal name -> ClassInfo) has under [prefixes] that [checked] lacks, as printable rows. A member the
+    checked class no longer declares still counts when [resolver] (a Classpath over the checked dex + the boot
+    classpath) resolves it through a supertype, as the runtime would (R8 drops redundant abstract redeclarations)."""
+    out = []
+    for name in sorted(ref):
+        if not any(name.startswith(p) for p in prefixes) or '$$' in name:
+            continue
+        info = ref[name]
+        if not info.access & 0x1:
+            continue  # package-private: no plugin (another package) can link against it
+        mine = checked.get(name)
+        if mine is None:
+            out.append(f'class {name}')
+            continue
+        for kind, members, have in (('M', info.methods, mine.methods), ('F', info.fields, mine.fields)):
+            for key, acc in members.items():
+                if acc & 0x5 and not _is_lambda_artifact(key[0]) and key not in have and \
+                        (resolver is None or resolver.resolve(name, kind, key) is not None):
+                    out.append(f'{kind} {name}.{key[0]}{key[1] if kind == "M" else ":" + key[1]}')
+    return out
+
+
+def apk_classes(path):
+    cp = Classpath()
+    cp.add(path)
+    return {n: cp.get(n) for n in list(cp._where)}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--symbols', required=True, help='cs3-symbols.tsv')
     ap.add_argument('--allowlist', help='symbol-allowlist.txt')
     ap.add_argument('--classpath-file', action='append', default=[], help='file listing one class dir/jar/dex per line')
     ap.add_argument('--reflective', action='append', default=[], help='symbols reached by reflection (see above)')
+    ap.add_argument('--parity-reference', help='APK whose public API under --parity-prefix the checked APK must hold')
+    ap.add_argument('--parity-apk', help='the checked APK for --parity-reference / --forbid-prefix')
+    ap.add_argument('--parity-prefix', action='append', default=[], help='internal-name prefix for the parity check')
+    ap.add_argument('--forbid-prefix', action='append', default=[], help='internal-name prefix no class may have')
     ap.add_argument('paths', nargs='*', help='class dirs, jars, dex or apk files')
     a = ap.parse_args()
 
@@ -371,10 +416,26 @@ def main():
                 reflective_missing += 1
                 print(f'MISSING\treflective\t{kind}\t{sym}\t{why}\t({reason})')
         print(f'reflective symbols checked: {path}')
+    parity_bad = 0
+    if a.parity_reference or a.forbid_prefix:
+        checked = apk_classes(a.parity_apk)
+        if a.parity_reference:
+            gaps = parity_missing(apk_classes(a.parity_reference), checked, a.parity_prefix, resolver=cp)
+            for g in gaps:
+                print(f'MISSING\tparity\t{g}')
+            parity_bad += len(gaps)
+            print(f'parity with {os.path.basename(a.parity_reference)}: {len(gaps)} missing under {len(a.parity_prefix)} prefixes')
+        for fp in a.forbid_prefix:
+            dotted = fp.replace('/', '.')
+            hits = sorted(n for n in checked if n.startswith(fp)) + [r['symbol'] for r in rows if dotted in r['symbol'] or fp in r['symbol']]
+            for h in hits[:20]:
+                print(f'FORBIDDEN\t{fp}\t{h}')
+            parity_bad += len(hits)
+            print(f'forbidden {fp}: {len(hits)}')
     for p in problems:
         print('ERROR\t' + p)
     print(f'missing (not allowlisted): {len(missing)}' + (f'; reflective missing: {reflective_missing}' if a.reflective else ''))
-    return 1 if missing or problems or reflective_missing else 0
+    return 1 if missing or problems or reflective_missing or parity_bad else 0
 
 
 if __name__ == '__main__':

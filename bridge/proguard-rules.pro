@@ -12,8 +12,10 @@
 #     class hierarchy that plugins extend at runtime (MainAPI, ExtractorApi, Interceptor, Plugin, ...).
 # What is left to R8 is dropping classes nothing can reach: the dex parser and its Guava/protobuf (bridge-internal),
 # unused parts of the bridge itself.
-# verifyPluginAbi<Variant> (bridge/build.gradle.kts) runs the symbol oracle and release-symbols.tsv against the
-# release dex and fails assembleRelease on any gap.
+# verifyPluginAbi<Variant> (bridge/build.gradle.kts) checks the release dex and fails the build on any gap: the symbol
+# oracle (com.lagradost.* as measured), release-symbols.tsv (the bridge's own by-name needs), and parity with the debug
+# APK for every public class and public/protected member under these packages plus the desugared JDK j$ (which L8 keeps
+# whole: see the j$ hook in build.gradle.kts).
 
 -dontobfuscate
 -dontoptimize
@@ -37,7 +39,6 @@
 -keep class com.google.gson.** { *; }
 -keep class me.xdrop.** { *; }
 -keep class coil3.** { *; }
--keep class org.conscrypt.** { *; }
 -keep class org.schabi.newpipe.** { *; }
 # Settings / donation UIs of about a third of all plugins reference these (appcompat, fragment, preference,
 # recyclerview, core, lifecycle, ...). Nothing headless shows them, but the install-time ABI check (SymbolChecker)

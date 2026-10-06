@@ -359,11 +359,9 @@ class HostWebViewResolverTest {
         assertEquals("(?-i)m3u8", HostWebViewResolver.matchPattern(Regex("m3u8")))
         assertEquals("m3u8", HostWebViewResolver.matchPattern(Regex("m3u8", RegexOption.IGNORE_CASE)))
         assertEquals("(?-i)(?:)", HostWebViewResolver.matchPattern(Regex("")))
-        // The plugin's other flags travel inline too, so Kino's Pattern matches what upstream's would.
-        assertEquals("(?ms-i)a.b", HostWebViewResolver.matchPattern(Regex("a.b", setOf(RegexOption.MULTILINE, RegexOption.DOT_MATCHES_ALL))))
-        assertEquals("(?s)a.b", HostWebViewResolver.matchPattern(Regex("a.b", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))))
-        assertEquals("(?x-i)a b", HostWebViewResolver.matchPattern(Regex("a b", RegexOption.COMMENTS)))
-        assertEquals("(?d-i)a", HostWebViewResolver.matchPattern(Regex("a", RegexOption.UNIX_LINES)))
+        // Only case-insensitivity travels: line options mean nothing in a URL, and ICU's inline-flag support is not relied on.
+        assertEquals("(?-i)a.b", HostWebViewResolver.matchPattern(Regex("a.b", setOf(RegexOption.MULTILINE, RegexOption.DOT_MATCHES_ALL, RegexOption.UNIX_LINES))))
+        assertEquals("a.b", HostWebViewResolver.matchPattern(Regex("a.b", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))))
         // A literal pattern is quoted: its metacharacters are plain text, as Pattern.LITERAL makes them.
         val lit = HostWebViewResolver.matchPattern(Regex.fromLiteral("a.b\\E(c"))!!
         assertTrue(Regex(lit.removePrefix("(?-i)")).matches("a.b\\E(c")); assertFalse(Regex(lit.removePrefix("(?-i)")).matches("axb\\E(c"))

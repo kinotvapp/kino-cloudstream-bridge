@@ -89,7 +89,7 @@ class ResultStreamTest {
         p.nio.sink().close() // frees the watchdog's drain
     }
 
-        @Test fun `the stream window is what the op has left, within 5 to 60 s`() {
+    @Test fun `the stream window is what the op has left, within 5 to 60 s`() {
         assertEquals(5_000L, ResultStream.windowMs(0, 5_000, 60_000))
         assertEquals(12_000L, ResultStream.windowMs(12_000, 5_000, 60_000))
         assertEquals(60_000L, ResultStream.windowMs(Long.MAX_VALUE, 5_000, 60_000))

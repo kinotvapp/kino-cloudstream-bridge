@@ -3,11 +3,14 @@ package com.kino.csbridge
 import android.app.Application
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Build
+import androidx.profileinstaller.ProfileInstaller
 import com.kino.csbridge.net.NetworkShim
 import com.kino.csbridge.prefs.HostPrefs
 import com.kino.csbridge.prefs.HostStore
 import com.lagradost.cloudstream3.CloudStreamApp
 import com.lagradost.cloudstream3.utils.PREFERENCES_NAME
+import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -58,7 +61,27 @@ class BridgeApp : Application() {
         CloudStreamApp.initForBridge(this)
         // Before any plugin loads: every request CloudStream code makes goes through Kino's IHost.
         NetworkShim.install()
+        installBaselineProfile()
     }
+
+    /**
+     * androidx.startup's ProfileInstallerInitializer runs in the default process, which never starts here: Kino binds
+     * only BridgeService, in `:plugins`. Without this the baseline profile in the APK is never installed on a sideloaded
+     * device (ART does not read it by itself). ProfileInstaller skips the work when this APK's profile is already
+     * installed. Off the main thread, so the bind does not wait for it.
+     */
+    private fun installBaselineProfile() {
+        if (processName()?.endsWith(":plugins") != true) return
+        Thread({ runCatching { ProfileInstaller.writeProfile(this) } }, "bridge-profile").apply {
+            isDaemon = true
+            priority = Thread.MIN_PRIORITY
+            start()
+        }
+    }
+
+    private fun processName(): String? =
+        if (Build.VERSION.SDK_INT >= 28) getProcessName()
+        else runCatching { File("/proc/self/cmdline").readBytes().takeWhile { it != 0.toByte() }.toByteArray().toString(Charsets.UTF_8) }.getOrNull()
 
     private companion object {
         /** No plugin-chosen name maps here: [namespaceOf] moves every name with a "/" under "/" + escaped name. */

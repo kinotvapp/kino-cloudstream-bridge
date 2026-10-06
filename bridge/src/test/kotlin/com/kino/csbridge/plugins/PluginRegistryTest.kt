@@ -313,6 +313,52 @@ class PluginRegistryTest {
         }
     }
 
+    @Test fun `overlapping loads and removes leave CloudStream's name index equal to allProviders`() {
+        val r = PluginRegistry(context, javaClass.classLoader!!, { _, parent -> OwnFixtureLoader(parent) }).also { created += it }
+        val f = cs3()
+        val pool = Executors.newFixedThreadPool(6)
+        val removedProviders = mutableListOf<Any>()
+        try {
+            repeat(8) { round ->
+                val old = (0 until 3).map { "cloudstream-r$round-$it" }
+                old.forEach { removedProviders += r.installFile(it, f).providers.single() }
+                // New loads (each registers through upstream's addPluginMapping) race the removes of the old ones.
+                val jobs = (0 until 3).map { i -> pool.submit<Any> { r.installFile("cloudstream-n$round-$i", f) } } +
+                    old.map { id -> pool.submit<Any> { r.remove(id) } }
+                jobs.forEach { it.get(10, TimeUnit.SECONDS) }
+            }
+            val apis = APIHolder.apis.withLock { APIHolder.apis.toList() }
+            val all = APIHolder.allProviders.withLock { APIHolder.allProviders.toList() }
+            assertEquals(all.size, apis.size)
+            assertTrue(apis.zip(all).all { (a, b) -> a === b })
+            assertTrue(removedProviders.none { p -> apis.any { it === p } })
+            assertEquals(null, APIHolder.apiMap)
+        } finally {
+            pool.shutdownNow()
+            r.ids().forEach { runCatching { r.remove(it) } }
+        }
+    }
+
+    @Test fun `a remove with a bound gives up behind a hung load instead of waiting for it`() {
+        val r = registry()
+        BlockingPlugin.reset()
+        val pool = Executors.newSingleThreadExecutor()
+        try {
+            val hung = pool.submit<Any> { r.installFile("cloudstream-hung", cs3(BlockingPlugin::class.java.name)) }
+            assertTrue("load() never started", BlockingPlugin.entered.await(5, TimeUnit.SECONDS))
+            val t0 = System.nanoTime()
+            val e = assertThrows(PluginRegistry.RegistryException::class.java) { r.remove("cloudstream-hung", maxWaitMs = 300) }
+            assertEquals(CsWire.Err.TIMEOUT, e.code)
+            assertTrue((System.nanoTime() - t0) / 1_000_000 in 250..2_000)
+            BlockingPlugin.release.countDown()
+            hung.get(5, TimeUnit.SECONDS)
+            assertEquals(listOf("cloudstream-hung"), r.ids()) // nothing was touched
+        } finally {
+            BlockingPlugin.release.countDown()
+            pool.shutdownNow()
+        }
+    }
+
     @Test fun `remove of an id SafeNames refuses is a bad request`() {
         assertEquals(CsWire.Err.BAD_REQUEST, assertThrows(PluginRegistry.RegistryException::class.java) { registry().remove("../index.json") }.code)
         assertEquals(CsWire.Err.BAD_REQUEST, assertThrows(PluginRegistry.RegistryException::class.java) { registry().remove("cloudstream-A") }.code)

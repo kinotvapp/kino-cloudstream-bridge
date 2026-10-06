@@ -90,6 +90,23 @@ class OracleTest(unittest.TestCase):
         finally:
             os.unlink(f.name)
 
+    def test_parity_ignores_private_package_private_and_lambda_artifacts(self):
+        ref = {
+            'k/A': sc.ClassInfo('k/A', None, [], {('f', '()V'): 0x1, ('lambda$f$0', '()V'): 0x1009, ('g$lambda$0', '()V'): 0x9,
+                                                   ('p', '()V'): 0x2, ('q', '()V'): 0x0, ('r', '()V'): 0x4}, {('X', 'I'): 0x1}, 0x1),
+            'k/Hidden': sc.ClassInfo('k/Hidden', None, [], {}, {}, 0x0),
+            'k/A$$ExternalSyntheticLambda0': sc.ClassInfo('k/A$$ExternalSyntheticLambda0', None, [], {}, {}, 0x11),
+            'other/B': sc.ClassInfo('other/B', None, [], {}, {}, 0x1),
+        }
+        full = {'k/A': sc.ClassInfo('k/A', None, [], {('f', '()V'): 0x1, ('r', '()V'): 0x4}, {('X', 'I'): 0x1})}
+        self.assertEqual(sc.parity_missing(ref, full, ['k/']), [])
+        shrunk = {'k/A': sc.ClassInfo('k/A', None, [], {('f', '()V'): 0x1}, {})}
+        self.assertEqual(sc.parity_missing(ref, shrunk, ['k/']), ['M k/A.r()V', 'F k/A.X:I'])
+        self.assertEqual(sc.parity_missing(ref, {}, ['k/']), ['class k/A'])
+        # A member the class dropped but a supertype declares (R8 removes redundant abstract redeclarations) still links.
+        self.assertEqual(sc.parity_missing({'fx/Sub': sc.ClassInfo('fx/Sub', 'fx/Impl', [], {('own', '(Ljava/lang/String;)J'): 0x1}, {}, 0x1)},
+                                           {'fx/Sub': sc.ClassInfo('fx/Sub', 'fx/Impl', [], {}, {})}, ['fx/'], resolver=self.cp), [])
+
     def run_main(self, rows, allow_text, reflective=None):
         with tempfile.TemporaryDirectory() as d:
             tsv, allow = os.path.join(d, 's.tsv'), os.path.join(d, 'a.txt')

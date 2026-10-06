@@ -10,8 +10,10 @@ import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.TvType
 import org.json.JSONArray
 import org.json.JSONObject
+import android.util.Log
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
@@ -113,10 +115,20 @@ object Ops {
         val stuck = PluginWork.busy(id)
         val own = dupPayload(pfd)
         // The generation this install created, or -1 when it stored nothing.
-        val rollback: suspend (Pair<String, Long>) -> Unit = { (_, gen) ->
-            if (gen >= 0) lockOf(id).withLock {
-                if (genOf(id).get() == gen) removeCounted(reg, id, existed = true) { reg.remove(id) }
-            }
+        // A rollback has no op to end its waits: it is bounded by ROLLBACK_WAIT_MS in total (a provider op whose load()
+        // of this plugin hangs would otherwise hold a registry thread and this plugin's Mutex until that load returns).
+        val rollback: suspend (Pair<String, Long>) -> Unit = rollback@{ (_, gen) ->
+            if (gen < 0) return@rollback
+            val until = System.nanoTime() + ROLLBACK_WAIT_MS * 1_000_000
+            val done = try {
+                withTimeoutOrNull(ROLLBACK_WAIT_MS) {
+                    lockOf(id).withLock {
+                        val left = ((until - System.nanoTime()) / 1_000_000).coerceAtLeast(1)
+                        if (genOf(id).get() == gen) removeCounted(reg, id, existed = true) { reg.remove(id, maxWaitMs = left) }
+                    }
+                }
+            } catch (_: PluginRegistry.RegistryException) { null }
+            if (done == null) runCatching { Log.w("KinoBridge", "late install of $id not rolled back: plugin busy for ${ROLLBACK_WAIT_MS / 1_000} s") }
         }
         return PluginWork.run(id, on = PluginWork.registryDispatcher, onLateResult = rollback, onDispose = { runCatching { own.close() } }) {
             lockOf(id).withLock {
@@ -155,4 +167,6 @@ object Ops {
         .put("mainPages", JSONArray().apply { p.mainPage.forEach { put(JSONObject().put("name", it.name).put("data", it.data)) } })
 
     private const val MAX_MISSING = 100
+    /** The longest a late install's rollback waits for the plugin (no op bounds it). */
+    internal const val ROLLBACK_WAIT_MS = 120_000L
 }
