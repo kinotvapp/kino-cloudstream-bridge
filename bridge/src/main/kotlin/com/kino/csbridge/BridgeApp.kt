@@ -57,6 +57,7 @@ class BridgeApp : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        com.kino.csbridge.ops.Json.initIdPrefixes()
         // Before any plugin loads: getKey/setKey and plugins reading CloudStreamApp.context see this app.
         CloudStreamApp.initForBridge(this)
         // Before any plugin loads: every request CloudStream code makes goes through Kino's IHost.

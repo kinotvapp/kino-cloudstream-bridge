@@ -14,6 +14,11 @@ import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.addEpisodes
 import com.lagradost.cloudstream3.mainPageOf
+import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addImdbId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addKitsuId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
+import com.lagradost.cloudstream3.LoadResponse.Companion.addTMDbId
 import com.lagradost.cloudstream3.newAnimeLoadResponse
 import com.lagradost.cloudstream3.newEpisode
 import com.lagradost.cloudstream3.newHomePageResponse
@@ -101,6 +106,43 @@ class OpsJsonTest {
         assertEquals("https://img.example/p.jpg", t.getString("poster")); assertEquals("https://img.example/b.jpg", t.getString("background"))
         assertEquals(2024, t.getInt("year")); assertEquals(20, t.getJSONArray("tags").length())
         assertEquals(7.5, t.getDouble("rating"), 0.001); assertEquals(118, t.getInt("durationMin")); assertEquals("movie", t.getString("kind"))
+    }
+
+    private fun title(build: suspend MainAPI.() -> LoadResponse): JSONObject = Json.title(kotlinx.coroutines.runBlocking { FakeApi().build() })
+
+    @Test fun `title ids carry the imdb and tmdb ids a plugin attached, and nothing else`() {
+        Json.initIdPrefixes()
+        val t = title { newMovieLoadResponse("M", "https://fake.example/m", TvType.Movie, "https://fake.example/p") {
+            addImdbId("tt0133093"); addTMDbId("603")
+        } }
+        assertEquals("""{"imdb":"tt0133093","tmdb":603}""", t.getJSONObject("ids").toString())
+    }
+
+    @Test fun `title ids carry anime mal, anilist and kitsu ids without mixing them`() {
+        Json.initIdPrefixes()
+        val t = title { newAnimeLoadResponse("A", "https://fake.example/a", TvType.Anime) {
+            addMalId(5114); addAniListId(5114 + 1); addKitsuId(77)
+        } }
+        val ids = t.getJSONObject("ids")
+        assertEquals(5114, ids.getInt("mal")); assertEquals(5115, ids.getInt("anilist")); assertEquals(77, ids.getInt("kitsu"))
+        assertFalse(ids.has("imdb")); assertFalse(ids.has("tmdb"))
+    }
+
+    @Test fun `title ids drop invalid values and the whole key when none is valid`() {
+        Json.initIdPrefixes()
+        val t = title { newMovieLoadResponse("M", "https://fake.example/m", TvType.Movie, "https://fake.example/p") {
+            addImdbId("nm0000206"); addTMDbId("99999999999")
+        } }
+        assertFalse(t.has("ids"))
+        val u = title { newMovieLoadResponse("M", "https://fake.example/m", TvType.Movie, "https://fake.example/p") {
+            addImdbId("tt12345678901"); addTMDbId("-5"); addMalId(0); addAniListId(-3); addKitsuId(Int.MAX_VALUE)
+        } }
+        assertEquals("""{"kitsu":2147483647}""", u.getJSONObject("ids").toString())
+    }
+
+    @Test fun `title has no ids key when the plugin attached none`() {
+        Json.initIdPrefixes()
+        assertFalse(title { newMovieLoadResponse("M", "https://fake.example/m", TvType.Movie, "https://fake.example/p") }.has("ids"))
     }
 
     @Test fun `a LiveStreamLoadResponse is a one-episode list too`() {

@@ -145,6 +145,38 @@ object Json {
         .put("rating", res.score?.toDouble(10))
         .put("durationMin", res.duration)
         .put("kind", kindOf(res))
+        .put("ids", ids(res))
+
+    private val IMDB = Regex("^tt\\d{1,10}$")
+
+    /**
+     * CloudStream's id prefixes are empty until the app sets them (upstream's AccountManager.initMainAPI), and then
+     * `addMalId`, `addAniListId` and `addKitsuId` would all write the one key. Called before any plugin loads.
+     */
+    fun initIdPrefixes() {
+        LoadResponse.malIdPrefix = "mal"
+        LoadResponse.kitsuIdPrefix = "kitsu"
+        LoadResponse.aniListIdPrefix = "anilist"
+        LoadResponse.simklIdPrefix = "simkl"
+    }
+
+    /**
+     * `{imdb:"tt…", tmdb, mal, anilist, kitsu}` from what the plugin put in `syncData` (upstream's `addImdbId`,
+     * `addTMDbId`, `addMalId`, `addAniListId`, `addKitsuId`); only valid values, null (so left out) when none is.
+     * Other services are ignored. Ints are positive digits strings clamped away when over Int.MAX_VALUE.
+     */
+    private fun ids(res: LoadResponse): JSONObject? {
+        fun num(v: String?): Int? = v?.trim()?.takeIf { it.length in 1..10 && it.all { c -> c in '0'..'9' } }?.toLongOrNull()
+            ?.takeIf { it in 1..Int.MAX_VALUE }?.toInt()
+        fun <T> guard(f: () -> T?): T? = try { f() } catch (_: Exception) { null }
+        val o = JSONObject()
+        guard { with(LoadResponse) { res.getImdbId() } }?.trim()?.takeIf { IMDB.matches(it) }?.let { o.put("imdb", it) }
+        num(guard { with(LoadResponse) { res.getTMDbId() } })?.let { o.put("tmdb", it) }
+        num(guard { with(LoadResponse) { res.getMalId() } })?.let { o.put("mal", it) }
+        num(guard { with(LoadResponse) { res.getAniListId() } })?.let { o.put("anilist", it) }
+        num(guard { with(LoadResponse) { res.getKitsuId() } })?.let { o.put("kitsu", it) }
+        return o.takeIf { it.length() > 0 }
+    }
 
     /** Which response class it was: "movie", "live", "series" or "anime". */
     private fun kindOf(res: LoadResponse): String = when (res) {

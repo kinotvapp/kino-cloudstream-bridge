@@ -79,6 +79,10 @@ Exactly one of `IReply.done(json)` / `IReply.doneStream(pfd)` ends each call, af
   `rating` a Double 0..10 (`Score.toDouble(10)`); `durationMin` Int minutes; `tags` ≤ 20 strings of ≤ 100 chars;
   `plot` ≤ 2000 chars; `kind` which CloudStream response class it was: `"movie"` (`MovieLoadResponse`), `"live"`
   (`LiveStreamLoadResponse`), `"anime"` (`AnimeLoadResponse`) or `"series"` (any other).
+  `ids` (additive, optional, absent when the plugin gave none; an older Kino ignores it): the external ids the plugin
+  attached to its `LoadResponse`, `{imdb?:"tt1234567",tmdb?:Int,mal?:Int,anilist?:Int,kitsu?:Int}`. Only valid values
+  are sent: `imdb` matches `^tt\d{1,10}$`, the others are positive Ints (≤ 2147483647); other services are ignored.
+  The key is never an empty object. PROTOCOL stays v2.
 - Episode `{data,season,episode,name,poster,description,date,dubStatus}`:
   `date` epoch milliseconds (Long); `dubStatus` a `DubStatus` name for anime; `description` ≤ 2000 chars.
   At most 5000 episodes; `data` ≤ 16 KiB (an episode with longer data is left out, never truncated). A movie or live
