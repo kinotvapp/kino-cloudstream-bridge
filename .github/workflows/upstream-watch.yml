@@ -1,0 +1,135 @@
+# GPL-3.0 (this fork). Watches upstream CloudStream for commits that touch the plugin API (all of :library, extractors
+# included, and the :app files :bridge compiles, bridge/app-sources.txt). When there are new ones, it replays this fork
+# onto them with scripts/upstream-bump.sh in the runner (build and checks, unsigned, nothing pushed) and opens one
+# issue in this repository with the report: oracle symbols lost/gained, compat targets, gates. One rolling issue: a
+# later upstream commit updates the open one instead of opening another.
+# Only the default GITHUB_TOKEN is used (issues: write). It never pushes, tags, signs or publishes; a person decides.
+name: Upstream watch
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Upstream ref to check (branch, tag or full sha)
+        required: false
+        default: master
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_URL: https://github.com/recloudstream/cloudstream.git
+  TITLE_PREFIX: "[upstream-watch]"
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Look for upstream commits touching the plugin API
+        id: check
+        env:
+          REF: ${{ inputs.ref || 'master' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$REF" in *[!A-Za-z0-9._/-]*|"") echo "::error::bad ref"; exit 1 ;; esac
+          git remote add upstream "$UPSTREAM_URL"
+          git fetch -q --no-tags --filter=blob:none upstream "$REF"
+          new="$(git rev-parse FETCH_HEAD)"
+          short="$(git rev-parse --short=9 "$new")"
+          pin="$(python3 scripts/upstream_bump.py pin)"
+          python3 scripts/upstream_bump.py watched-commits --old "$pin" --new "$new" > "$RUNNER_TEMP/commits.txt"
+          count="$(grep -c . "$RUNNER_TEMP/commits.txt" || true)"
+          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$TITLE_PREFIX\" in:title" \
+            --json number,title --jq "map(select(.title | startswith(\"$TITLE_PREFIX\")))[0] // empty | \"\(.number) \(.title)\"")"
+          run=true
+          if [ "$count" = 0 ]; then
+            echo "No upstream commit since ${pin:0:9} touches the plugin API."; run=false
+          elif printf '%s' "$issue" | grep -q "$short"; then
+            echo "Already reported in #${issue%% *}."; run=false
+          fi
+          {
+            echo "new=$new"; echo "short=$short"; echo "count=$count"; echo "run=$run"
+            echo "issue=${issue%% *}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up JDK 17
+        if: steps.check.outputs.run == 'true'
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        if: steps.check.outputs.run == 'true'
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Replay the fork onto upstream and check it
+        id: bump
+        if: steps.check.outputs.run == 'true'
+        env:
+          NEW: ${{ steps.check.outputs.new }}
+        run: |
+          set -uo pipefail
+          # Commits made by the replay stay in this runner; nothing is pushed.
+          git config user.name "upstream-watch"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rc=0
+          scripts/upstream-bump.sh --base "$GITHUB_REF_NAME" --dir "$RUNNER_TEMP/bump" \
+            --report "$RUNNER_TEMP/report.md" "$NEW" 2> "$RUNNER_TEMP/bump.err" || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          tail -n 40 "$RUNNER_TEMP/bump.err"
+
+      - name: Open or update the issue
+        if: steps.check.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEW: ${{ steps.check.outputs.new }}
+          SHORT: ${{ steps.check.outputs.short }}
+          COUNT: ${{ steps.check.outputs.count }}
+          ISSUE: ${{ steps.check.outputs.issue }}
+          RC: ${{ steps.bump.outputs.rc }}
+        run: |
+          set -euo pipefail
+          case "$RC" in
+            0) verdict="replays cleanly, every gate passed" ;;
+            1) verdict="replays, but a gate or check FAILED" ;;
+            3) verdict="does NOT replay: conflict" ;;
+            *) verdict="the bump script stopped (exit $RC)" ;;
+          esac
+          body="$RUNNER_TEMP/body.md"
+          {
+            echo "Upstream \`$NEW\` has $COUNT new commit(s) touching the plugin API: $verdict."
+            echo
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. Nothing was pushed; to bump, run"
+            echo "\`scripts/upstream-bump.sh $NEW\` locally and follow BRIDGE.md \"Keeping up with upstream\"."
+            echo
+            if [ -s "$RUNNER_TEMP/report.md" ]; then
+              head -c 55000 "$RUNNER_TEMP/report.md"
+            else
+              echo '```'; tail -n 40 "$RUNNER_TEMP/bump.err" | head -c 20000; echo '```'
+            fi
+            echo
+            echo "Upstream commits:"
+            sed 's/^/- /' "$RUNNER_TEMP/commits.txt" | head -n 100
+          } > "$body"
+          title="$TITLE_PREFIX upstream $SHORT changes the plugin API ($COUNT commits): $verdict"
+          if [ -n "$ISSUE" ]; then
+            gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --title "$title"
+            gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body-file "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file "$body"
+          fi
