@@ -251,10 +251,10 @@ class PluginRegistry(
      * @throws RegistryException `not_installed` when it is not stored, `incompatible` when it killed the bridge in
      * [CRASHES_TO_DISABLE] consecutive loads or no longer links against this bridge.
      */
-    fun providers(pluginId: String): List<MainAPI> {
+    fun providers(pluginId: String, maxWaitMs: Long = Long.MAX_VALUE): List<MainAPI> {
         ensureLoaded()
         loaded[pluginId]?.let { return it.providers }
-        return withPluginLock(pluginId) {
+        return withPluginLock(pluginId, maxWaitMs) {
             loaded[pluginId]?.let { return@withPluginLock it.providers }
             val e = synchronized(indexLock) { index[pluginId] } ?: throw RegistryException(CsWire.Err.NOT_INSTALLED, "plugin")
             if (e.disabled) throw RegistryException(CsWire.Err.INCOMPATIBLE, "crashed the bridge while loading; re-install it")
@@ -270,9 +270,10 @@ class PluginRegistry(
     /**
      * The loaded plugin instance of [pluginId], loading it first like [providers] (same errors). For the settings screen,
      * which runs outside any op: a `load()` that makes HTTP gets it refused, as for any request outside a Kino call.
+     * With no op to end it, the wait for the plugin's lock gives up (`timeout`) after [maxWaitMs].
      */
-    fun plugin(pluginId: String): BasePlugin {
-        providers(pluginId)
+    fun plugin(pluginId: String, maxWaitMs: Long = Long.MAX_VALUE): BasePlugin {
+        providers(pluginId, maxWaitMs)
         return loaded[pluginId]?.plugin ?: throw RegistryException(CsWire.Err.NOT_INSTALLED, "plugin")
     }
 
@@ -282,6 +283,7 @@ class PluginRegistry(
      */
     private fun unloadLocked(pluginId: String, beforeUnload: Boolean = true) {
         loaded.remove(pluginId)?.let { l ->
+            unloadListeners.forEach { runCatching { it(pluginId) } }
             if (beforeUnload) {
                 val t = Thread({ try { l.plugin.beforeUnload() } catch (_: Throwable) {} }, "beforeUnload")
                 t.isDaemon = true
@@ -290,13 +292,21 @@ class PluginRegistry(
             }
             unregister(l.plugin, l.path, l.providers, l.extractors, l.actions)
             l.loader?.let { pluginLoaders.remove(it) }
+            PluginFrames.unregister(pluginId)
         }
     }
+
+    /** Told the id of every loaded plugin as it is unloaded (update, remove), before its `beforeUnload()`. Any thread. */
+    private val unloadListeners = java.util.concurrent.CopyOnWriteArraySet<(String) -> Unit>()
+    fun addUnloadListener(l: (String) -> Unit) { unloadListeners += l }
+    fun removeUnloadListener(l: (String) -> Unit) { unloadListeners -= l }
 
     /** Upstream's load sequence, guarded by the crash marker and bracketed by the registration snapshot. */
     private fun loadLocked(pluginId: String, file: File, manifest: Manifest): Loaded {
         val marker = File(dir, "$MARKER$pluginId")
         marker.writeText("") // before any plugin code: static initialisers run from here on
+        // Before any plugin code too: threads its load() starts are attributed to it (storage) from their first frame.
+        PluginFrames.register(pluginId, SymbolChecker(parentLoader).definedClasses(file), manifest.pluginClassName)
         val path = file.absolutePath
         val beforeProviders = snapshot(APIHolder.allProviders)
         val beforeExtractors = snapshot(extractorApis)
@@ -346,6 +356,7 @@ class PluginRegistry(
                     mine(extractorApis, beforeExtractors, own, pluginId) { it.extractors },
                     mine(VideoClickActionHolder.allVideoClickActions, beforeActions, own, pluginId) { it.actions })
                 own?.let { pluginLoaders.remove(it) }
+                if (loaded[pluginId] == null) PluginFrames.unregister(pluginId)
             }
             marker.delete()
         }

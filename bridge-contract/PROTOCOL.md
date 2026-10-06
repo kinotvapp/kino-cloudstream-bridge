@@ -178,24 +178,38 @@ a television; the bridge refuses there anyway). Constants: `CsWire.Settings`.
   It has no intent filter.
 - **Permission**: the activity requires `com.arkiv.player.permission.CLOUDSTREAM_BRIDGE` (`CsWire.PERMISSION`, the
   bridge's signature-level permission, the same the service requires). Kino already holds it.
-- **Start it for a result** (`registerForActivityResult(StartActivityForResult)` / `startActivityForResult`). The
-  bridge also checks that the calling package, which Android fills in only for a start for a result, is Kino and is
-  signed with the bridge's certificate; a plain `startActivity` is refused (`refused`).
+- **Start it for a result** (`registerForActivityResult(StartActivityForResult)` / `startActivityForResult`), without
+  `FLAG_ACTIVITY_NEW_TASK`. The bridge also checks that the calling package, which Android fills in only for a start
+  for a result, is Kino and is signed with the bridge's certificate; a plain `startActivity`, or a start for a result
+  with `FLAG_ACTIVITY_NEW_TASK` (Android then delivers no calling package and an immediate cancel), is `refused` or a
+  bare cancel.
 - **Extra** `com.kino.csbridge.extra.PLUGIN_ID` (`CsWire.Settings.EXTRA_PLUGIN_ID`), String, required: the plugin's
   Kino id, the `pluginId` of its ops (`cloudstream-…`).
 - **Before starting it**, Kino has a live binding to the bridge service with a successful `hello` (the screen reads and
   writes the plugin's values through `IHost.storage` of that binding) and keeps the binding until the result arrives.
-- **While it is open**, the plugin's SharedPreferences / DataStore reads and writes made outside any op go to that
-  plugin's storage (`IHost.storage` with its `pluginId`), whatever thread the plugin uses. A live op of another plugin
-  keeps its own attribution. Plugin HTTP made from the screen is outside any op and fails (as for any request outside a
-  call), so a screen that downloads something shows its own error.
+- **One screen at a time.** A start while another settings screen is open answers `busy`. Kino disables the gear (or
+  ignores the tap) from the start until the result arrives.
+- **Do not update or remove that plugin while its screen is open.** Kino holds back an `installPlugin` / `removePlugin`
+  of that plugin (a reconcile after `hello`, an update) until the result arrives. If one runs anyway, the screen closes
+  with `cancelled`, and values the plugin wrote before that stay in its storage (removed with the plugin by Kino's own
+  uninstall).
+- **Storage while it is open**: the plugin's SharedPreferences / DataStore reads and writes go to that plugin's storage
+  (`IHost.storage` with its `pluginId`): those its code makes on any thread, and those the framework makes on the main
+  thread for the screen. Other plugins' work keeps its own attribution (never the open screen's storage).
+- **No network**: plugin HTTP made from the screen is outside any op and is refused (as for any request outside a call),
+  so a screen that downloads something (a login, a remote list, images) shows its own error or nothing.
 - **The screen**: the activity has no window content of its own (transparent, dark theme, no animation); the plugin's
-  dialog shows over Kino. It closes when no plugin dialog or fragment is left on top of it (dismissal, Back), when the
-  person taps outside the dialog, or 1.5 s after `openSettings` returned without showing anything. It waits up to 3 s
-  for the plugin's pending storage writes to reach Kino before finishing.
-- **Result**: `RESULT_OK` when the screen ran and closed; Kino then reloads whatever it shows from the plugin (the
-  plugin's next op sees the new values). `RESULT_CANCELED` with the String extra `com.kino.csbridge.extra.ERROR`
-  (`CsWire.Settings.EXTRA_ERROR`):
+  dialog shows over Kino. It closes when no plugin dialog or fragment is left on top of it and the plugin is not waiting
+  on a storage read (dismissal, Back), when the person taps outside the dialog, or 3 s after `openSettings` returned
+  without showing or reading anything. Once closing it takes no touches, and it waits up to 3 s for the plugin's pending
+  storage writes to reach Kino before finishing.
+- **Plugin failures**: a throwable of the plugin (its `load()`, `openSettings`, a click handler, a dialog shown late, a
+  thread it started) closes the screen with `plugin_error` and leaves the bridge process running. A failure the bridge
+  cannot contain (a VM error such as out of memory, a throw inside the framework's own layout pass) kills the bridge
+  process: see the bare cancel below.
+- **Result**: `RESULT_OK` (no data, no extras) when the screen ran and closed. The plugin may have changed its values:
+  Kino reloads whatever it shows from the plugin (its next op sees the new values). `RESULT_CANCELED` with the String
+  extra `com.kino.csbridge.extra.ERROR` (`CsWire.Settings.EXTRA_ERROR`):
 
   | code | meaning |
   |---|---|
@@ -203,14 +217,21 @@ a television; the bridge refuses there anyway). Constants: `CsWire.Settings`.
   | `bad_request` | extra missing, or not a valid `cloudstream-` id |
   | `unavailable` | no live Kino binding in the bridge (no `hello` yet) |
   | `unsupported_device` | the device is a television (`UI_MODE_TYPE_TELEVISION` or `FEATURE_LEANBACK`) |
+  | `busy` | another plugin settings screen is open |
   | `not_installed` | the bridge holds no such plugin |
   | `incompatible` | the plugin no longer links against this bridge, or crashed it while loading |
   | `no_settings` | the plugin has no settings screen (`openSettings` is null after `load()`) |
-  | `timeout` | the plugin's `load()` (first use in the bridge process) took over 20 s, or its lock was busy |
-  | `plugin_error` | the plugin's `load()` or `openSettings` threw (logged by the bridge as one line, class name only) |
-  | `cancelled` | Android re-created the screen (the bridge process died while it was open); nothing was restored |
+  | `timeout` | the plugin's `load()` (first use in the bridge process), or the wait for it, took over 20 s |
+  | `plugin_error` | the plugin threw (see "Plugin failures"; the bridge logs one line, class name only). It may have saved some values first |
+  | `cancelled` | the plugin was updated or removed while open, or Android re-created the screen; nothing was restored |
 
-  A `RESULT_CANCELED` without the extra (the system's own cancel, a bridge without this activity) means "nothing ran".
+  A **bare** `RESULT_CANCELED` (no extra) means one of two things, and Kino tells them apart by its binding:
+  - Kino's binding to the bridge service died between the start and the result: the bridge process died while the
+    screen was open (a failure it could not contain, or the system killed it). Kino treats it as `plugin_error`: the
+    plugin may have saved some values first. Its in-flight ops already failed with the dead binding. Kino rebinds, runs
+    `hello`, and reloads plugin-derived UI.
+  - The binding stayed alive: nothing ran (the system cancelled the start, or this activity does not exist in that
+    bridge).
   `ActivityNotFoundException` / `SecurityException` on start means the bridge predates this activity: Kino offers the
   bridge update.
 
@@ -219,7 +240,8 @@ a television; the bridge refuses there anyway). Constants: `CsWire.Settings`.
 `{"error":{"code","message"}}` (message ≤ 300 chars, never a URL query), codes in `CsWire.Err`: `protocol`,
 `bad_request`, `not_installed`, `incompatible` (a plugin linked against a symbol the bridge lacks), `timeout`, `cancelled`,
 `plugin_error`, `network`, `refused`, `too_large`, `budget`, `unavailable`, `bridge_stream_broken` (read side of
-`doneStream`), `streams_busy` (both stream slots busy), and, for `IHost.webView` only, `busy` plus the codes listed there.
+`doneStream`), `streams_busy` (both stream slots busy), and, for `IHost.webView` and the plugin settings result only,
+`busy` plus the codes listed there.
 
 ## Distribution (Kino's OTA manifest)
 

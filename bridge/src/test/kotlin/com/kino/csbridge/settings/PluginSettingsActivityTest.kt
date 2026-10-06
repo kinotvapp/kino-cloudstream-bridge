@@ -5,6 +5,8 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.pm.PermissionInfo
+import android.view.MotionEvent
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import com.kino.csbridge.HostLink
@@ -14,7 +16,10 @@ import com.kino.csbridge.plugins.DexFixtures
 import com.kino.csbridge.plugins.PluginRegistry
 import com.kino.csbridge.plugins.fixture.FixtureApi
 import com.kino.csbridge.plugins.fixture.FixtureExtractor
+import com.kino.csbridge.plugins.fixture.BackgroundWriterPlugin
+import com.kino.csbridge.plugins.fixture.BlockingPlugin
 import com.kino.csbridge.plugins.fixture.FixturePlugin
+import com.kino.csbridge.plugins.fixture.SettingsDialogFragment
 import com.kino.csbridge.plugins.fixture.SettingsPlugin
 import com.kino.csbridge.prefs.FakeKinoStorage
 import com.lagradost.cloudstream3.APIHolder
@@ -51,6 +56,7 @@ class PluginSettingsActivityTest {
         Ops.instance = registry
         HostLink.host = kino
         SettingsPlugin.reset()
+        SettingsGuard.loopGuard = false // Robolectric's main looper is this test thread
         PluginSettingsActivity.callerCheck = { true }
         PluginSettingsActivity.loadExecutor = Executor { it.run() }
         PluginSettingsActivity.flushExecutor = Executor { it.run() }
@@ -96,6 +102,11 @@ class PluginSettingsActivityTest {
     @Test fun `installPlugin answers hasSettings true for a plugin that set openSettings, false otherwise`() {
         assertTrue(install("cloudstream-a", SettingsPlugin::class.java).hasSettings)
         assertFalse(install("cloudstream-b", FixturePlugin::class.java).hasSettings)
+        // Missing symbols: nothing loads, so never true (Kino must not offer a gear for a plugin that is not stored).
+        val old = DexFixtures.cs3(File.createTempFile("fxs", ".cs3"), listOf(DexFixtures.refusedSymbolDex()),
+            DexFixtures.manifest("Fx", SettingsPlugin::class.java.name, 1))
+        val refused = old.inputStream().use { registry.install("cloudstream-e", it, DexFixtures.sha256(old)) }
+        assertTrue(refused.missingSymbols.isNotEmpty()); assertFalse(refused.hasSettings)
         fun wire(id: String, cls: Class<*>): JSONObject {
             val f = DexFixtures.cs3(File.createTempFile("fxs", ".cs3"), listOf(DexFixtures.currentEpisodeDex()), DexFixtures.manifest("Fx", cls.name, 1))
             val req = CsWire.parseOpRequest(CsWire.opRequest(CsWire.Op.INSTALL, "c-$id", id, 5000, JSONObject().put("sha256", DexFixtures.sha256(f))))!!
@@ -112,6 +123,9 @@ class PluginSettingsActivityTest {
         assertEquals(CsWire.PERMISSION, info.permission)
         assertTrue(info.exported)
         assertEquals("${context.packageName}:plugins", info.processName)
+        // The security property is the protection level, not the name.
+        val level = context.packageManager.getPermissionInfo(CsWire.PERMISSION, 0).protectionLevel and PermissionInfo.PROTECTION_MASK_BASE
+        assertEquals(PermissionInfo.PROTECTION_SIGNATURE, level)
         assertEquals(CsWire.BRIDGE_PACKAGE, context.packageName)
     }
 
@@ -211,5 +225,149 @@ class PluginSettingsActivityTest {
         idle()
         assertEquals(CsWire.Err.CANCELLED, c.error())
         assertEquals(0, SettingsPlugin.opened.get())
+    }
+
+    // ---- fix round 1 ----------------------------------------------------------------------------------------------
+
+    @Test fun `a DialogFragment keeps the screen open until it is dismissed`() {
+        install("cloudstream-a", SettingsPlugin::class.java)
+        SettingsPlugin.mode = SettingsPlugin.Mode.FRAGMENT
+        val c = launch()
+        val f = c.get().supportFragmentManager.findFragmentByTag("settings") as SettingsDialogFragment
+        // Even with focus (a fragment that is not a dialog window, or a focus event that came late): it holds a fragment.
+        idle(PluginSettingsActivity.IDLE_GRACE_MS * 2)
+        assertFalse(c.get().isFinishing)
+        c.windowFocusChanged(false)
+        f.dismiss(); idle()
+        c.windowFocusChanged(true); idle(PluginSettingsActivity.SETTLE_MS + 100)
+        assertTrue(c.get().isFinishing)
+        assertEquals(Activity.RESULT_OK, c.resultCode())
+    }
+
+    @Test fun `a tap outside and Back both close through the flush with RESULT_OK`() {
+        install("cloudstream-a", SettingsPlugin::class.java)
+        val tapped = launch()
+        tapped.get().onTouchEvent(MotionEvent.obtain(0, 0, MotionEvent.ACTION_UP, 1f, 1f, 0)); idle()
+        assertTrue(tapped.get().isFinishing); assertEquals(Activity.RESULT_OK, tapped.resultCode())
+        assertNull(SettingsSession.pluginId())
+        val backed = launch()
+        backed.get().onBackPressedDispatcher.onBackPressed(); idle()
+        assertTrue(backed.get().isFinishing); assertEquals(Activity.RESULT_OK, backed.resultCode())
+        assertNull(SettingsSession.pluginId())
+    }
+
+    @Test fun `a load that does not finish in time closes with timeout`() {
+        BlockingPlugin.release.countDown() // lets the install's own load through
+        install("cloudstream-a", BlockingPlugin::class.java)
+        registry.unloadForTest("cloudstream-a")
+        BlockingPlugin.reset()
+        PluginSettingsActivity.loadExecutor = Executor { r -> Thread(r).apply { isDaemon = true }.start() }
+        try {
+            val c = launch()
+            assertTrue(BlockingPlugin.entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            idle(PluginSettingsActivity.LOAD_TIMEOUT_MS + 100)
+            assertEquals(CsWire.Err.TIMEOUT, c.error())
+        } finally {
+            BlockingPlugin.release.countDown()
+        }
+    }
+
+    @Test fun `a second screen while one is open is busy and does not take over storage`() {
+        install("cloudstream-a", SettingsPlugin::class.java)
+        install("cloudstream-b", SettingsPlugin::class.java)
+        SettingsPlugin.mode = SettingsPlugin.Mode.DIALOG
+        val first = launch()
+        assertEquals(CsWire.Err.BUSY, launch(id = "cloudstream-b").error())
+        assertEquals("cloudstream-a", SettingsSession.pluginId())
+        assertFalse(first.get().isFinishing)
+    }
+
+    @Test fun `removing or updating the plugin while its screen is open closes it with cancelled`() {
+        install("cloudstream-a", SettingsPlugin::class.java)
+        SettingsPlugin.mode = SettingsPlugin.Mode.DIALOG
+        val c = launch()
+        c.windowFocusChanged(false)
+        registry.remove("cloudstream-a"); idle()
+        assertTrue(c.get().isFinishing)
+        assertEquals(CsWire.Err.CANCELLED, c.error())
+        assertNull(SettingsSession.pluginId())
+    }
+
+    @Test fun `another plugin's background thread keeps its own storage while a screen is open`() {
+        install("cloudstream-b", BackgroundWriterPlugin::class.java)
+        install("cloudstream-a", SettingsPlugin::class.java)
+        SettingsPlugin.mode = SettingsPlugin.Mode.DIALOG
+        launch()
+        assertEquals("cloudstream-a", SettingsSession.pluginId())
+        BackgroundWriterPlugin.writeFromOwnThread(context)
+        assertEquals("480", JSONObject(kino.stores["cloudstream-b"].orEmpty().getValue("\u0000cfg\u0000quality")).getString("v"))
+        assertNull(kino.stores["cloudstream-a"])
+    }
+
+    @Test fun `a throw from the plugin's click handler is absorbed, closes with plugin_error, and nothing else is`() {
+        install("cloudstream-a", SettingsPlugin::class.java)
+        SettingsPlugin.mode = SettingsPlugin.Mode.CLICK_THROW
+        val c = launch()
+        c.windowFocusChanged(false)
+        // Not the plugin's: crashes as before.
+        assertFalse(SettingsGuard.absorb(IllegalStateException("not the plugin's"), onMainThread = true))
+        // On a device this reaches the loop guard; here Robolectric hands it to the test thread.
+        val e = runCatching {
+            SettingsPlugin.dialog!!.let { it as android.app.AlertDialog }.getButton(android.content.DialogInterface.BUTTON_POSITIVE).performClick()
+            idle()
+        }.exceptionOrNull()!!
+        assertTrue(SettingsGuard.absorb(e, onMainThread = true))
+        idle()
+        assertTrue(c.get().isFinishing)
+        assertEquals(CsWire.Err.PLUGIN, c.error())
+        assertEquals(listOf("openSettings of cloudstream-a failed: IllegalStateException"), ShadowLog.getLogsForTag("KinoBridgeSettings").map { it.msg })
+        // Once the screen is gone, the same throwable is no longer absorbed.
+        idle(PluginSettingsActivity.FLUSH_MS)
+        assertNull(SettingsSession.pluginId())
+        assertFalse(SettingsGuard.absorb(e, onMainThread = true))
+    }
+
+    @Test fun `a throw inside a view traversal is never absorbed`() {
+        install("cloudstream-a", SettingsPlugin::class.java)
+        SettingsPlugin.mode = SettingsPlugin.Mode.DIALOG
+        launch()
+        val e = IllegalStateException("x").apply {
+            stackTrace = arrayOf(StackTraceElement(SettingsPlugin::class.java.name, "onMeasure", null, 1),
+                StackTraceElement("android.view.ViewRootImpl", "performTraversals", null, 1))
+        }
+        assertFalse(SettingsGuard.absorb(e, onMainThread = true))
+        assertTrue(SettingsGuard.absorb(e, onMainThread = false))
+    }
+
+    @Test fun `a throw on the plugin's own thread is absorbed by the default handler and closes the screen`() {
+        install("cloudstream-a", SettingsPlugin::class.java)
+        SettingsPlugin.mode = SettingsPlugin.Mode.THREAD_THROW
+        val c = launch()
+        SettingsPlugin.worker!!.join(5_000)
+        idle()
+        assertTrue(c.get().isFinishing)
+        assertEquals(CsWire.Err.PLUGIN, c.error())
+    }
+
+    @Test fun `the screen does not close while the plugin is still reading its values from Kino`() {
+        install("cloudstream-a", SettingsPlugin::class.java)
+        SettingsPlugin.mode = SettingsPlugin.Mode.SLOW_READ
+        val gate = java.util.concurrent.CountDownLatch(1)
+        kino.block = gate
+        try {
+            val c = launch()
+            val end = System.nanoTime() + 2_000_000_000L
+            while (kino.ops.none { it.getString("op") == "get" } && System.nanoTime() < end) Thread.sleep(5)
+            idle(PluginSettingsActivity.IDLE_GRACE_MS + PluginSettingsActivity.SETTLE_MS * 2)
+            assertFalse(c.get().isFinishing)
+            gate.countDown()
+            SettingsPlugin.worker!!.join(5_000)
+            idle(PluginSettingsActivity.SETTLE_MS + 100)
+            assertTrue(c.get().isFinishing)
+            assertEquals(Activity.RESULT_OK, c.resultCode())
+            assertEquals("cloudstream-a", kino.ops.first { it.getString("op") == "get" }.getString("pluginId"))
+        } finally {
+            gate.countDown(); kino.block = null
+        }
     }
 }

@@ -8,8 +8,9 @@ pinned at upstream commit `4e2516d56ecd42c22c52e461980625fe3f3d559a` (branch `ki
 A headless Android application, `:bridge` (`com.kino.csbridge`), that hosts the CloudStream plugin
 runtime for Kino. Its only UI is a transparent host for a plugin's own settings dialog, which only Kino can start
 (`bridge-contract/PROTOCOL.md`, "Plugin settings"), and it holds **no network permission**: every request a plugin makes
-goes through Kino over IPC. The IPC contract lives in `bridge-contract/` (copied verbatim from Kino,
-never edited here).
+goes through Kino over IPC. The IPC contract lives in `bridge-contract/`, kept identical to Kino's copy: a change
+made on either side is copied verbatim to the other in the same release (the plugin settings section was written here
+first).
 
 Everything we add lives only in `bridge/`, `bridge-contract/`, `scripts/`, `.github/` and `BRIDGE.md`.
 **Never edit upstream files.** The exceptions, each in its own commit so it rebases trivially (and

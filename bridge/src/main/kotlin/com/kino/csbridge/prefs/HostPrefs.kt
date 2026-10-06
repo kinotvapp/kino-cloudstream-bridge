@@ -2,11 +2,13 @@
 package com.kino.csbridge.prefs
 
 import android.content.SharedPreferences
+import android.os.Looper
 import android.util.Log
 import com.kino.csbridge.CallContext
 import com.kino.csbridge.HostLink
 import com.kino.csbridge.contract.CsWire
 import com.kino.csbridge.contract.IHost
+import com.kino.csbridge.plugins.PluginFrames
 import com.kino.csbridge.settings.SettingsSession
 import org.json.JSONArray
 import org.json.JSONObject
@@ -23,6 +25,7 @@ import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -30,9 +33,11 @@ import java.util.concurrent.atomic.AtomicLong
  * through `IHost.storage` (spec §5.6). Nothing is ever written in the bridge's data dir. [HostPrefs] are views of one
  * SharedPreferences name over this store; all names of one plugin share that plugin's 256 KB quota.
  *
- * **Owner of a call:** the plugin of the live [CallContext]; else the plugin whose settings screen is open
- * ([SettingsSession]); else the only installed plugin; else nobody, and the value is kept in this process's memory only
- * (logged once per key, never naming it). The context is read from the thread
+ * **Owner of a call:** the plugin of the live [CallContext]; else the plugin whose code is on the calling thread's stack
+ * ([PluginFrames]: a plugin's own threads, timers and callbacks, a settings screen's handlers); else, on the main thread
+ * only, the plugin whose settings screen is open ([SettingsSession]: framework code saving for it with no plugin frame
+ * on the stack); else the only installed plugin; else nobody, and the value is kept in this process's memory only
+ * (logged once per key, never naming it). Another plugin's background thread is never given the open screen's storage. The context is read from the thread
  * local, which follows an op's coroutines. Work a plugin starts outside its op (own scopes, raw threads, callbacks)
  * falls to the second or third rule. Extractors are global: plugin B's extractor run inside plugin A's op writes to A's
  * storage, which is expected (it is A's op).
@@ -62,7 +67,8 @@ class HostStore(
     private val stallMs: Long = STALL_MS,
     private val log: (String) -> Unit = ::defaultLog,
     private val readExecutor: ExecutorService = sharedReadExecutor,
-    private val settingsOwner: () -> String? = { SettingsSession.pluginId() },
+    private val stackOwner: () -> String? = { PluginFrames.ownerOfCurrentThread() },
+    private val settingsOwner: () -> String? = { SettingsSession.pluginId()?.takeIf { Looper.myLooper() == Looper.getMainLooper() } },
 ) {
     private data class Slot(val pluginId: String, val key: String)
     private class Batch { @Volatile var failed = false; val dropLogged = AtomicBoolean() }
@@ -88,6 +94,7 @@ class HostStore(
     /** The plugin whose Kino storage serves this call, or null for this process's memory. */
     private fun owner(): String? {
         CallContext.current()?.pluginId?.takeIf { it.startsWith(ID_PREFIX) }?.let { return it }
+        try { stackOwner() } catch (_: Exception) { null }?.takeIf { it.startsWith(ID_PREFIX) }?.let { return it }
         settingsOwner()?.takeIf { it.startsWith(ID_PREFIX) }?.let { return it }
         return try { installedIds().singleOrNull() } catch (_: Exception) { null }
     }
@@ -279,6 +286,17 @@ class HostStore(
 
     /** Kino's answer, or null (logged) when there is no host, the op is over, Kino failed or the deadline passed. */
     private fun call(name: String, id: String, body: JSONObject, timeoutMs: Long): String? {
+        val n = readsInFlight.computeIfAbsent(id) { AtomicInteger() }
+        n.incrementAndGet()
+        try { return callCounted(name, id, body, timeoutMs) } finally { n.decrementAndGet() }
+    }
+
+    private val readsInFlight = ConcurrentHashMap<String, AtomicInteger>()
+
+    /** Reads of [pluginId] waiting on Kino right now (the settings screen does not close under a plugin still reading). */
+    fun readsInFlight(pluginId: String): Int = readsInFlight[pluginId]?.get() ?: 0
+
+    private fun callCounted(name: String, id: String, body: JSONObject, timeoutMs: Long): String? {
         val h = host() ?: run { log("storage $name skipped: no host (plugin=$id)"); return null }
         val budget = minOf(timeoutMs, CallContext.current()?.remainingMs() ?: Long.MAX_VALUE)
         if (budget <= 0) { log("storage $name skipped: call over (plugin=$id)"); return null }

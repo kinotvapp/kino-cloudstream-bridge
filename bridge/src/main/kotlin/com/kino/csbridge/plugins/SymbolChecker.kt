@@ -147,6 +147,13 @@ class SymbolChecker(private val loader: ClassLoader) {
         }
     }
 
+    /** Binary names (`a.b.C$D`) of every class the `.cs3`'s dex files define; empty when they cannot be read. */
+    fun definedClasses(cs3: File): Set<String> = try {
+        readDexes(cs3).flatMapTo(HashSet()) { dex -> dex.classes.map { it.type.removePrefix("L").removeSuffix(";").replace('/', '.') } }
+    } catch (_: RuntimeException) {
+        emptySet()
+    }
+
     private fun readDexes(f: File): List<DexBackedDexFile> {
         val zip = try { ZipFile(f) } catch (e: IOException) { throw IllegalArgumentException("not a zip", e) }
         return zip.use { z ->

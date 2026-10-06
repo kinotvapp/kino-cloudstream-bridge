@@ -45,7 +45,7 @@ object CsWire {
         const val STREAM_BROKEN = "bridge_stream_broken"
         /** Both of the bridge's stream slots are writing: a large result is answered this in `done`, with no doneStream. */
         const val STREAMS_BUSY = "streams_busy"
-        /** `IHost.webView` only: another hidden page is open in Kino. */
+        /** `IHost.webView`: another hidden page is open in Kino. Plugin settings result: another settings screen is open. */
         const val BUSY = "busy"
         /** `IHost.webView` only: no live op the person started. */
         const val NOT_ALLOWED = "not_allowed"

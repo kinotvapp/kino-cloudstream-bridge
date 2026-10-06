@@ -76,7 +76,7 @@ class HostPrefsTest {
 
     private fun store(timeoutMs: Long = 2_000, maxDirty: Int = HostStore.MAX_DIRTY, stallMs: Long = HostStore.STALL_MS) =
         HostStore({ installed }, { host }, readTimeoutMs = timeoutMs, writeTimeoutMs = timeoutMs, maxDirty = maxDirty,
-            stallMs = stallMs, log = { logs += it }, settingsOwner = { null })
+            stallMs = stallMs, log = { logs += it }, stackOwner = { null }, settingsOwner = { null })
 
     private fun latch() = CountDownLatch(1).also { latches += it }
 
@@ -449,10 +449,18 @@ class HostPrefsTest {
         const val B = "cloudstream-beta-bbbbbb"
     }
 
+    @Test fun `the plugin on the calling thread's stack owns a write without a live call, ahead of an open settings screen`() {
+        installed = listOf("cloudstream-a", "cloudstream-b")
+        val s = HostStore({ installed }, { host }, log = { logs += it }, stackOwner = { "cloudstream-b" }, settingsOwner = { "cloudstream-a" })
+        assertTrue(HostPrefs(s, "cfg").edit().putString("k", "v").commit())
+        assertEquals("v", stored("cloudstream-b", "\u0000cfg\u0000k"))
+        assertNull(kino.stores["cloudstream-a"]) // never the open screen's storage
+    }
+
     @Test fun `an open settings screen owns writes made without a live call, even with two plugins installed`() {
         installed = listOf("cloudstream-a", "cloudstream-b")
         var owner: String? = "cloudstream-b"
-        val s = HostStore({ installed }, { host }, log = { logs += it }, settingsOwner = { owner })
+        val s = HostStore({ installed }, { host }, log = { logs += it }, stackOwner = { null }, settingsOwner = { owner })
         assertTrue(HostPrefs(s, "cfg").edit().putString("k", "v").commit())
         assertEquals("v", stored("cloudstream-b", "\u0000cfg\u0000k"))
         assertNull(kino.stores["cloudstream-a"])
@@ -468,7 +476,7 @@ class HostPrefsTest {
 
     @Test fun `a settings owner that is not a CloudStream id is ignored`() {
         installed = listOf("cloudstream-a")
-        val s = HostStore({ installed }, { host }, log = { logs += it }, settingsOwner = { "other" })
+        val s = HostStore({ installed }, { host }, log = { logs += it }, stackOwner = { null }, settingsOwner = { "other" })
         assertTrue(HostPrefs(s, "cfg").edit().putString("k", "v").commit())
         assertEquals("v", stored("cloudstream-a", "\u0000cfg\u0000k"))
     }

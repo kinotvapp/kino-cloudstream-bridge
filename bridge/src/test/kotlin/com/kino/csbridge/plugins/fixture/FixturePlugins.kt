@@ -116,14 +116,38 @@ class SettingsPlugin : Plugin() {
                 }
                 Mode.DIALOG -> dialog = android.app.AlertDialog.Builder(ctx).setMessage("settings").show()
                 Mode.THROW -> error("boom https://x.example/p?token=secret")
+                Mode.FRAGMENT -> SettingsDialogFragment().show((ctx as androidx.fragment.app.FragmentActivity).supportFragmentManager, "settings")
+                Mode.CLICK_THROW -> dialog = android.app.AlertDialog.Builder(ctx).setMessage("settings")
+                    .setPositiveButton("Save") { _, _ -> error("save failed https://x.example/p?token=secret") }.show()
+                Mode.THREAD_THROW -> worker = Thread { error("worker failed https://x.example/p?token=secret") }.also { it.start() }
+                // Reads its values before it shows anything (a Binder round trip each): the screen must wait for it.
+                Mode.SLOW_READ -> worker = Thread { ctx.getSharedPreferences("cfg", Context.MODE_PRIVATE).getString("quality", null) }.also { it.start() }
             }
         }
     }
-    enum class Mode { WRITE, DIALOG, THROW }
+    enum class Mode { WRITE, DIALOG, THROW, FRAGMENT, CLICK_THROW, THREAD_THROW, SLOW_READ }
     companion object {
         @Volatile var mode = Mode.WRITE
         @Volatile var dialog: android.app.Dialog? = null
+        @Volatile var worker: Thread? = null
         val opened = java.util.concurrent.atomic.AtomicInteger()
-        fun reset() { mode = Mode.WRITE; dialog = null; opened.set(0) }
+        fun reset() { mode = Mode.WRITE; dialog = null; worker = null; opened.set(0) }
+    }
+}
+
+/** The common plugin pattern: an androidx DialogFragment shown on the host's FragmentManager. */
+class SettingsDialogFragment : androidx.fragment.app.DialogFragment() {
+    override fun onCreateDialog(savedInstanceState: android.os.Bundle?): android.app.Dialog =
+        android.app.AlertDialog.Builder(requireContext()).setMessage("settings").create()
+}
+
+/** Another plugin with background work of its own (no op), running while some other plugin's settings screen is open. */
+class BackgroundWriterPlugin : Plugin() {
+    override fun load(context: Context) { registerMainAPI(FixtureApi()) }
+    companion object {
+        fun writeFromOwnThread(context: Context) {
+            val t = Thread { context.getSharedPreferences("cfg", Context.MODE_PRIVATE).edit().putString("quality", "480").commit() }
+            t.start(); t.join()
+        }
     }
 }
