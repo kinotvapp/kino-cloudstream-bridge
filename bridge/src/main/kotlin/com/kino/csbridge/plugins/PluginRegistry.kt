@@ -306,7 +306,7 @@ class PluginRegistry(
         val marker = File(dir, "$MARKER$pluginId")
         marker.writeText("") // before any plugin code: static initialisers run from here on
         // Before any plugin code too: threads its load() starts are attributed to it (storage) from their first frame.
-        PluginFrames.register(pluginId, SymbolChecker(parentLoader).definedClasses(file), manifest.pluginClassName)
+        PluginFrames.register(pluginId, onlyPluginClasses(file), manifest.pluginClassName)
         val path = file.absolutePath
         val beforeProviders = snapshot(APIHolder.allProviders)
         val beforeExtractors = snapshot(extractorApis)
@@ -361,6 +361,15 @@ class PluginRegistry(
             marker.delete()
         }
     }
+
+    /**
+     * The classes [file]'s dex defines that the bridge cannot load itself: under parent-first loading a bundled copy of a
+     * class the bridge has (kotlin, kotlinx.coroutines, OkHttp) never runs, so its frames are never this plugin's.
+     */
+    private fun onlyPluginClasses(file: File): Set<String> =
+        SymbolChecker(parentLoader).definedClasses(file).filterTo(HashSet()) { name ->
+            try { Class.forName(name, false, parentLoader); false } catch (_: Throwable) { true }
+        }
 
     /**
      * What [list] gained since [before] that is this load's: defined by its own loader [own], or by a loader that is no

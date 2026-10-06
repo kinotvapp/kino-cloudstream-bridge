@@ -11,6 +11,7 @@ import com.lagradost.cloudstream3.plugins.Plugin
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.SubtitleFile
+import kotlinx.coroutines.launch
 
 // JVM stand-ins for plugin classes: Robolectric cannot execute dex, so the registry tests load these from the test
 // classpath (the .cs3 still carries a dexlib2-written classes.dex for the ABI check). PluginRegistryDeviceTest
@@ -121,11 +122,26 @@ class SettingsPlugin : Plugin() {
                     .setPositiveButton("Save") { _, _ -> error("save failed https://x.example/p?token=secret") }.show()
                 Mode.THREAD_THROW -> worker = Thread { error("worker failed https://x.example/p?token=secret") }.also { it.start() }
                 // Reads its values before it shows anything (a Binder round trip each): the screen must wait for it.
+                Mode.TEARDOWN_THROW -> TeardownFragment().show((ctx as androidx.fragment.app.FragmentActivity).supportFragmentManager, "settings")
+                // The usual Kotlin pattern: kotlinx reports this straight to the main thread's uncaught handler.
+                Mode.MAIN_COROUTINE_THROW -> kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+                    error("parse failed https://x.example/p?token=secret")
+                }
                 Mode.SLOW_READ -> worker = Thread { ctx.getSharedPreferences("cfg", Context.MODE_PRIVATE).getString("quality", null) }.also { it.start() }
             }
         }
     }
-    enum class Mode { WRITE, DIALOG, THROW, FRAGMENT, CLICK_THROW, THREAD_THROW, SLOW_READ }
+    enum class Mode { WRITE, DIALOG, THROW, FRAGMENT, CLICK_THROW, THREAD_THROW, SLOW_READ, TEARDOWN_THROW, MAIN_COROUTINE_THROW }
+    /** A plugin fragment (one of the plugin's own classes) whose teardown throws after the screen closed: a binding never set. */
+    class TeardownFragment : androidx.fragment.app.DialogFragment() {
+        override fun onCreateDialog(savedInstanceState: android.os.Bundle?): android.app.Dialog =
+            android.app.AlertDialog.Builder(requireContext()).setMessage("settings").create()
+        override fun onDestroyView() {
+            super.onDestroyView()
+            throw UninitializedPropertyAccessException("binding https://x.example/p?token=secret")
+        }
+    }
+
     companion object {
         @Volatile var mode = Mode.WRITE
         @Volatile var dialog: android.app.Dialog? = null

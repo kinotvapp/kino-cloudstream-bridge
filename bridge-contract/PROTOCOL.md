@@ -202,11 +202,23 @@ a television; the bridge refuses there anyway). Constants: `CsWire.Settings`.
   dialog shows over Kino. It closes when no plugin dialog or fragment is left on top of it and the plugin is not waiting
   on a storage read (dismissal, Back), when the person taps outside the dialog, or 3 s after `openSettings` returned
   without showing or reading anything. Once closing it takes no touches, and it waits up to 3 s for the plugin's pending
-  storage writes to reach Kino before finishing.
-- **Plugin failures**: a throwable of the plugin (its `load()`, `openSettings`, a click handler, a dialog shown late, a
-  thread it started) closes the screen with `plugin_error` and leaves the bridge process running. A failure the bridge
-  cannot contain (a VM error such as out of memory, a throw inside the framework's own layout pass) kills the bridge
-  process: see the bare cancel below.
+  storage writes to reach Kino before finishing (after a plugin failure it finishes at once; queued writes still reach
+  Kino).
+- **Plugin failures**: the bridge contains these throwables of the plugin (the screen closes with `plugin_error`, the
+  bridge process and its ops go on): from its `load()` or `openSettings`, from a handler or callback on the main thread
+  (a click, a dialog shown late, a `Dispatchers.Main` coroutine), from a thread it started, and from its fragments'
+  teardown while the screen is destroyed. These still kill the bridge process (`:plugins`, every op in flight with it):
+  a VM error (out of memory and the like); a throw inside the framework's own layout or draw pass (a plugin view's
+  measure, layout or draw) or a Choreographer frame; a throw while Android creates, starts, resumes, pauses or stops the
+  screen (a plugin fragment's `onStart`, `onResume`…); a native crash; a throwable attributed to no single plugin (it
+  went only through bridge or library code, or through a class name two installed plugins share). Kino sees those as
+  the bare cancel below. The bridge logs a contained failure as one line with the class name only, but Android's own
+  handler may still print a background thread's stack and message ("FATAL EXCEPTION") to logcat first: such a logcat
+  entry is not a crash when the result was `plugin_error`.
+- **Release gate** (manual, every bridge release that changes the settings screen or `SettingsGuard`): on one physical
+  phone, a fixture plugin whose settings button throws, whose `Dispatchers.Main` coroutine throws, and whose fragment
+  throws in `onDestroyView` each give `plugin_error`, no "keeps stopping" dialog, no ANR, and a resolve or playback in
+  progress in Kino that survives.
 - **Result**: `RESULT_OK` (no data, no extras) when the screen ran and closed. The plugin may have changed its values:
   Kino reloads whatever it shows from the plugin (its next op sees the new values). `RESULT_CANCELED` with the String
   extra `com.kino.csbridge.extra.ERROR` (`CsWire.Settings.EXTRA_ERROR`):

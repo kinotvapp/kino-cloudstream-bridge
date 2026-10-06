@@ -21,6 +21,7 @@ import com.kino.csbridge.CallerCheck
 import com.kino.csbridge.HostLink
 import com.kino.csbridge.Ops
 import com.kino.csbridge.contract.CsWire
+import com.kino.csbridge.plugins.PluginFrames
 import com.kino.csbridge.plugins.PluginRegistry
 import com.kino.csbridge.plugins.SafeNames
 import com.lagradost.cloudstream3.plugins.BasePlugin
@@ -51,11 +52,14 @@ import java.util.concurrent.Executor
  * plugin (`cancelled`). Before `finish()` it stops taking touches and waits up to [FLUSH_MS] for the plugin's storage
  * writes to reach Kino.
  *
- * **Never crashes the process for the plugin's throwables:** the load and `openSettings` (with the fragment
- * transactions it queued) are guarded, and everything later (click handlers, a late `show()`, the plugin's threads) by
- * [SettingsGuard]; a throwable is one log line (class name only) and `RESULT_CANCELED` with
- * [CsWire.Settings.EXTRA_ERROR] `plugin_error`. A recreated instance (process death) never restores the plugin's
- * fragments (their classes belong to the plugin's loader) and closes at once.
+ * **The plugin's throwables:** the load and `openSettings` (with the fragment transactions it queued) are caught here,
+ * and later ones (click handlers, a late `show()`, `Dispatchers.Main` coroutines, its threads, its fragments' teardown)
+ * by [SettingsGuard], which lists what it does not contain (VM errors, throws inside a layout pass, a Choreographer
+ * frame or the screen's create/start/resume/pause/stop dispatch: those still kill `:plugins`). A contained throwable is
+ * one bridge log line (class name only; Android's own pre-handler may still print a background thread's stack) and
+ * `RESULT_CANCELED` with [CsWire.Settings.EXTRA_ERROR] `plugin_error`, the screen finishing at once. A recreated
+ * instance (process death) never restores the plugin's fragments (their classes belong to the plugin's loader) and
+ * closes at once.
  */
 class PluginSettingsActivity : AppCompatActivity() {
     private val main = Handler(Looper.getMainLooper())
@@ -118,6 +122,7 @@ class PluginSettingsActivity : AppCompatActivity() {
                 when (outcome) {
                     is String -> close(outcome)
                     is BasePlugin -> {
+                        token.claim = PluginFrames.claim(id) // kept even if the plugin is updated or removed mid-close
                         val open = (outcome as? Plugin)?.openSettings
                         if (open == null) close(CsWire.Settings.NO_SETTINGS) else { settings = open; invokeIfReady() }
                     }
@@ -188,7 +193,9 @@ class PluginSettingsActivity : AppCompatActivity() {
 
     /**
      * Sets the result ([error] null = `RESULT_OK`), stops taking touches and focus (Kino is usable at once), waits off
-     * the main thread for the plugin's pending storage writes (at most [FLUSH_MS]), then finishes. Idempotent.
+     * the main thread for the plugin's pending storage writes (at most [FLUSH_MS]), then finishes. After a plugin
+     * failure it finishes at once (its broken dialogs go with the screen; the queued writes reach Kino anyway). The
+     * session lasts until [onDestroy]. Idempotent.
      */
     private fun close(error: String?) {
         if (closing) return
@@ -196,22 +203,23 @@ class PluginSettingsActivity : AppCompatActivity() {
         main.removeCallbacks(idleCheck)
         if (error == null) setResult(RESULT_OK) else setResult(RESULT_CANCELED, Intent().putExtra(CsWire.Settings.EXTRA_ERROR, error))
         runCatching { window?.addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) }
-        val token = session
-        if (token == null) { super.finish(); return }
+        if (session == null || error == CsWire.Err.PLUGIN) { super.finish(); return }
         flushExecutor.execute {
             runCatching { (application as? BridgeApp)?.prefsStore?.awaitIdle(FLUSH_MS) }
-            main.post {
-                SettingsSession.end(token)
-                super.finish()
-            }
+            main.post { super.finish() }
         }
     }
 
+    /**
+     * The session (storage attribution, [SettingsGuard]) outlives the plugin's own teardown: its fragments' onDestroyView
+     * / onDismiss run inside super.onDestroy(), and a throw there must still be absorbed. So its end is posted before
+     * super.onDestroy() runs and happens after it (and after a throwable from it has reached the loop guard).
+     */
     override fun onDestroy() {
         main.removeCallbacksAndMessages(null)
         runCatching { supportFragmentManager.unregisterFragmentLifecycleCallbacks(fragmentWatcher) }
         registry?.removeUnloadListener(unloaded)
-        session?.let { SettingsSession.end(it) }
+        session?.let { token -> Handler(Looper.getMainLooper()).post { SettingsSession.end(token) } }
         super.onDestroy()
     }
 

@@ -56,6 +56,7 @@ class PluginSettingsActivityTest {
         Ops.instance = registry
         HostLink.host = kino
         SettingsPlugin.reset()
+        SettingsGuard.mainGuarded = false
         SettingsGuard.loopGuard = false // Robolectric's main looper is this test thread
         PluginSettingsActivity.callerCheck = { true }
         PluginSettingsActivity.loadExecutor = Executor { it.run() }
@@ -87,7 +88,15 @@ class PluginSettingsActivityTest {
         idle()
         if (!c.get().isFinishing) { c.visible(); idle() } // attaches the window (focus events need it), focus not yet given
         if (focus && !c.get().isFinishing) { c.windowFocusChanged(true); idle() }
+        c.finishOut()
         return c
+    }
+
+    /** What the system does after finish(): pause, stop, destroy (the session ends after onDestroy). No-op if still open. */
+    private fun ActivityController<PluginSettingsActivity>.finishOut() {
+        if (!get().isFinishing || get().isDestroyed) return
+        runCatching { pause() }; runCatching { stop() }
+        destroy(); idle()
     }
 
     private fun idle(ms: Long = 0) = shadowOf(Looper.getMainLooper()).idleFor(Duration.ofMillis(ms))
@@ -183,6 +192,8 @@ class PluginSettingsActivityTest {
         assertEquals("1080", JSONObject(a.getValue("\u0000cfg\u0000quality")).getString("v"))
         assertEquals(true, JSONObject(a.getValue("\u0000cfg\u0000bg")).getBoolean("v")) // from the plugin's own thread
         assertNull(kino.stores["cloudstream-b"])
+        assertEquals("cloudstream-a", SettingsSession.pluginId()) // until the screen is destroyed
+        c.finishOut()
         assertNull(SettingsSession.pluginId())
     }
 
@@ -249,10 +260,12 @@ class PluginSettingsActivityTest {
         val tapped = launch()
         tapped.get().onTouchEvent(MotionEvent.obtain(0, 0, MotionEvent.ACTION_UP, 1f, 1f, 0)); idle()
         assertTrue(tapped.get().isFinishing); assertEquals(Activity.RESULT_OK, tapped.resultCode())
+        tapped.finishOut()
         assertNull(SettingsSession.pluginId())
         val backed = launch()
         backed.get().onBackPressedDispatcher.onBackPressed(); idle()
         assertTrue(backed.get().isFinishing); assertEquals(Activity.RESULT_OK, backed.resultCode())
+        backed.finishOut()
         assertNull(SettingsSession.pluginId())
     }
 
@@ -290,6 +303,7 @@ class PluginSettingsActivityTest {
         registry.remove("cloudstream-a"); idle()
         assertTrue(c.get().isFinishing)
         assertEquals(CsWire.Err.CANCELLED, c.error())
+        c.finishOut()
         assertNull(SettingsSession.pluginId())
     }
 
@@ -307,6 +321,8 @@ class PluginSettingsActivityTest {
     @Test fun `a throw from the plugin's click handler is absorbed, closes with plugin_error, and nothing else is`() {
         install("cloudstream-a", SettingsPlugin::class.java)
         SettingsPlugin.mode = SettingsPlugin.Mode.CLICK_THROW
+        var flushed = false
+        PluginSettingsActivity.flushExecutor = Executor { flushed = true } // never runs: a plugin_error must not wait on it
         val c = launch()
         c.windowFocusChanged(false)
         // Not the plugin's: crashes as before.
@@ -321,8 +337,9 @@ class PluginSettingsActivityTest {
         assertTrue(c.get().isFinishing)
         assertEquals(CsWire.Err.PLUGIN, c.error())
         assertEquals(listOf("openSettings of cloudstream-a failed: IllegalStateException"), ShadowLog.getLogsForTag("KinoBridgeSettings").map { it.msg })
+        assertFalse("finished at once, no flush wait", flushed)
         // Once the screen is gone, the same throwable is no longer absorbed.
-        idle(PluginSettingsActivity.FLUSH_MS)
+        c.finishOut()
         assertNull(SettingsSession.pluginId())
         assertFalse(SettingsGuard.absorb(e, onMainThread = true))
     }
@@ -369,5 +386,87 @@ class PluginSettingsActivityTest {
         } finally {
             gate.countDown(); kino.block = null
         }
+    }
+
+    // ---- fix round 2 ----------------------------------------------------------------------------------------------
+
+    @Test fun `classes the bridge can load are never a plugin's, for throwables and storage alike`() {
+        // A .cs3 that bundles its own copy of a library class the bridge has: parent-first, that copy never runs.
+        val bundled = DexFixtures.dex(DexFixtures.runner("Lkotlinx/coroutines/DispatchedTask;", 1, listOf(DexFixtures.returnVoid())))
+        val f = DexFixtures.cs3(File.createTempFile("fxs", ".cs3"), listOf(DexFixtures.currentEpisodeDex(), bundled),
+            DexFixtures.manifest("Fx", SettingsPlugin::class.java.name, 1))
+        f.inputStream().use { registry.install("cloudstream-a", it, DexFixtures.sha256(f)) }
+        val claim = com.kino.csbridge.plugins.PluginFrames.claim("cloudstream-a")!!
+        assertTrue(claim.owns("fixture.Current"))
+        assertFalse(claim.owns("kotlinx.coroutines.DispatchedTask"))
+        val libraryOnly = arrayOf(StackTraceElement("kotlinx.coroutines.DispatchedTask", "run", null, 1))
+        assertNull(com.kino.csbridge.plugins.PluginFrames.ownerOf(libraryOnly))
+        SettingsPlugin.mode = SettingsPlugin.Mode.DIALOG
+        launch()
+        val e = IllegalStateException("x").apply { stackTrace = libraryOnly }
+        assertFalse(SettingsGuard.absorb(e, onMainThread = false))
+    }
+
+    @Test fun `a frame two loaded plugins both claim is nobody's`() {
+        install("cloudstream-a", SettingsPlugin::class.java)
+        install("cloudstream-b", SettingsPlugin::class.java) // same plugin class name in two .cs3
+        SettingsPlugin.mode = SettingsPlugin.Mode.DIALOG
+        launch()
+        val e = IllegalStateException("x").apply { stackTrace = arrayOf(StackTraceElement(SettingsPlugin::class.java.name, "f", null, 1)) }
+        assertFalse(SettingsGuard.absorb(e, onMainThread = false))
+    }
+
+    @Test fun `a throw from the plugin's fragment teardown is absorbed, even after the plugin was removed`() {
+        install("cloudstream-a", SettingsPlugin::class.java)
+        SettingsPlugin.mode = SettingsPlugin.Mode.TEARDOWN_THROW
+        val c = launch()
+        c.windowFocusChanged(false)
+        registry.remove("cloudstream-a"); idle() // its live classes are unregistered; the screen kept its own copy
+        assertNull(com.kino.csbridge.plugins.PluginFrames.claim("cloudstream-a"))
+        assertTrue(c.get().isFinishing)
+        val e = runCatching { c.pause(); c.stop(); c.destroy() }.exceptionOrNull()
+        assertTrue("teardown threw", e != null)
+        // Still inside the session: its end runs after onDestroy.
+        assertEquals("cloudstream-a", SettingsSession.pluginId())
+        assertTrue(SettingsGuard.absorb(e!!, onMainThread = true))
+        idle()
+        assertNull(SettingsSession.pluginId())
+    }
+
+    @Test fun `a Dispatchers Main coroutine throw reported to the main thread's handler is absorbed when the loop is guarded`() {
+        install("cloudstream-a", SettingsPlugin::class.java)
+        SettingsPlugin.mode = SettingsPlugin.Mode.MAIN_COROUTINE_THROW
+        SettingsGuard.mainGuarded = true
+        try {
+            val c = launch()
+            idle()
+            assertTrue(c.get().isFinishing)
+            assertEquals(CsWire.Err.PLUGIN, c.error())
+        } finally {
+            SettingsGuard.mainGuarded = false
+        }
+    }
+
+    @Test fun `without the loop guard a main thread report is never absorbed`() {
+        install("cloudstream-a", SettingsPlugin::class.java)
+        SettingsPlugin.mode = SettingsPlugin.Mode.DIALOG
+        launch()
+        val e = IllegalStateException("x").apply { stackTrace = arrayOf(StackTraceElement(SettingsPlugin::class.java.name, "f", null, 1)) }
+        assertFalse(SettingsGuard.handle(Looper.getMainLooper().thread, e))
+        assertTrue(SettingsGuard.handle(Thread.currentThread().let { Thread() }, e))
+    }
+
+    @Test fun `throws inside the activity lifecycle dispatch crash as before, except the screen's destruction`() {
+        install("cloudstream-a", SettingsPlugin::class.java)
+        SettingsPlugin.mode = SettingsPlugin.Mode.DIALOG
+        launch()
+        fun thrown(vararg frames: Pair<String, String>) = RuntimeException("Unable to resume activity",
+            IllegalStateException("x").apply { stackTrace = arrayOf(StackTraceElement(SettingsPlugin::class.java.name, "onResume", null, 1)) })
+            .apply { stackTrace = frames.map { StackTraceElement(it.first, it.second, null, 1) }.toTypedArray() }
+        assertFalse(SettingsGuard.absorb(thrown("android.app.ActivityThread" to "performResumeActivity"), onMainThread = true))
+        assertFalse(SettingsGuard.absorb(thrown("android.app.servertransaction.TransactionExecutor" to "execute"), onMainThread = true))
+        assertFalse(SettingsGuard.absorb(thrown("android.app.Instrumentation" to "callActivityOnStart"), onMainThread = true))
+        assertTrue(SettingsGuard.absorb(thrown("android.app.servertransaction.TransactionExecutor" to "execute",
+            "android.app.ActivityThread" to "performDestroyActivity"), onMainThread = true))
     }
 }

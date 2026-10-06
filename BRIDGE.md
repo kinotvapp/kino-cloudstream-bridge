@@ -98,6 +98,9 @@ the Mac. There is no `testReleaseUnitTest` in it.
 
 1. On `kino-bridge`, with every gate green: `./gradlew :bridge:assembleRelease -PbridgeVersionCode=N
    -PbridgeVersionName=X.Y.Z` with the `KINO_*` signing variables set (on the Mac only).
+   When the plugin settings screen or `SettingsGuard` changed since the last release, also run the manual on-device check
+   in `bridge-contract/PROTOCOL.md` ("Plugin settings", "Release gate") on one physical phone; it is a release gate (the
+   unit tests cannot run the real main-loop guard).
 2. Tag that commit `bridge-vX.Y.Z` and push the tag (`git push origin bridge-vX.Y.Z`) **before** publishing the APK:
    the tag is the GPL source offer, and Kino's release for the APK uses the same name.
 3. Publish through Kino (`scripts/publish-release-github.sh --bridge <apk>` in the Kino repository).

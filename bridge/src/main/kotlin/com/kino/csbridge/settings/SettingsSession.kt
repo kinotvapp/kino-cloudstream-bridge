@@ -8,7 +8,14 @@ package com.kino.csbridge.settings
  * [Token.onPluginFailure].
  */
 object SettingsSession {
-    class Token internal constructor(val pluginId: String, internal val onPluginFailure: (Throwable) -> Unit)
+    class Token internal constructor(val pluginId: String, internal val onPluginFailure: (Throwable) -> Unit) {
+        /**
+         * The plugin's classes as loaded for this screen, kept for the screen's whole life: an update or removal while it
+         * closes unregisters the live ones, and the old instance's dialog code still runs until the screen is destroyed.
+         */
+        @Volatile var claim: com.kino.csbridge.plugins.PluginFrames.Claim? = null
+            internal set
+    }
 
     @Volatile private var current: Token? = null
 
