@@ -69,7 +69,10 @@ class PluginRegistry(
 ) {
     class RegistryException(val code: String, message: String) : Exception(message)
 
-    data class InstallResult(val name: String, val version: Int, val providers: List<MainAPI>, val missingSymbols: List<String>)
+    /** [hasSettings]: the plugin set CloudStream's `openSettings` in its `load()` (PROTOCOL.md "Plugin settings"). */
+    data class InstallResult(
+        val name: String, val version: Int, val providers: List<MainAPI>, val missingSymbols: List<String>, val hasSettings: Boolean = false,
+    )
 
     private data class Entry(val pluginId: String, val file: String, val sha256: String, val crashes: Int = 0) {
         val disabled get() = crashes >= CRASHES_TO_DISABLE
@@ -163,7 +166,7 @@ class PluginRegistry(
             if (missing.isNotEmpty()) return InstallResult(displayName, manifest.version, emptyList(), missing)
             return withPluginLock(pluginId) {
                 val l = replaceLocked(pluginId, name, sha256, tmp, manifest, beforeUnload)
-                InstallResult(displayName, manifest.version, l.providers, emptyList())
+                InstallResult(displayName, manifest.version, l.providers, emptyList(), hasSettings(l.plugin))
             }
         } finally {
             deleteFile(tmp)
@@ -262,6 +265,15 @@ class PluginRegistry(
             if (missing.isNotEmpty()) throw RegistryException(CsWire.Err.INCOMPATIBLE, "missing ${missing.size}: ${missing.first()}")
             loadLocked(pluginId, f, manifest).providers
         }
+    }
+
+    /**
+     * The loaded plugin instance of [pluginId], loading it first like [providers] (same errors). For the settings screen,
+     * which runs outside any op: a `load()` that makes HTTP gets it refused, as for any request outside a Kino call.
+     */
+    fun plugin(pluginId: String): BasePlugin {
+        providers(pluginId)
+        return loaded[pluginId]?.plugin ?: throw RegistryException(CsWire.Err.NOT_INSTALLED, "plugin")
     }
 
     /**
@@ -471,6 +483,9 @@ class PluginRegistry(
     private fun ByteArray.toHex() = joinToString("") { "%02x".format(it) }
 
     companion object {
+        /** True when [plugin] set `openSettings` (a plain field of upstream's Plugin: reading it runs no plugin code). */
+        fun hasSettings(plugin: BasePlugin): Boolean = (plugin as? Plugin)?.openSettings != null
+
         const val MAX_CS3_BYTES = 20L shl 20
         private const val MAX_MANIFEST_BYTES = 64 * 1024
         private const val MARKER = "loading-"

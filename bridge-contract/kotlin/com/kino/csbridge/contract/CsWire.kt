@@ -56,6 +56,25 @@ object CsWire {
     }
 
     /**
+     * A plugin's own settings screen (PROTOCOL.md "Plugin settings"). Additive within v2: a bridge without it answers
+     * `installPlugin` without [HAS_SETTINGS] (read as false) and has no such activity.
+     */
+    object Settings {
+        /** Optional Boolean in the `installPlugin` result: the plugin set CloudStream's `openSettings` in its `load()`. */
+        const val HAS_SETTINGS = "hasSettings"
+        /** Explicit component (package [BRIDGE_PACKAGE]); requires [PERMISSION]. Start it for a result. */
+        const val ACTIVITY = "com.kino.csbridge.settings.PluginSettingsActivity"
+        /** String extra, required: the plugin's Kino id (the `pluginId` of its ops, `cloudstream-…`). */
+        const val EXTRA_PLUGIN_ID = "com.kino.csbridge.extra.PLUGIN_ID"
+        /** String extra on a `RESULT_CANCELED` result: one of the codes below or an [Err] code. */
+        const val EXTRA_ERROR = "com.kino.csbridge.extra.ERROR"
+        /** The plugin has no settings screen (`openSettings` is null after `load()`). */
+        const val NO_SETTINGS = "no_settings"
+        /** Started on a television: the bridge does not show plugin settings there. */
+        const val UNSUPPORTED_DEVICE = "unsupported_device"
+    }
+
+    /**
      * Reads one `IReply.doneStream` result to its end and closes [result]: the result JSON, or an error JSON
      * ([Err.TOO_LARGE] over [MAX_STREAM_RESULT_BYTES], [Err.STREAM_BROKEN] when the pipe ended without the writer's OK
      * or the bytes are not UTF-8). Blocking: run it off the binder thread, and close [result] from elsewhere to stop it

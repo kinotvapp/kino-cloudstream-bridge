@@ -6,7 +6,8 @@ pinned at upstream commit `4e2516d56ecd42c22c52e461980625fe3f3d559a` (branch `ki
 ## What the fork adds
 
 A headless Android application, `:bridge` (`com.kino.csbridge`), that hosts the CloudStream plugin
-runtime for Kino. It has no UI and holds **no network permission**: every request a plugin makes
+runtime for Kino. Its only UI is a transparent host for a plugin's own settings dialog, which only Kino can start
+(`bridge-contract/PROTOCOL.md`, "Plugin settings"), and it holds **no network permission**: every request a plugin makes
 goes through Kino over IPC. The IPC contract lives in `bridge-contract/` (copied verbatim from Kino,
 never edited here).
 

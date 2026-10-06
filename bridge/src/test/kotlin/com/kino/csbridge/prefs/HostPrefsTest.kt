@@ -76,7 +76,7 @@ class HostPrefsTest {
 
     private fun store(timeoutMs: Long = 2_000, maxDirty: Int = HostStore.MAX_DIRTY, stallMs: Long = HostStore.STALL_MS) =
         HostStore({ installed }, { host }, readTimeoutMs = timeoutMs, writeTimeoutMs = timeoutMs, maxDirty = maxDirty,
-            stallMs = stallMs, log = { logs += it })
+            stallMs = stallMs, log = { logs += it }, settingsOwner = { null })
 
     private fun latch() = CountDownLatch(1).also { latches += it }
 
@@ -447,5 +447,29 @@ class HostPrefsTest {
     private companion object {
         const val A = "cloudstream-alpha-aaaaaa"
         const val B = "cloudstream-beta-bbbbbb"
+    }
+
+    @Test fun `an open settings screen owns writes made without a live call, even with two plugins installed`() {
+        installed = listOf("cloudstream-a", "cloudstream-b")
+        var owner: String? = "cloudstream-b"
+        val s = HostStore({ installed }, { host }, log = { logs += it }, settingsOwner = { owner })
+        assertTrue(HostPrefs(s, "cfg").edit().putString("k", "v").commit())
+        assertEquals("v", stored("cloudstream-b", "\u0000cfg\u0000k"))
+        assertNull(kino.stores["cloudstream-a"])
+        // A live op still wins: its plugin is known for certain.
+        asPlugin("cloudstream-a") { assertTrue(HostPrefs(s, "cfg").edit().putString("k", "op").commit()) }
+        assertEquals("op", stored("cloudstream-a", "\u0000cfg\u0000k"))
+        // Closed: back to the old rules (two plugins, so memory only).
+        owner = null
+        assertTrue(HostPrefs(s, "cfg").edit().putString("k", "mem").commit())
+        assertEquals("v", stored("cloudstream-b", "\u0000cfg\u0000k"))
+        assertTrue(logs.contains(HostStore.UNATTRIBUTED))
+    }
+
+    @Test fun `a settings owner that is not a CloudStream id is ignored`() {
+        installed = listOf("cloudstream-a")
+        val s = HostStore({ installed }, { host }, log = { logs += it }, settingsOwner = { "other" })
+        assertTrue(HostPrefs(s, "cfg").edit().putString("k", "v").commit())
+        assertEquals("v", stored("cloudstream-a", "\u0000cfg\u0000k"))
     }
 }

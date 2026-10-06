@@ -54,4 +54,16 @@ class CallerCheckTest {
         shadowOf(context.packageManager).setPackagesForUid(uid, CallerCheck.KINO_PACKAGE)
         assertFalse(CallerCheck.isKino(context, uid))
     }
+
+    @Test fun `a calling package is trusted only when it is kino with our signature`() {
+        install(context.packageName, "aa"); install(CallerCheck.KINO_PACKAGE, "aa"); install("evil.app", "aa")
+        assertTrue(CallerCheck.isKinoPackage(context, CallerCheck.KINO_PACKAGE))
+        assertFalse(CallerCheck.isKinoPackage(context, "evil.app"))
+        assertFalse(CallerCheck.isKinoPackage(context, null)) // a start not for a result has no calling package
+    }
+
+    @Test fun `a calling package that is kino signed by someone else is refused`() {
+        install(context.packageName, "aa"); install(CallerCheck.KINO_PACKAGE, "bb")
+        assertFalse(CallerCheck.isKinoPackage(context, CallerCheck.KINO_PACKAGE))
+    }
 }

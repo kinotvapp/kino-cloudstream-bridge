@@ -97,3 +97,33 @@ class ThrowingGetterApi : MainAPI() {
 class ThrowingGetterPlugin : Plugin() {
     override fun load(context: Context) { registerMainAPI(ThrowingGetterApi()) }
 }
+
+/**
+ * Has a settings screen (CloudStream's `openSettings`), as plugins set it in `load()`. [mode] picks what the screen
+ * does: write prefs from the screen's Context and from a thread of its own, show a dialog, or throw.
+ */
+class SettingsPlugin : Plugin() {
+    override fun load(context: Context) {
+        registerMainAPI(FixtureApi())
+        openSettings = { ctx ->
+            opened.incrementAndGet()
+            when (mode) {
+                Mode.WRITE -> {
+                    ctx.getSharedPreferences("cfg", Context.MODE_PRIVATE).edit().putString("quality", "1080").apply()
+                    // Plugins also save from their own threads (no op there either).
+                    val t = Thread { ctx.applicationContext.getSharedPreferences("cfg", Context.MODE_PRIVATE).edit().putBoolean("bg", true).commit() }
+                    t.start(); t.join()
+                }
+                Mode.DIALOG -> dialog = android.app.AlertDialog.Builder(ctx).setMessage("settings").show()
+                Mode.THROW -> error("boom https://x.example/p?token=secret")
+            }
+        }
+    }
+    enum class Mode { WRITE, DIALOG, THROW }
+    companion object {
+        @Volatile var mode = Mode.WRITE
+        @Volatile var dialog: android.app.Dialog? = null
+        val opened = java.util.concurrent.atomic.AtomicInteger()
+        fun reset() { mode = Mode.WRITE; dialog = null; opened.set(0) }
+    }
+}

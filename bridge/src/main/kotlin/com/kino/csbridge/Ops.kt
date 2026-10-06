@@ -160,7 +160,8 @@ object Ops {
             throw t
         }
         val json = JSONObject().put("name", res.name).put("version", res.version).put("providers", providers)
-            .put("missingSymbols", JSONArray(res.missingSymbols.take(MAX_MISSING).map { it.take(300) })).toString()
+            .put("missingSymbols", JSONArray(res.missingSymbols.take(MAX_MISSING).map { it.take(300) }))
+            .put(CsWire.Settings.HAS_SETTINGS, res.hasSettings).toString()
         return json to res.missingSymbols.isEmpty()
     }
 

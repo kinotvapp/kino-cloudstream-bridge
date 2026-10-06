@@ -7,6 +7,7 @@ import com.kino.csbridge.CallContext
 import com.kino.csbridge.HostLink
 import com.kino.csbridge.contract.CsWire
 import com.kino.csbridge.contract.IHost
+import com.kino.csbridge.settings.SettingsSession
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.ArrayBlockingQueue
@@ -29,8 +30,9 @@ import java.util.concurrent.atomic.AtomicLong
  * through `IHost.storage` (spec §5.6). Nothing is ever written in the bridge's data dir. [HostPrefs] are views of one
  * SharedPreferences name over this store; all names of one plugin share that plugin's 256 KB quota.
  *
- * **Owner of a call:** the plugin of the live [CallContext]; else the only installed plugin; else nobody, and the value
- * is kept in this process's memory only (logged once per key, never naming it). The context is read from the thread
+ * **Owner of a call:** the plugin of the live [CallContext]; else the plugin whose settings screen is open
+ * ([SettingsSession]); else the only installed plugin; else nobody, and the value is kept in this process's memory only
+ * (logged once per key, never naming it). The context is read from the thread
  * local, which follows an op's coroutines. Work a plugin starts outside its op (own scopes, raw threads, callbacks)
  * falls to the second or third rule. Extractors are global: plugin B's extractor run inside plugin A's op writes to A's
  * storage, which is expected (it is A's op).
@@ -60,6 +62,7 @@ class HostStore(
     private val stallMs: Long = STALL_MS,
     private val log: (String) -> Unit = ::defaultLog,
     private val readExecutor: ExecutorService = sharedReadExecutor,
+    private val settingsOwner: () -> String? = { SettingsSession.pluginId() },
 ) {
     private data class Slot(val pluginId: String, val key: String)
     private class Batch { @Volatile var failed = false; val dropLogged = AtomicBoolean() }
@@ -85,6 +88,7 @@ class HostStore(
     /** The plugin whose Kino storage serves this call, or null for this process's memory. */
     private fun owner(): String? {
         CallContext.current()?.pluginId?.takeIf { it.startsWith(ID_PREFIX) }?.let { return it }
+        settingsOwner()?.takeIf { it.startsWith(ID_PREFIX) }?.let { return it }
         return try { installedIds().singleOrNull() } catch (_: Exception) { null }
     }
 
@@ -261,7 +265,7 @@ class HostStore(
     /** Tests only: commit() futures held by pending writes. */
     internal fun waiterCount(): Int = overlay.values.sumOf { it.waiters.size }
 
-    /** Tests only: true once every pending write was acknowledged or dropped. */
+    /** True once every pending write was acknowledged or dropped (tests, and the settings screen before it closes). */
     internal fun awaitIdle(timeoutMs: Long): Boolean {
         val until = System.nanoTime() + timeoutMs * 1_000_000
         while (overlay.isNotEmpty() || queue.isNotEmpty()) {

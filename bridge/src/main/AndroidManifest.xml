@@ -9,5 +9,12 @@
         android:extractNativeLibs="false" tools:replace="android:label">
         <service android:name=".BridgeService" android:exported="true"
             android:permission="com.arkiv.player.permission.CLOUDSTREAM_BRIDGE" android:process=":plugins" />
+        <!-- A plugin's own settings (PROTOCOL.md "Plugin settings"): explicit start for a result by Kino only, no
+             intent filter; the plugin's classes live in :plugins. Config changes never recreate it (the plugin's dialog
+             would be lost, and its fragments cannot be restored). -->
+        <activity android:name=".settings.PluginSettingsActivity" android:exported="true"
+            android:permission="com.arkiv.player.permission.CLOUDSTREAM_BRIDGE" android:process=":plugins"
+            android:theme="@style/Theme.KinoBridge.PluginSettings" android:excludeFromRecents="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|layoutDirection" />
     </application>
 </manifest>
