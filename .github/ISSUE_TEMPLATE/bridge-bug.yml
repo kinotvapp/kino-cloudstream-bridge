@@ -1,0 +1,47 @@
+name: Kino bridge bug
+description: Something wrong in the Kino CloudStream bridge (com.kino.csbridge) while used from Kino
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This form is for the bridge that runs CloudStream extensions inside Kino. CloudStream app bugs go to
+        recloudstream/cloudstream; extension bugs go to the extension's repository.
+        Please do not paste links to streams, video pages or extension repositories, and remove URLs from logs.
+  - type: input
+    id: bridge-version
+    attributes:
+      label: Bridge version
+      description: The bridge app's version in Android Settings > Apps (versionName, e.g. 1.0.2).
+    validations:
+      required: true
+  - type: input
+    id: kino-version
+    attributes:
+      label: Kino version
+    validations:
+      required: true
+  - type: input
+    id: plugin
+    attributes:
+      label: Extension
+      description: The extension's name and version as Kino lists it (no repository URL).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what you expected
+      placeholder: |
+        1. Opened ...
+        2. Picked ...
+        3. Got ...
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device and Android version
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (without URLs)
+      description: The error Kino showed, or a logcat excerpt with every URL removed.
+      render: text
