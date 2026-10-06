@@ -18,7 +18,8 @@ Inputs (any mix, first occurrence of a class wins, like a classpath):
 A member that the walk finds first in a class where it is private counts as missing (it would not link).
 
 Parity (release vs debug): --parity-reference REF_APK with --parity-prefix P (repeatable, internal-name prefixes such as
-`kotlin/`): every public class under those prefixes in REF_APK, and every public or protected method and field of it,
+`kotlin/`; each must match at least one reference class, so a renamed or vanished package fails instead of passing
+silently): every public class under those prefixes in REF_APK, and every public or protected method and field of it,
 must exist in the checked APK (a member may also resolve through a supertype, on the positional classpath: give the
 checked APK and the boot classpath there too). Compiler and R8 lambda artifacts are ignored (`$$` synthesized classes such as
 `$$ExternalSyntheticLambda0`, and members named `lambda$...`, `...$lambda$N`, `$r8$lambda$...`): no plugin links
@@ -324,7 +325,8 @@ def parity_missing(ref, checked, prefixes, resolver=None):
     """What [ref] (internal name -> ClassInfo) has under [prefixes] that [checked] lacks, as printable rows. A member the
     checked class no longer declares still counts when [resolver] (a Classpath over the checked dex + the boot
     classpath) resolves it through a supertype, as the runtime would (R8 drops redundant abstract redeclarations)."""
-    out = []
+    out = [f'prefix {p} matches no class of the reference APK (a dead prefix checks nothing)'
+           for p in prefixes if not any(n.startswith(p) for n in ref)]
     for name in sorted(ref):
         if not any(name.startswith(p) for p in prefixes) or '$$' in name:
             continue

@@ -362,6 +362,9 @@ class HostWebViewResolverTest {
         // Only case-insensitivity travels: line options mean nothing in a URL, and ICU's inline-flag support is not relied on.
         assertEquals("(?-i)a.b", HostWebViewResolver.matchPattern(Regex("a.b", setOf(RegexOption.MULTILINE, RegexOption.DOT_MATCHES_ALL, RegexOption.UNIX_LINES))))
         assertEquals("a.b", HostWebViewResolver.matchPattern(Regex("a.b", setOf(RegexOption.DOT_MATCHES_ALL, RegexOption.IGNORE_CASE))))
+        // COMMENTS changes the meaning of the pattern itself: refused rather than sent without it.
+        assertNull(HostWebViewResolver.matchPattern(Regex("m3u8  # playlist", RegexOption.COMMENTS)))
+        assertNull(HostWebViewResolver.matchPattern(Regex("m3u8", setOf(RegexOption.COMMENTS, RegexOption.IGNORE_CASE))))
         // A literal pattern is quoted: its metacharacters are plain text, as Pattern.LITERAL makes them.
         val lit = HostWebViewResolver.matchPattern(Regex.fromLiteral("a.b\\E(c"))!!
         assertTrue(Regex(lit.removePrefix("(?-i)")).matches("a.b\\E(c")); assertFalse(Regex(lit.removePrefix("(?-i)")).matches("axb\\E(c"))

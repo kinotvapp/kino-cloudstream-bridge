@@ -2,18 +2,18 @@ package com.kino.csbridge
 
 import android.content.Context
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import com.kino.csbridge.contract.CsWire
 import com.kino.csbridge.ops.PluginWork
 import com.kino.csbridge.ops.ProviderOps
 import com.kino.csbridge.plugins.PluginRegistry
 import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.TvType
-import org.json.JSONArray
-import org.json.JSONObject
-import android.util.Log
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
@@ -114,9 +114,11 @@ object Ops {
         val id = req.pluginId
         val stuck = PluginWork.busy(id)
         val own = dupPayload(pfd)
-        // The generation this install created, or -1 when it stored nothing.
-        // A rollback has no op to end its waits: it is bounded by ROLLBACK_WAIT_MS in total (a provider op whose load()
-        // of this plugin hangs would otherwise hold a registry thread and this plugin's Mutex until that load returns).
+        // Gets the generation this install created, or -1 when it stored nothing.
+        // A rollback has no op to end its waits: the WAITS are bounded by ROLLBACK_WAIT_MS in total (a provider op whose
+        // load() of this plugin hangs would otherwise hold a registry thread and this plugin's Mutex until that load
+        // returns). Once the plugin's lock is taken the remove itself is not bounded by it: beforeUnload() is waited on
+        // for at most PluginRegistry.BEFORE_UNLOAD_MS, but the unregister and the file/index IO that follow run to the end.
         val rollback: suspend (Pair<String, Long>) -> Unit = rollback@{ (_, gen) ->
             if (gen < 0) return@rollback
             val until = System.nanoTime() + ROLLBACK_WAIT_MS * 1_000_000
@@ -127,7 +129,10 @@ object Ops {
                         if (genOf(id).get() == gen) removeCounted(reg, id, existed = true) { reg.remove(id, maxWaitMs = left) }
                     }
                 }
-            } catch (_: PluginRegistry.RegistryException) { null }
+            } catch (e: PluginRegistry.RegistryException) {
+                if (e.code != CsWire.Err.TIMEOUT) throw e // only "plugin busy" means the wait ran out
+                null
+            }
             if (done == null) runCatching { Log.w("KinoBridge", "late install of $id not rolled back: plugin busy for ${ROLLBACK_WAIT_MS / 1_000} s") }
         }
         return PluginWork.run(id, on = PluginWork.registryDispatcher, onLateResult = rollback, onDispose = { runCatching { own.close() } }) {

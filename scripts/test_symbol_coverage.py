@@ -103,6 +103,8 @@ class OracleTest(unittest.TestCase):
         shrunk = {'k/A': sc.ClassInfo('k/A', None, [], {('f', '()V'): 0x1}, {})}
         self.assertEqual(sc.parity_missing(ref, shrunk, ['k/']), ['M k/A.r()V', 'F k/A.X:I'])
         self.assertEqual(sc.parity_missing(ref, {}, ['k/']), ['class k/A'])
+        # A prefix that matches nothing in the reference (j$ gone from debug, a package renamed) is a failure.
+        self.assertEqual(sc.parity_missing(ref, full, ['k/', 'j$/']), ['prefix j$/ matches no class of the reference APK (a dead prefix checks nothing)'])
         # A member the class dropped but a supertype declares (R8 removes redundant abstract redeclarations) still links.
         self.assertEqual(sc.parity_missing({'fx/Sub': sc.ClassInfo('fx/Sub', 'fx/Impl', [], {('own', '(Ljava/lang/String;)J'): 0x1}, {}, 0x1)},
                                            {'fx/Sub': sc.ClassInfo('fx/Sub', 'fx/Impl', [], {}, {})}, ['fx/'], resolver=self.cp), [])

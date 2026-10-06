@@ -96,9 +96,12 @@ object HostWebViewResolver {
      * case-insensitive itself it is sent as `(?-i)…`: Kino then picks the same first match upstream would. A LITERAL
      * regex is quoted. No other option is forwarded: the pattern runs against URLs, which have no line terminators
      * (MULTILINE, DOT_MATCHES_ALL, UNIX_LINES change nothing there), and Kino compiles with Android's ICU Pattern, whose
-     * support for every inline flag is not something to depend on. Null = refused.
+     * support for every inline flag is not something to depend on. COMMENTS is the exception: dropping it would change
+     * what the pattern means (its whitespace and `#` comments would become literal), so such a regex is refused. Null =
+     * refused.
      */
     fun matchPattern(match: Regex): String? {
+        if (RegexOption.COMMENTS in match.options) return null
         val pattern = if (RegexOption.LITERAL in match.options) java.util.regex.Pattern.quote(match.pattern) else match.pattern.ifEmpty { "(?:)" }
         val sent = if (RegexOption.IGNORE_CASE in match.options) pattern else "(?-i)$pattern"
         return sent.takeIf { it.length <= MAX_MATCH_CHARS }
@@ -133,7 +136,7 @@ object HostWebViewResolver {
             return Outcome.Failed(REFUSED_LOCALLY)
         }
         val pattern = if (match == null) null else matchPattern(match) ?: run {
-            log("webview ${start.host}: match pattern over $MAX_MATCH_CHARS chars, not sent")
+            log("webview ${start.host}: match pattern refused (over $MAX_MATCH_CHARS chars, or COMMENTS), not sent")
             return Outcome.Failed(REFUSED_LOCALLY)
         }
         if (pattern == null && waitForCookie == null) return Outcome.Failed(REFUSED_LOCALLY)
@@ -170,7 +173,7 @@ object HostWebViewResolver {
     /** [alsoMatch] as sent: each through [matchPattern], at most [CsWire.WebView.MAX_ALSO_MATCH]; what does not fit is logged. */
     private fun alsoPatterns(host: String, alsoMatch: List<Regex>): List<String> {
         val fit = alsoMatch.mapNotNull { matchPattern(it) }
-        if (fit.size < alsoMatch.size) log("webview $host: ${alsoMatch.size - fit.size} additional pattern(s) over $MAX_MATCH_CHARS chars, not sent")
+        if (fit.size < alsoMatch.size) log("webview $host: ${alsoMatch.size - fit.size} additional pattern(s) refused (over $MAX_MATCH_CHARS chars, or COMMENTS), not sent")
         if (fit.size > CsWire.WebView.MAX_ALSO_MATCH) log("webview $host: only the first ${CsWire.WebView.MAX_ALSO_MATCH} additional patterns sent")
         return fit.take(CsWire.WebView.MAX_ALSO_MATCH)
     }
