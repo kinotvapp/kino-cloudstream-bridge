@@ -56,3 +56,10 @@ Exception: `bridge-contract/` (the AIDL and wire protocol shared with Kino) is A
 
 Release signing reads `KINO_KEYSTORE_PATH`, `KINO_KEYSTORE_PASSWORD`, `KINO_KEY_ALIAS`, `KINO_KEY_PASSWORD`.
 Version: `-PbridgeVersionCode=N -PbridgeVersionName=X.Y.Z`.
+
+Release is minified, but plugins link against this APK by name at runtime, so `bridge/proguard-rules.pro` keeps the
+whole plugin-facing API (CloudStream, NiceHttp and the libraries plugins use) unrenamed and unoptimised; R8 only drops
+what nothing can reach. `assembleRelease` runs `verifyPluginAbiRelease`: the symbol oracle plus
+`bridge/release-symbols.tsv` (the bridge's own reflection targets and the compat constructors with their `$default`
+forms) against the release dex, so a keep-rule gap fails the build. `src/main/baseline-prof.txt` is a hand-written
+baseline profile of the cold bind/hello/first-load path.

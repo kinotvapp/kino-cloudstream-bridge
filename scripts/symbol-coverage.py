@@ -16,6 +16,11 @@ Inputs (any mix, first occurrence of a class wins, like a classpath):
   - --classpath-file FILE: one such path per line (written by the :bridge Gradle task)
 
 A member that the walk finds first in a class where it is private counts as missing (it would not link).
+
+--reflective FILE (repeatable): symbols the bridge itself reaches by reflection (getDeclaredMethod / getDeclaredField /
+getMethod on the class that declares it), so R8 must keep them: TSV `kind<TAB>symbol<TAB>reason`, same symbol syntax.
+Such a member counts only when the owner class itself declares it, with any access (private is fine: the bridge calls
+setAccessible). No allowlist applies to them; any missing row fails.
 Exit 1 when a symbol is missing and not in the allowlist, or when an allowlist row is stale (it resolves now),
 malformed (no reason), duplicated, or not in the symbol list. Classpath entries that do not exist are printed. Allowlist rows: `<symbol><TAB or spaces><one-line reason>`; `#` starts a comment line.
 """
@@ -227,6 +232,13 @@ class Classpath:
             queue.extend(info.ifaces)
         return 'not declared'
 
+    def resolve_declared(self, owner, kind, key):
+        """Reflection's view: declared on [owner] itself, any access. None when found, else why not."""
+        info = self.get(owner)
+        if info is None:
+            return 'no owner class'
+        return None if key in (info.methods if kind == 'M' else info.fields) else 'not declared on the class itself'
+
 
 
 # ---------------------------------------------------------------------------------------------- symbols
@@ -281,11 +293,27 @@ def read_allowlist(path):
     return allow, bad
 
 
+def read_reflective(path):
+    """Rows of a --reflective file: (kind, symbol, reason); `#` lines and the `kind` header are skipped."""
+    rows = []
+    with open(path, encoding='utf-8') as f:
+        for n, line in enumerate(f, 1):
+            s = line.rstrip('\n')
+            if not s.strip() or s.startswith('#') or s.startswith('kind\t'):
+                continue
+            cols = s.split('\t')
+            if len(cols) < 3 or cols[0] not in ('T', 'M', 'F') or not cols[2].strip():
+                raise ValueError(f'{path}:{n}: expected kind<TAB>symbol<TAB>reason: {s}')
+            rows.append((cols[0], cols[1], cols[2]))
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--symbols', required=True, help='cs3-symbols.tsv')
     ap.add_argument('--allowlist', help='symbol-allowlist.txt')
     ap.add_argument('--classpath-file', action='append', default=[], help='file listing one class dir/jar/dex per line')
+    ap.add_argument('--reflective', action='append', default=[], help='symbols reached by reflection (see above)')
     ap.add_argument('paths', nargs='*', help='class dirs, jars, dex or apk files')
     a = ap.parse_args()
 
@@ -334,10 +362,19 @@ def main():
         problems.append(f'stale allowlist row (resolves now, remove it): {s}')
     for s in unknown:
         problems.append(f'allowlist row not in the symbol list: {s}')
+    reflective_missing = 0
+    for path in a.reflective:
+        for kind, sym, reason in read_reflective(path):
+            owner, key = parse_symbol(kind, sym)
+            why = ('no class' if cp.get(owner) is None else None) if key is None else cp.resolve_declared(owner, kind, key)
+            if why is not None:
+                reflective_missing += 1
+                print(f'MISSING\treflective\t{kind}\t{sym}\t{why}\t({reason})')
+        print(f'reflective symbols checked: {path}')
     for p in problems:
         print('ERROR\t' + p)
-    print(f'missing (not allowlisted): {len(missing)}')
-    return 1 if missing or problems else 0
+    print(f'missing (not allowlisted): {len(missing)}' + (f'; reflective missing: {reflective_missing}' if a.reflective else ''))
+    return 1 if missing or problems or reflective_missing else 0
 
 
 if __name__ == '__main__':

@@ -6,6 +6,8 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+import javax.inject.Inject
+import org.gradle.process.ExecOperations
 
 plugins {
     // AGP 9 compiles Kotlin itself (built-in Kotlin), as upstream's :app does: no kotlin.android plugin.
@@ -337,13 +339,64 @@ abstract class VerifyReplacedClasses : DefaultTask() {
     }
 }
 
+// ---- Guard 3: the plugin ABI in the APK's dex (release: after R8) ------------------------------------------------
+// The symbol oracle (cs3-symbols.tsv minus symbol-allowlist.txt) and release-symbols.tsv (what the bridge itself needs
+// by name: reflection targets, the compat constructors and their $default forms) run against the variant's dex + the
+// boot classpath. A keep-rule gap in proguard-rules.pro then fails the build, not a plugin on a TV. Wired into
+// assemble<Variant> for minified variants (debug has no R8 step; symbolCoverage covers its classpath).
+abstract class VerifyPluginAbi : DefaultTask() {
+    @get:InputFiles @get:PathSensitive(PathSensitivity.NONE) abstract val apkDir: DirectoryProperty
+    @get:InputFiles @get:PathSensitive(PathSensitivity.NONE) abstract val bootClasspath: ConfigurableFileCollection
+    @get:InputFile @get:PathSensitive(PathSensitivity.NONE) abstract val script: RegularFileProperty
+    @get:InputFile @get:PathSensitive(PathSensitivity.NONE) abstract val symbols: RegularFileProperty
+    @get:InputFile @get:PathSensitive(PathSensitivity.NONE) abstract val allowlist: RegularFileProperty
+    @get:InputFile @get:PathSensitive(PathSensitivity.NONE) abstract val reflective: RegularFileProperty
+    @get:OutputFile abstract val report: RegularFileProperty
+    @get:Inject abstract val execOps: ExecOperations
+
+    @TaskAction fun verify() {
+        val apks = apkDir.get().asFile.walkTopDown().filter { it.isFile && it.name.endsWith(".apk") }.toList()
+        if (apks.isEmpty()) throw GradleException("verifyPluginAbi: no APK in ${apkDir.get().asFile}")
+        val lines = mutableListOf<String>()
+        for (apk in apks) {
+            val out = ByteArrayOutputStream()
+            val result = execOps.exec {
+                commandLine(
+                    listOf("python3", script.get().asFile.absolutePath, "--symbols", symbols.get().asFile.absolutePath,
+                        "--allowlist", allowlist.get().asFile.absolutePath, "--reflective", reflective.get().asFile.absolutePath,
+                        apk.absolutePath) + bootClasspath.files.map { it.absolutePath },
+                )
+                standardOutput = out; errorOutput = out
+                isIgnoreExitValue = true
+            }
+            val text = out.toString(Charsets.UTF_8)
+            if (result.exitValue != 0) throw GradleException("verifyPluginAbi ${apk.name}: plugin ABI missing from the dex\n$text")
+            lines += "${apk.name}:"; lines += text.lines().filter { it.isNotBlank() }
+        }
+        report.get().asFile.apply { parentFile.mkdirs(); writeText(lines.joinToString("\n") + "\n") }
+    }
+}
+
 androidComponents.onVariants { variant ->
     val cap = variant.name.replaceFirstChar { it.uppercase() }
+    val apk = variant.artifacts.get(com.android.build.api.artifact.SingleArtifact.APK)
     val verify = tasks.register<VerifyReplacedClasses>("verifyReplacedClasses$cap") {
         description = "Fails when the $cap APK holds the library's WebViewResolver or calls WebView/CookieManager."
         group = "verification"
-        apkDir.set(variant.artifacts.get(com.android.build.api.artifact.SingleArtifact.APK))
+        apkDir.set(apk)
         report.set(layout.buildDirectory.file("verifyReplacedClasses/${variant.name}.txt"))
     }
-    tasks.matching { it.name == "assemble$cap" }.configureEach { dependsOn(verify) }
+    val abi = tasks.register<VerifyPluginAbi>("verifyPluginAbi$cap") {
+        description = "Fails when a symbol plugins link against (or the bridge reaches by name) is missing from the $cap dex."
+        group = "verification"
+        apkDir.set(apk)
+        bootClasspath.from(oracleBootClasspath)
+        script.set(rootProject.file("scripts/symbol-coverage.py"))
+        symbols.set(file("src/test/resources/cs3-symbols.tsv"))
+        allowlist.set(file("symbol-allowlist.txt"))
+        reflective.set(file("release-symbols.tsv"))
+        report.set(layout.buildDirectory.file("verifyPluginAbi/${variant.name}.txt"))
+    }
+    val minified = (variant as? com.android.build.api.variant.CanMinifyCode)?.isMinifyEnabled == true
+    tasks.matching { it.name == "assemble$cap" }.configureEach { dependsOn(verify); if (minified) dependsOn(abi) }
 }

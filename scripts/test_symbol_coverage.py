@@ -75,7 +75,22 @@ class OracleTest(unittest.TestCase):
         self.assertIn('no reason', bad[0])
         self.assertIn('duplicate', bad[1])
 
-    def run_main(self, rows, allow_text):
+    def test_reflective_rows_need_the_owner_itself_any_access(self):
+        self.assertIsNone(self.cp.resolve_declared('fx/Impl', 'M', ('hidden', '()V')))  # private is fine
+        self.assertEqual(self.cp.resolve_declared('fx/Sub', 'M', ('hidden', '()V')), 'not declared on the class itself')
+        self.assertEqual(self.cp.resolve_declared('fx/Sub', 'M', ('own', '(Ljava/lang/String;)J')), 'not declared on the class itself')
+        self.assertEqual(self.cp.resolve_declared('fx/Nope', 'F', ('x', 'I')), 'no owner class')
+
+    def test_reflective_file_rejects_rows_without_a_reason(self):
+        with tempfile.NamedTemporaryFile('w', suffix='.tsv', delete=False) as f:
+            f.write('kind\tsymbol\treason\n# c\nM\tfx.Impl.hidden()V\n')
+        try:
+            with self.assertRaises(ValueError):
+                sc.read_reflective(f.name)
+        finally:
+            os.unlink(f.name)
+
+    def run_main(self, rows, allow_text, reflective=None):
         with tempfile.TemporaryDirectory() as d:
             tsv, allow = os.path.join(d, 's.tsv'), os.path.join(d, 'a.txt')
             with open(tsv, 'w') as f:
@@ -84,6 +99,11 @@ class OracleTest(unittest.TestCase):
                 f.write(allow_text)
             argv = sys.argv
             sys.argv = ['symbol-coverage.py', '--symbols', tsv, '--allowlist', allow, self.classes]
+            if reflective is not None:
+                refl = os.path.join(d, 'r.tsv')
+                with open(refl, 'w') as f:
+                    f.write('kind\tsymbol\treason\n' + ''.join(f'{k}\t{s}\tbecause\n' for k, s in reflective))
+                sys.argv += ['--reflective', refl]
             try:
                 with open(os.devnull, 'w') as null:
                     stdout, sys.stdout = sys.stdout, null
@@ -99,6 +119,8 @@ class OracleTest(unittest.TestCase):
         self.assertEqual(self.run_main([('M', 'fx.Sub.hidden()V')], ''), 1)
         self.assertEqual(self.run_main([('M', 'fx.Sub.hidden()V')], 'fx.Sub.hidden()V\tprivate on purpose\n'), 0)
         self.assertEqual(self.run_main([('T', 'fx.Sub')], 'fx.Sub\tstale row\n'), 1)
+        self.assertEqual(self.run_main([('T', 'fx.Sub')], '', reflective=[('M', 'fx.Impl.hidden()V'), ('T', 'fx.Base')]), 0)
+        self.assertEqual(self.run_main([('T', 'fx.Sub')], '', reflective=[('M', 'fx.Sub.hidden()V')]), 1)
 
 
 if __name__ == '__main__':

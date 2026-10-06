@@ -1,0 +1,48 @@
+# GPL-3.0 (this fork). Baseline profile, written by hand (upstream has no Macrobenchmark / baseline-profile module to
+# generate one from). The cold path Kino waits on: process start, bind, hello, the first op loading a stored plugin
+# (index read, ABI check with dexlib2, plugin class loading), and the NiceHttp client every plugin request goes through.
+# AGP merges this into assets/dexopt/baseline.prof; androidx.profileinstaller (already in the APK) installs it on
+# sideloaded devices. Task 9 part B measures cold bind with and without it (target: hello within 400 ms on the Fire TV).
+
+# Process start: BridgeApp.onCreate sets CloudStreamApp.context and puts the IPC interceptor under NiceHttp's clients.
+HSPLcom/kino/csbridge/BridgeApp;->**(**)**
+HSPLcom/kino/csbridge/CloudStreamContextKt;->**(**)**
+HSPLcom/kino/csbridge/net/NetworkShim;->**(**)**
+HSPLcom/kino/csbridge/net/CallCapture;->**(**)**
+HSPLcom/lagradost/cloudstream3/MainActivityKt;->**(**)**
+HSPLcom/lagradost/nicehttp/Requests;->**(**)**
+HSPLcom/lagradost/nicehttp/RequestsKt;->**(**)**
+
+# Bind and hello: the service, its binder, the caller check, the host link, the contract codec, the stored-plugin index.
+HSPLcom/kino/csbridge/BridgeService;->**(**)**
+HSPLcom/kino/csbridge/BridgeService$**;->**(**)**
+HSPLcom/kino/csbridge/CallerCheck;->**(**)**
+HSPLcom/kino/csbridge/HostLink;->**(**)**
+HSPLcom/kino/csbridge/CallContext;->**(**)**
+HSPLcom/kino/csbridge/CallContext$**;->**(**)**
+HSPLcom/kino/csbridge/contract/**;->**(**)**
+HSPLcom/kino/csbridge/Ops;->**(**)**
+HSPLcom/kino/csbridge/plugins/PluginRegistry;->**(**)**
+HSPLcom/kino/csbridge/plugins/PluginRegistry$**;->**(**)**
+HSPLcom/kino/csbridge/plugins/SafeNames;->**(**)**
+
+# First op on a stored plugin: the plugin pool, the ABI check (dexlib2 reads the .cs3), the load, the provider op.
+HSPLcom/kino/csbridge/ops/PluginWork;->**(**)**
+HSPLcom/kino/csbridge/ops/ProviderOps;->**(**)**
+HSPLcom/kino/csbridge/ops/ProviderOps$**;->**(**)**
+HSPLcom/kino/csbridge/plugins/SymbolChecker;->**(**)**
+HSPLcom/kino/csbridge/plugins/SymbolChecker$**;->**(**)**
+HSPLcom/android/tools/smali/dexlib2/dexbacked/**;->**(**)**
+HSPLcom/kino/csbridge/net/IpcInterceptor;->**(**)**
+HSPLcom/kino/csbridge/net/RedirectFlag;->**(**)**
+HSPLcom/kino/csbridge/prefs/HostStore;->**(**)**
+HSPLcom/kino/csbridge/prefs/HostPrefs;->**(**)**
+
+# The classes themselves: preloaded into the app image at install.
+Lcom/kino/csbridge/BridgeApp;
+Lcom/kino/csbridge/BridgeService;
+Lcom/kino/csbridge/Ops;
+Lcom/kino/csbridge/plugins/PluginRegistry;
+Lcom/kino/csbridge/plugins/SymbolChecker;
+Lcom/kino/csbridge/net/IpcInterceptor;
+Lcom/kino/csbridge/net/NetworkShim;
