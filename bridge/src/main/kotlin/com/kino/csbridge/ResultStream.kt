@@ -27,9 +27,12 @@ internal class StreamPipe(
 /**
  * Writes a large result into a [StreamPipe] (PROTOCOL.md "call, event, done, doneStream"), bounded in time.
  *
- * A blocking pipe write cannot be interrupted, and closing the descriptor from another thread does not wake it. So the
- * bridge keeps its own copy of the read end: at the deadline a watchdog marks the write abandoned and reads (discards)
- * from that copy, which frees the stuck write; the writer then sees the mark and ends the pipe with an error. Kino, which
+ * A blocking pipe write cannot be interrupted. Whether closing the descriptor from another thread wakes it differs: on
+ * the JVM it does not; on ART `ParcelFileDescriptor.close()` goes through libcore's `closeAndSignalBlockedThreads`,
+ * which probably does (a device check of Task 9 part B; `CsWire.readStreamedResult`'s KDoc relies on it for the read
+ * side). The design does not depend on either: the bridge keeps its own copy of the read end, and at the deadline a
+ * watchdog marks the write abandoned and reads (discards) from that copy, which frees the stuck write; the writer then
+ * sees the mark and ends the pipe with an error. Kino, which
  * has its own read end, sees EOF without the OK status (`bridge_stream_broken`). A state that only one side can claim
  * makes sure the drain never eats the bytes of a write that completed.
  *
@@ -98,9 +101,15 @@ internal object ResultStream {
         }
         finished.countDown()
         runCatching { pipe.closeWrite(error) }
-        // Abandoned: the watchdog drains until the close above gives it EOF; only then is the read end released.
-        drained.await(DRAIN_WAIT_MS, TimeUnit.MILLISECONDS)
-        runCatching { pipe.closeRead() }
+        // Abandoned: the watchdog drains until the close above gives it EOF; only then is the read end released. An
+        // interrupt (the service shutting its stream pool down) ends the wait early, never the release.
+        try {
+            drained.await(DRAIN_WAIT_MS, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } finally {
+            runCatching { pipe.closeRead() }
+        }
         return error == null
     }
 }

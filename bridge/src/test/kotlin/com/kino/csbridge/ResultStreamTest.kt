@@ -21,7 +21,7 @@ import kotlin.concurrent.thread
 @RunWith(RobolectricTestRunner::class)
 class ResultStreamTest {
     /** A [StreamPipe] over a real pipe; [ended] is the write end's closing status ("" = still open, null = OK). */
-    private class RealPipe {
+    private class RealPipe(closeSinkOnEnd: Boolean = true) {
         val nio: Pipe = Pipe.open()
         @Volatile var ended: String? = ""
         @Volatile var readReleased = false
@@ -29,7 +29,7 @@ class ResultStreamTest {
             readEnd = ParcelFileDescriptor.createPipe()[0],
             out = Channels.newOutputStream(nio.sink()),
             drain = Channels.newInputStream(nio.source()),
-            closeWrite = { err -> ended = err; nio.sink().close() },
+            closeWrite = { err -> ended = err; if (closeSinkOnEnd) nio.sink().close() },
             // Our own read end. Kino's copy is a separate descriptor; here both are the nio source, so it stays open.
             closeRead = { readReleased = true },
         )
@@ -67,7 +67,29 @@ class ResultStreamTest {
         assertEquals("write failed", p.ended)
     }
 
-    @Test fun `the stream window is what the op has left, within 5 to 60 s`() {
+    @Test fun `a writer interrupted while it waits for the drain still releases its read end`() {
+        val p = RealPipe(closeSinkOnEnd = false)
+        val done = java.util.concurrent.CountDownLatch(1)
+        val result = java.util.concurrent.atomic.AtomicReference<Boolean?>()
+        val thrown = java.util.concurrent.atomic.AtomicReference<Throwable?>()
+        // Nobody reads: at the 200 ms deadline the watchdog drains, and the writer then waits (up to 2 s) for the drain to
+        // see EOF. This pipe's write end stays open, so the drain never does and the writer sits in that wait.
+        val writer = thread {
+            try { result.set(ResultStream.write(p.stream, ByteArray(2 * 1024 * 1024), timeoutMs = 200)) } catch (t: Throwable) { thrown.set(t) }
+            done.countDown()
+        }
+        val end = System.nanoTime() + 3_000_000_000
+        while (p.ended == "" && System.nanoTime() < end) Thread.sleep(10)
+        assertEquals("deadline", p.ended)
+        writer.interrupt() // e.g. BridgeService.onDestroy's shutdownNow()
+        assertTrue(done.await(1, TimeUnit.SECONDS))
+        assertNull(thrown.get())
+        assertEquals(false, result.get())
+        assertTrue(p.readReleased)
+        p.nio.sink().close() // frees the watchdog's drain
+    }
+
+        @Test fun `the stream window is what the op has left, within 5 to 60 s`() {
         assertEquals(5_000L, ResultStream.windowMs(0, 5_000, 60_000))
         assertEquals(12_000L, ResultStream.windowMs(12_000, 5_000, 60_000))
         assertEquals(60_000L, ResultStream.windowMs(Long.MAX_VALUE, 5_000, 60_000))

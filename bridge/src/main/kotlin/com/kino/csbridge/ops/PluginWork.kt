@@ -33,8 +33,15 @@ internal object PluginWork {
     /** Tests swap it for a smaller pool. */
     @Volatile internal var dispatcher: CoroutineDispatcher = defaultDispatcher
 
+    /**
+     * Threads of [registryDispatcher]. Only plugin code that never returns (a hung `load()` or `beforeUnload()` past its
+     * wait) keeps one: waits for a plugin's lock give up with their op, so it takes [REGISTRY_THREADS] plugins hung
+     * inside an install at once to delay other installs (they then run as soon as a thread frees).
+     */
+    const val REGISTRY_THREADS = 4
+
     /** Installs, removes and late-result rollbacks: daemon threads, created once per process. */
-    val registryDispatcher: CoroutineDispatcher = Executors.newFixedThreadPool(2) { r ->
+    val registryDispatcher: CoroutineDispatcher = Executors.newFixedThreadPool(REGISTRY_THREADS) { r ->
         Thread(r, "plugin-registry").apply { isDaemon = true }
     }.asCoroutineDispatcher()
 
@@ -63,7 +70,7 @@ internal object PluginWork {
     suspend fun <T> run(
         pluginId: String,
         on: CoroutineDispatcher = dispatcher,
-        onLateResult: ((T) -> Unit)? = null,
+        onLateResult: (suspend (T) -> Unit)? = null,
         onDispose: (() -> Unit)? = null,
         block: suspend () -> T,
     ): T {
@@ -97,7 +104,7 @@ internal object PluginWork {
         }
     }
 
-    private fun <T> late(onLateResult: ((T) -> Unit)?, r: T) {
+    private fun <T> late(onLateResult: (suspend (T) -> Unit)?, r: T) {
         if (onLateResult == null) return
         CoroutineScope(registryDispatcher).launch { runCatching { onLateResult(r) } }
     }

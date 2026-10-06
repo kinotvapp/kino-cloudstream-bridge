@@ -93,11 +93,22 @@ object HostWebViewResolver {
     /**
      * A pattern as Kino accepts it (1..[MAX_MATCH_CHARS] chars, the limit checked on what is sent); an empty pattern
      * matches anything, as it does upstream. Kino compiles it with IGNORE_CASE, so unless the plugin's regex is
-     * case-insensitive itself it is sent as `(?-i)…`: Kino then picks the same first match upstream would. Null = refused.
+     * case-insensitive itself it is sent as `(?-i)…`: Kino then picks the same first match upstream would. The plugin's
+     * other options travel the same way, as inline flags: MULTILINE `m`, DOT_MATCHES_ALL `s`, COMMENTS `x`, UNIX_LINES
+     * `d` (e.g. `(?ms-i)…`); LITERAL quotes the pattern. CANON_EQ has no inline form and is dropped (it only matters for
+     * decomposed Unicode, never in a URL). Null = refused.
      */
     fun matchPattern(match: Regex): String? {
-        val pattern = match.pattern.ifEmpty { "(?:)" }
-        val sent = if (RegexOption.IGNORE_CASE in match.options) pattern else "(?-i)$pattern"
+        val o = match.options
+        val pattern = if (RegexOption.LITERAL in o) java.util.regex.Pattern.quote(match.pattern) else match.pattern.ifEmpty { "(?:)" }
+        val on = buildString {
+            if (RegexOption.MULTILINE in o) append('m')
+            if (RegexOption.DOT_MATCHES_ALL in o) append('s')
+            if (RegexOption.COMMENTS in o) append('x')
+            if (RegexOption.UNIX_LINES in o) append('d')
+        }
+        val off = if (RegexOption.IGNORE_CASE in o) "" else "-i"
+        val sent = if (on.isEmpty() && off.isEmpty()) pattern else "(?$on$off)$pattern"
         return sent.takeIf { it.length <= MAX_MATCH_CHARS }
     }
 

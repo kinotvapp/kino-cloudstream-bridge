@@ -78,9 +78,9 @@ class HostStore(
         Thread(::drain, "bridge-storage-writer").apply { isDaemon = true; start() }
     }
 
-    /** The write in flight: when it started (nanoTime, 0 = none) and for which plugin. */
-    @Volatile private var sendingSince = 0L
-    @Volatile private var sendingPlugin = ""
+    /** The write in flight: for which plugin and since when ([System.nanoTime]). One object, so the watchdog never pairs one write's start with another's plugin. */
+    private class Sending(val pluginId: String, val since: Long)
+    @Volatile private var sending: Sending? = null
 
     /** The plugin whose Kino storage serves this call, or null for this process's memory. */
     private fun owner(): String? {
@@ -226,13 +226,13 @@ class HostStore(
 
     /** Logs once per stalled write; the plugin id only. */
     private fun watch() {
-        var logged = 0L
+        var logged: Sending? = null
         while (true) {
             try { Thread.sleep((stallMs / 4).coerceIn(10, 1_000)) } catch (_: InterruptedException) { continue }
-            val since = sendingSince
-            if (since != 0L && since != logged && System.nanoTime() - since > stallMs * 1_000_000) {
-                logged = since
-                log("storage writer stalled > ${stallMs / 1_000} s (plugin=$sendingPlugin)")
+            val s = sending ?: continue
+            if (s !== logged && System.nanoTime() - s.since > stallMs * 1_000_000) {
+                logged = s
+                log("storage writer stalled > ${stallMs / 1_000} s (plugin=${s.pluginId})")
             }
         }
     }
@@ -244,10 +244,9 @@ class HostStore(
         repeat(2) {
             val h = host()
             val answer = if (h == null) null else try {
-                sendingPlugin = slot.pluginId
-                sendingSince = System.nanoTime().coerceAtLeast(1)
+                sending = Sending(slot.pluginId, System.nanoTime())
                 h.storage(body)
-            } catch (_: Exception) { null } finally { sendingSince = 0L }
+            } catch (_: Exception) { null } finally { sending = null }
             if (answer != null) {
                 val err = CsWire.errorOf(answer) ?: return true
                 log("storage $name refused: ${err.first} (plugin=${slot.pluginId})")

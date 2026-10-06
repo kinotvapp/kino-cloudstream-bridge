@@ -143,7 +143,9 @@ class BridgeService : Service() {
         scope.cancel()
         timers.cancel()
         executor.shutdown()
-        streamExecutor.shutdownNow() // interrupts nothing stuck in a pipe write, but drops queued work at once
+        // Interrupts the stream threads: a write blocked in a pipe ignores it (its watchdog's deadline frees it), a writer
+        // waiting for the drain stops waiting and releases its read end. Nothing is ever queued (streamSlots).
+        streamExecutor.shutdownNow()
         super.onDestroy()
     }
 

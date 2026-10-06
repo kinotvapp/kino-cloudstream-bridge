@@ -10,6 +10,8 @@ import com.lagradost.cloudstream3.MainAPI
 import com.lagradost.cloudstream3.TvType
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
@@ -51,15 +53,37 @@ object Ops {
         CsWire.error(e.code, e.message ?: e.code)
     }
 
-    /** Per plugin: one install, remove or rollback at a time, and how many installs and removes have started. */
     /**
-     * Per plugin: one install, remove or rollback at a time, and a generation that only a real change bumps (an install
-     * that stored a version, a remove of a stored plugin, a rollback), always inside that plugin's lock.
+     * Per plugin: one install, remove or rollback at a time, and a generation that every change of what is stored bumps
+     * (an install that stored a version, one that stored and then removed it, a remove of a stored plugin even if it
+     * failed half-way, a rollback), always inside that plugin's lock. The lock is a coroutine Mutex: a second install or
+     * remove of a plugin whose install hangs waits without holding a registry thread, and stops waiting when its op is
+     * abandoned.
      */
-    private val mutationLocks = ConcurrentHashMap<String, Any>()
+    private val mutationLocks = ConcurrentHashMap<String, Mutex>()
     private val mutationGen = ConcurrentHashMap<String, AtomicLong>()
-    private fun lockOf(id: String) = mutationLocks.computeIfAbsent(id) { Any() }
+    private fun lockOf(id: String) = mutationLocks.computeIfAbsent(id) { Mutex() }
     private fun genOf(id: String) = mutationGen.computeIfAbsent(id) { AtomicLong() }
+
+    /**
+     * Runs a registry remove of [id] and bumps its generation when what is stored changed: always when it [existed],
+     * even if the remove failed half-way (file gone, index write failed), except for a RegistryException, which the
+     * registry throws only before touching anything (bad id, its op ended while waiting for the plugin's lock).
+     */
+    private inline fun removeCounted(reg: PluginRegistry, id: String, existed: Boolean, remove: () -> Unit) {
+        var changed = existed
+        try {
+            remove()
+        } catch (e: PluginRegistry.RegistryException) {
+            changed = false
+            throw e
+        } finally {
+            if (changed) genOf(id).incrementAndGet()
+        }
+    }
+
+    /** Tests only: the plugin's current generation. */
+    internal fun generationForTest(id: String): Long = genOf(id).get()
 
     /** Tests swap it to observe the install's own descriptor. */
     @Volatile internal var dupPayload: (ParcelFileDescriptor) -> ParcelFileDescriptor = { it.dup() }
@@ -67,10 +91,9 @@ object Ops {
     private suspend fun remove(reg: PluginRegistry, id: String): String {
         val stuck = PluginWork.busy(id)
         return PluginWork.run(id, on = PluginWork.registryDispatcher) {
-            synchronized(lockOf(id)) {
+            lockOf(id).withLock {
                 val existed = id in reg.ids()
-                reg.remove(id, beforeUnload = !stuck)
-                if (existed) genOf(id).incrementAndGet()
+                removeCounted(reg, id, existed) { reg.remove(id, beforeUnload = !stuck) }
             }
             JSONObject().put("ok", true).toString()
         }
@@ -90,27 +113,33 @@ object Ops {
         val stuck = PluginWork.busy(id)
         val own = dupPayload(pfd)
         // The generation this install created, or -1 when it stored nothing.
-        val rollback: (Pair<String, Long>) -> Unit = { (_, gen) ->
-            if (gen >= 0) synchronized(lockOf(id)) {
-                if (genOf(id).get() == gen) { reg.remove(id); genOf(id).incrementAndGet() }
+        val rollback: suspend (Pair<String, Long>) -> Unit = { (_, gen) ->
+            if (gen >= 0) lockOf(id).withLock {
+                if (genOf(id).get() == gen) removeCounted(reg, id, existed = true) { reg.remove(id) }
             }
         }
         return PluginWork.run(id, on = PluginWork.registryDispatcher, onLateResult = rollback, onDispose = { runCatching { own.close() } }) {
-            synchronized(lockOf(id)) {
-                val (json, stored) = installLocked(reg, req, own, beforeUnload = !stuck)
+            lockOf(id).withLock {
+                val (json, stored) = installLocked(reg, req, own, beforeUnload = !stuck) { genOf(id).incrementAndGet() }
                 json to (if (stored) genOf(id).incrementAndGet() else -1L)
             }
         }.first
     }
 
-    /** The answer and whether a new version was stored. */
-    private fun installLocked(reg: PluginRegistry, req: CsWire.OpRequest, pfd: ParcelFileDescriptor, beforeUnload: Boolean): Pair<String, Boolean> {
+    /**
+     * The answer and whether a new version was stored. [changed] runs when the version it stored is taken out again (a
+     * provider getter threw): what is stored changed, so a pending rollback of an earlier install must not apply.
+     */
+    private fun installLocked(
+        reg: PluginRegistry, req: CsWire.OpRequest, pfd: ParcelFileDescriptor, beforeUnload: Boolean, changed: () -> Unit,
+    ): Pair<String, Boolean> {
         val res = ParcelFileDescriptor.AutoCloseInputStream(pfd).use { reg.install(req.pluginId, it, req.args.optString("sha256"), beforeUnload) }
         // Provider getters are plugin code: if one throws, the plugin does not stay half-answered and installed.
         val providers = try {
             JSONArray().apply { res.providers.forEach { put(providerJson(it)) } }
         } catch (t: Throwable) {
-            reg.remove(req.pluginId)
+            runCatching { reg.remove(req.pluginId) } // the getter's throwable is the answer, not a failed cleanup
+            changed() // the version was stored, whether or not it could be taken out again
             throw t
         }
         val json = JSONObject().put("name", res.name).put("version", res.version).put("providers", providers)

@@ -158,8 +158,8 @@ class OpsInstallTest {
         val release = java.util.concurrent.CountDownLatch(1)
         try {
             runBlocking {
-                // Both registry threads busy: the install below is queued and cancelled before it starts.
-                repeat(2) {
+                // Every registry thread busy: the install below is queued and cancelled before it starts.
+                repeat(PluginWork.REGISTRY_THREADS) {
                     kotlinx.coroutines.withTimeoutOrNull(50) {
                         PluginWork.run("cloudstream-other", on = PluginWork.registryDispatcher) { release.await(20, java.util.concurrent.TimeUnit.SECONDS) }
                     }
@@ -212,5 +212,88 @@ class OpsInstallTest {
             BlockingPlugin.release.countDown()
             retryPool.shutdown()
         }
+    }
+
+    /** [op], but given up (null) after [ms]: the wait is cancellable, unlike runBlocking inside a timeout. */
+    private fun opWithin(ms: Long, op: String, args: JSONObject = JSONObject(), payload: File? = null, id: String = "cloudstream-fx"): String? {
+        val pfd = payload?.let { ParcelFileDescriptor.open(it, ParcelFileDescriptor.MODE_READ_ONLY) }
+        try {
+            return runBlocking {
+                kotlinx.coroutines.withTimeoutOrNull(ms) {
+                    Ops.run(context, CsWire.parseOpRequest(CsWire.opRequest(op, "c1", id, 5000, args))!!, pfd) { true }
+                }
+            }
+        } finally {
+            pfd?.close()
+        }
+    }
+
+    private fun installAbandoned(f: File, id: String, waitMs: Long): String? {
+        val pfd = ParcelFileDescriptor.open(f, ParcelFileDescriptor.MODE_READ_ONLY)
+        try {
+            return runBlocking {
+                kotlinx.coroutines.withTimeoutOrNull(waitMs) {
+                    val req = CsWire.parseOpRequest(CsWire.opRequest(CsWire.Op.INSTALL, "c1", id, 5000,
+                        JSONObject().put("sha256", DexFixtures.sha256(f))))!!
+                    Ops.run(context, req, pfd) { true }
+                }
+            }
+        } finally {
+            pfd.close() // as the service does when the op ends; the install reads its own dup
+        }
+    }
+
+    @Test fun `a hung install holds neither another plugin's install and remove nor a registry thread per retry`() {
+        BlockingPlugin.reset()
+        val slow = DexFixtures.cs3(File.createTempFile("blocking", ".cs3"), listOf(DexFixtures.currentEpisodeDex()),
+            DexFixtures.manifest("Lento", BlockingPlugin::class.java.name, 1))
+        val fx = DexFixtures.cs3(File.createTempFile("fixture", ".cs3"), listOf(DexFixtures.currentEpisodeDex()),
+            DexFixtures.manifest("Cuevana", FixturePlugin::class.java.name, 7))
+        try {
+            assertEquals(null, installAbandoned(slow, "cloudstream-slow", 300))
+            assertTrue("load() never started", BlockingPlugin.entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            // Kino retries the hung plugin more times than there are registry threads: each retry waits for the plugin's
+            // lock without holding a thread, and stops waiting with its op.
+            repeat(PluginWork.REGISTRY_THREADS + 1) { assertEquals(null, installAbandoned(slow, "cloudstream-slow", 150)) }
+            // Another plugin installs and is removed at once.
+            val installed = opWithin(5_000, CsWire.Op.INSTALL, JSONObject().put("sha256", DexFixtures.sha256(fx)), fx)
+            assertTrue("another plugin's install waited on the hung one", installed != null)
+            assertEquals(1, JSONObject(installed!!).getJSONArray("providers").length())
+            val removed = opWithin(5_000, CsWire.Op.REMOVE)
+            assertEquals(true, JSONObject(removed!!).getBoolean("ok"))
+            assertEquals(listOf("cloudstream-slow"), Ops.instance!!.ids())
+        } finally {
+            BlockingPlugin.release.countDown()
+        }
+        waitUntil("the late install was not rolled back") { "cloudstream-slow" !in Ops.instance!!.ids() }
+    }
+
+    @Test fun `an install whose provider getter throws is taken out and counts as a change`() {
+        val f = DexFixtures.cs3(File.createTempFile("getter", ".cs3"), listOf(DexFixtures.currentEpisodeDex()),
+            DexFixtures.manifest("Getter", com.kino.csbridge.plugins.fixture.ThrowingGetterPlugin::class.java.name, 1))
+        val before = Ops.generationForTest("cloudstream-getter")
+        val e = org.junit.Assert.assertThrows(IllegalStateException::class.java) {
+            op(CsWire.Op.INSTALL, JSONObject().put("sha256", DexFixtures.sha256(f)), f, id = "cloudstream-getter")
+        }
+        assertEquals("getter", e.message)
+        assertEquals(emptyList<String>(), Ops.instance!!.ids())
+        // It was stored, then taken out: a rollback pending from an earlier install of this id must not apply any more.
+        assertEquals(before + 1, Ops.generationForTest("cloudstream-getter"))
+    }
+
+    @Test fun `a remove that fails half-way still counts as a change`() {
+        val f = DexFixtures.cs3(File.createTempFile("fixture", ".cs3"), listOf(DexFixtures.currentEpisodeDex()),
+            DexFixtures.manifest("Cuevana", FixturePlugin::class.java.name, 7))
+        op(CsWire.Op.INSTALL, JSONObject().put("sha256", DexFixtures.sha256(f)), f)
+        val before = Ops.generationForTest("cloudstream-fx")
+        val dir = File(context.filesDir, "plugins")
+        assertTrue(dir.setWritable(false))
+        try {
+            // The registry drops the entry, then cannot write the index: the remove fails after changing what is stored.
+            org.junit.Assert.assertThrows(java.io.IOException::class.java) { op(CsWire.Op.REMOVE) }
+        } finally {
+            dir.setWritable(true)
+        }
+        assertEquals(before + 1, Ops.generationForTest("cloudstream-fx"))
     }
 }

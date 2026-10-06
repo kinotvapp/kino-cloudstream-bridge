@@ -248,28 +248,68 @@ class PluginRegistryTest {
         assertEquals(1, registry().providers("cloudstream-a").size)
     }
 
-    @Test fun `hello and list never wait on a plugin load that hangs, nor on another install`() {
+    @Test fun `a hung load blocks only its own plugin - hello, other installs, removes and loads go on`() {
         val r = registry()
-        val stable = cs3()
-        r.installFile("cloudstream-stable", stable)
+        r.installFile("cloudstream-stable", cs3())
+        r.installFile("cloudstream-other", cs3())
         BlockingPlugin.reset()
         val pool = Executors.newFixedThreadPool(3)
         try {
             val hung = pool.submit<Any> { r.installFile("cloudstream-hung", cs3(BlockingPlugin::class.java.name)) }
             assertTrue("load() never started", BlockingPlugin.entered.await(5, TimeUnit.SECONDS))
-            // A second install streams and hashes outside the lock, then queues behind the hung load.
-            val queued = pool.submit<Any> { r.installFile("cloudstream-queued", cs3()) }
-            val hello = pool.submit<List<CsWire.HelloPlugin>> { r.stored() }
-            val ids = hello.get(2, TimeUnit.SECONDS).map { it.id }
+            val ids = pool.submit<List<CsWire.HelloPlugin>> { r.stored() }.get(2, TimeUnit.SECONDS).map { it.id }
             assertTrue(ids.contains("cloudstream-stable"))
             assertEquals(ids, r.ids())
-            assertFalse(queued.isDone)
-            BlockingPlugin.release.countDown()
-            hung.get(5, TimeUnit.SECONDS); queued.get(5, TimeUnit.SECONDS)
+            // Another plugin installs, loads lazily and is removed while the hung load still holds its own plugin.
+            val queued = pool.submit<PluginRegistry.InstallResult> { r.installFile("cloudstream-queued", cs3()) }.get(5, TimeUnit.SECONDS)
+            assertEquals(1, queued.providers.size)
+            simulateLazyLoad(r, "cloudstream-stable")
+            assertEquals(1, pool.submit<Int> { r.providers("cloudstream-stable").size }.get(5, TimeUnit.SECONDS))
+            pool.submit { r.remove("cloudstream-other") }.get(5, TimeUnit.SECONDS)
+            assertFalse(hung.isDone)
             assertEquals(listOf("cloudstream-stable", "cloudstream-hung", "cloudstream-queued"), r.ids())
+            BlockingPlugin.release.countDown()
+            hung.get(5, TimeUnit.SECONDS)
+            // The hung plugin's load window saw the other plugins' registrations: none of them became its own.
+            assertEquals(1, r.providers("cloudstream-hung").size)
+            r.remove("cloudstream-hung")
+            assertSame(queued.providers.single(), r.providers("cloudstream-queued").single())
+            assertTrue(fixtureProviders().any { it === queued.providers.single() })
+            assertTrue(fixtureProviders().any { it === r.providers("cloudstream-stable").single() })
+            assertEquals(2, fixtureProviders().size)
         } finally {
             BlockingPlugin.release.countDown()
             pool.shutdownNow()
+        }
+    }
+
+    /** Unloads [id] in memory only (as a new process would see it), so the next providers() call loads it again. */
+    private fun simulateLazyLoad(r: PluginRegistry, id: String) = r.unloadForTest(id)
+
+    @Test fun `two plugins loading at once each keep only their own registrations`() {
+        // Each .cs3 gets its own class loader (as PathClassLoader does on a device): the fixture classes are defined
+        // again by it, so a registration's class names the plugin that made it.
+        val loaders = java.util.Collections.synchronizedList(mutableListOf<ClassLoader>())
+        val r = PluginRegistry(context, javaClass.classLoader!!, { _, parent -> OwnFixtureLoader(parent).also { loaders += it } }).also { created += it }
+        OverlapGates.barrier = java.util.concurrent.CyclicBarrier(2)
+        val pool = Executors.newFixedThreadPool(2)
+        try {
+            val f = cs3(com.kino.csbridge.plugins.fixture.OverlapPlugin::class.java.name)
+            val a = pool.submit<PluginRegistry.InstallResult> { r.installFile("cloudstream-a", f) }
+            val b = pool.submit<PluginRegistry.InstallResult> { r.installFile("cloudstream-b", f) }
+            val pa = a.get(10, TimeUnit.SECONDS).providers.single()
+            val pb = b.get(10, TimeUnit.SECONDS).providers.single()
+            assertFalse(pa === pb)
+            assertEquals(2, loaders.size)
+            assertTrue(pa.javaClass.classLoader in loaders && pb.javaClass.classLoader in loaders)
+            assertFalse(pa.javaClass.classLoader === pb.javaClass.classLoader)
+            r.remove("cloudstream-a")
+            assertSame(pb, r.providers("cloudstream-b").single())
+            assertTrue(APIHolder.allProviders.withLock { APIHolder.allProviders.any { it === pb } && APIHolder.allProviders.none { it === pa } })
+        } finally {
+            OverlapGates.barrier.reset()
+            pool.shutdownNow()
+            runCatching { r.remove("cloudstream-a") }; runCatching { r.remove("cloudstream-b") }
         }
     }
 
@@ -303,5 +343,20 @@ class PluginRegistryTest {
         APIHolder.apis.filter { it is FixtureApi }.forEach { APIHolder.removePluginMapping(it) }
         extractorApis.withLock { extractorApis.removeAll { it is FixtureExtractor } }
         created.clear()
+    }
+}
+
+/** Gates the overlapping fixture plugins share: loaded by the test class loader, so every plugin copy sees the same one. */
+object OverlapGates { @Volatile var barrier = java.util.concurrent.CyclicBarrier(2) }
+
+/** Defines the fixture plugin classes itself, one copy per plugin (as each .cs3's PathClassLoader does on a device). */
+class OwnFixtureLoader(parent: ClassLoader) : ClassLoader(parent) {
+    override fun loadClass(name: String, resolve: Boolean): Class<*> {
+        if (!name.startsWith("com.kino.csbridge.plugins.fixture.")) return super.loadClass(name, resolve)
+        synchronized(this) {
+            findLoadedClass(name)?.let { return it }
+            val bytes = parent.getResourceAsStream(name.replace('.', '/') + ".class")!!.use { it.readBytes() }
+            return defineClass(name, bytes, 0, bytes.size)
+        }
     }
 }

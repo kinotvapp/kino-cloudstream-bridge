@@ -3,6 +3,7 @@ package com.kino.csbridge.plugins
 import android.content.Context
 import android.content.res.AssetManager
 import android.content.res.Resources
+import com.kino.csbridge.CallContext
 import com.kino.csbridge.contract.CsWire
 import com.lagradost.cloudstream3.APIHolder
 import com.lagradost.cloudstream3.MainAPI
@@ -27,6 +28,8 @@ import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.locks.ReentrantLock
 import java.util.zip.ZipFile
 
 /**
@@ -42,9 +45,21 @@ import java.util.zip.ZipFile
  * is `incompatible` until Kino re-installs it (one OOM kill or unbind mid-load does not disable it).
  *
  * A stored plugin is loaded on first use ([providers]), from inside the op that needs it, so the HTTP its `load()`
- * makes is part of a call Kino serves. All mutation is serialised on one lock (the snapshot diff needs it); the lock
- * is never needed to answer `hello` / `listPlugins` ([stored] reads an immutable snapshot published on every index
- * write) and the payload is streamed and hashed before taking it.
+ * makes is part of a call Kino serves.
+ *
+ * **Locks.** Each plugin id has its own lock: its install, remove and load run one at a time, and a plugin whose
+ * `load()` hangs holds only that one. Another plugin installs, loads and is removed meanwhile. A wait for a plugin's
+ * lock gives up (`timeout`) as soon as the op it serves is over ([CallContext.isOver]), so a waiter never outlives its
+ * op. The index (and the snapshot `hello` reads) has a short lock of its own that no plugin code ever runs under.
+ * Neither is needed to answer `hello` / `listPlugins` ([stored] reads an immutable snapshot published on every index
+ * write), and the payload is streamed and hashed before taking any.
+ *
+ * **Who registered what.** Loads of different plugins can overlap, so a registration made inside one load's window may
+ * be another plugin's. A registration whose class was defined by a plugin's own class loader belongs to that plugin
+ * (on a device every .cs3 has its own PathClassLoader, and providers are always plugin classes). One whose class is the
+ * bridge's (a library extractor instance, say) belongs to the load whose window it fell in, unless another loaded plugin
+ * already holds it; if two loads that overlapped both made such registrations, both claim them, and removing either
+ * plugin removes them (a library class registered twice; never another plugin's own class).
  */
 class PluginRegistry(
     context: Context,
@@ -66,14 +81,21 @@ class PluginRegistry(
     private class Loaded(
         val plugin: BasePlugin, val path: String, val providers: List<MainAPI>,
         val extractors: List<ExtractorApi>, val actions: List<VideoClickAction>,
+        /** The plugin's own class loader, or null when it is [parentLoader] itself (JVM tests). */
+        val loader: ClassLoader?,
     )
 
     private val app: Context = context.applicationContext ?: context
     private val dir = File(app.filesDir, "plugins")
     private val indexFile = File(dir, "index.json")
-    private val lock = Any()
+    /** Guards [index], index.json and [published]; held only for in-memory changes and the index write, never plugin code. */
+    private val indexLock = Any()
     private val index = LinkedHashMap<String, Entry>()
     private val loaded = ConcurrentHashMap<String, Loaded>()
+    /** One per plugin id: its install, remove and load. Ids are Kino's installed plugins, so the map stays small. */
+    private val pluginLocks = ConcurrentHashMap<String, ReentrantLock>()
+    /** The class loaders of plugins loading or loaded (distinct from [parentLoader]): who defined a registration's class. */
+    private val pluginLoaders: MutableSet<ClassLoader> = Collections.synchronizedSet(Collections.newSetFromMap(IdentityHashMap()))
     @Volatile private var started = false
 
     /** What [stored] answers: replaced as a whole after every successful index write, read without the lock. */
@@ -86,7 +108,7 @@ class PluginRegistry(
      */
     fun ensureLoaded() {
         if (started) return
-        synchronized(lock) {
+        synchronized(indexLock) {
             if (started) return
             dir.mkdirs()
             index.clear()
@@ -139,9 +161,9 @@ class PluginRegistry(
             }
             val displayName = manifest.name ?: pluginId
             if (missing.isNotEmpty()) return InstallResult(displayName, manifest.version, emptyList(), missing)
-            synchronized(lock) {
+            return withPluginLock(pluginId) {
                 val l = replaceLocked(pluginId, name, sha256, tmp, manifest, beforeUnload)
-                return InstallResult(displayName, manifest.version, l.providers, emptyList())
+                InstallResult(displayName, manifest.version, l.providers, emptyList())
             }
         } finally {
             deleteFile(tmp)
@@ -152,7 +174,7 @@ class PluginRegistry(
     private fun replaceLocked(pluginId: String, name: String, sha256: String, tmp: File, manifest: Manifest, beforeUnload: Boolean): Loaded {
         unloadLocked(pluginId, beforeUnload)
         val target = File(dir, name)
-        val previous = index[pluginId]
+        val previous = synchronized(indexLock) { index[pluginId] }
         val backup = File(dir, "$TMP$name-previous-${UUID.randomUUID()}").takeIf { previous != null && target.isFile }
         var backedUp = false
         try {
@@ -162,8 +184,7 @@ class PluginRegistry(
             // Android 14 refuses to load a writable dex file.
             if (!target.setReadOnly()) throw IOException("setReadOnly failed")
             // Indexed before load(): if load() kills the process, the marker then names a known entry.
-            index[pluginId] = Entry(pluginId, name, sha256)
-            writeIndex()
+            synchronized(indexLock) { index[pluginId] = Entry(pluginId, name, sha256); writeIndex() }
             val l = loadLocked(pluginId, target, manifest)
             backup?.let { deleteFile(it) }
             return l
@@ -171,10 +192,10 @@ class PluginRegistry(
             // Best effort, step by step: nothing here may replace the original throwable.
             if (backup == null || backedUp) runCatching { deleteFile(target) } // a failed backup left the old file in place
             if (backup != null && backedUp) runCatching { if (!backup.renameTo(target)) deleteFile(backup) }
-            runCatching {
-                if (previous != null && target.isFile) index[pluginId] = previous else index.remove(pluginId)
+            synchronized(indexLock) {
+                runCatching { if (previous != null && target.isFile) index[pluginId] = previous else index.remove(pluginId) }
+                runCatching { writeIndex() }
             }
-            runCatching { writeIndex() }
             throw t
         }
     }
@@ -186,12 +207,35 @@ class PluginRegistry(
     fun remove(pluginId: String, beforeUnload: Boolean = true) {
         val name = SafeNames.fileName(pluginId) ?: throw RegistryException(CsWire.Err.BAD_REQUEST, "plugin id")
         ensureLoaded()
-        synchronized(lock) {
+        withPluginLock(pluginId) {
             unloadLocked(pluginId, beforeUnload)
-            val e = index.remove(pluginId)
-            deleteFile(File(dir, e?.file ?: name))
-            File(dir, "$MARKER$pluginId").delete()
-            if (e != null) writeIndex()
+            synchronized(indexLock) {
+                val e = index.remove(pluginId)
+                deleteFile(File(dir, e?.file ?: name))
+                File(dir, "$MARKER$pluginId").delete()
+                if (e != null) writeIndex()
+            }
+        }
+    }
+
+    /** Tests only: forgets [pluginId]'s loaded instance (without `beforeUnload()`), as a new process would start. */
+    internal fun unloadForTest(pluginId: String) = withPluginLock(pluginId) { unloadLocked(pluginId, beforeUnload = false) }
+
+    /**
+     * Runs [block] holding [pluginId]'s lock. The wait is in short slices and ends with `timeout` once the op this thread
+     * serves is over (deadline, cancel): a waiter behind a hung load never outlives its op. Without an op (start-up,
+     * rollback, tests) it waits.
+     */
+    private fun <T> withPluginLock(pluginId: String, block: () -> T): T {
+        val l = pluginLocks.computeIfAbsent(pluginId) { ReentrantLock() }
+        val ctx = CallContext.current()
+        while (!l.tryLock(LOCK_SLICE_MS, TimeUnit.MILLISECONDS)) {
+            if (ctx?.isOver() == true) throw RegistryException(CsWire.Err.TIMEOUT, "plugin busy")
+        }
+        try {
+            return block()
+        } finally {
+            l.unlock()
         }
     }
 
@@ -203,22 +247,22 @@ class PluginRegistry(
     fun providers(pluginId: String): List<MainAPI> {
         ensureLoaded()
         loaded[pluginId]?.let { return it.providers }
-        synchronized(lock) {
-            loaded[pluginId]?.let { return it.providers }
-            val e = index[pluginId] ?: throw RegistryException(CsWire.Err.NOT_INSTALLED, "plugin")
+        return withPluginLock(pluginId) {
+            loaded[pluginId]?.let { return@withPluginLock it.providers }
+            val e = synchronized(indexLock) { index[pluginId] } ?: throw RegistryException(CsWire.Err.NOT_INSTALLED, "plugin")
             if (e.disabled) throw RegistryException(CsWire.Err.INCOMPATIBLE, "crashed the bridge while loading; re-install it")
             val f = File(dir, e.file)
             val manifest = try { readManifest(f) } catch (x: RegistryException) { throw RegistryException(CsWire.Err.INCOMPATIBLE, "manifest") }
             // The bridge may have been updated since the install: check again before running its code.
             val missing = try { SymbolChecker(parentLoader).missing(f) } catch (x: IllegalArgumentException) { listOf("not a .cs3") }
             if (missing.isNotEmpty()) throw RegistryException(CsWire.Err.INCOMPATIBLE, "missing ${missing.size}: ${missing.first()}")
-            return loadLocked(pluginId, f, manifest).providers
+            loadLocked(pluginId, f, manifest).providers
         }
     }
 
     /**
      * [beforeUnload] runs the plugin's `beforeUnload()` on a fresh daemon thread, waited on at most [BEFORE_UNLOAD_MS]:
-     * plugin code that hangs there never holds a remove or an update (or this lock) longer than that.
+     * plugin code that hangs there never holds a remove or an update (or this plugin's lock) longer than that.
      */
     private fun unloadLocked(pluginId: String, beforeUnload: Boolean = true) {
         loaded.remove(pluginId)?.let { l ->
@@ -229,6 +273,7 @@ class PluginRegistry(
                 t.join(BEFORE_UNLOAD_MS)
             }
             unregister(l.plugin, l.path, l.providers, l.extractors, l.actions)
+            l.loader?.let { pluginLoaders.remove(it) }
         }
     }
 
@@ -241,9 +286,11 @@ class PluginRegistry(
         val beforeExtractors = snapshot(extractorApis)
         val beforeActions = snapshot(VideoClickActionHolder.allVideoClickActions)
         var plugin: BasePlugin? = null
+        var own: ClassLoader? = null
         var done: Loaded? = null
         try {
             val loader = loaderFactory(file, parentLoader)
+            if (loader !== parentLoader) { own = loader; pluginLoaders += loader }
             val created: Any = try {
                 loader.loadClass(manifest.pluginClassName).getDeclaredConstructor().newInstance()
             } catch (e: InvocationTargetException) {
@@ -266,19 +313,40 @@ class PluginRegistry(
             synchronized(PluginManager.plugins) { PluginManager.plugins[path] = instance }
             synchronized(PluginManager.urlPlugins) { PluginManager.urlPlugins[path] = instance }
             if (instance is Plugin) instance.load(app) else instance.load()
-            val l = Loaded(instance, path, added(APIHolder.allProviders, beforeProviders), added(extractorApis, beforeExtractors),
-                added(VideoClickActionHolder.allVideoClickActions, beforeActions))
+            val l = Loaded(instance, path, mine(APIHolder.allProviders, beforeProviders, own, pluginId) { it.providers },
+                mine(extractorApis, beforeExtractors, own, pluginId) { it.extractors },
+                mine(VideoClickActionHolder.allVideoClickActions, beforeActions, own, pluginId) { it.actions }, own)
             loaded[pluginId] = l
             done = l
             // Consecutive deaths only: a load that completed resets the count (best effort; the load itself succeeded).
-            index[pluginId]?.takeIf { it.crashes != 0 }?.let { index[pluginId] = it.copy(crashes = 0); runCatching { writeIndex() } }
+            synchronized(indexLock) {
+                index[pluginId]?.takeIf { it.crashes != 0 }?.let { index[pluginId] = it.copy(crashes = 0); runCatching { writeIndex() } }
+            }
             return l
         } finally {
             if (done == null) {
-                unregister(plugin, path, added(APIHolder.allProviders, beforeProviders), added(extractorApis, beforeExtractors),
-                    added(VideoClickActionHolder.allVideoClickActions, beforeActions))
+                unregister(plugin, path, mine(APIHolder.allProviders, beforeProviders, own, pluginId) { it.providers },
+                    mine(extractorApis, beforeExtractors, own, pluginId) { it.extractors },
+                    mine(VideoClickActionHolder.allVideoClickActions, beforeActions, own, pluginId) { it.actions })
+                own?.let { pluginLoaders.remove(it) }
             }
             marker.delete()
+        }
+    }
+
+    /**
+     * What [list] gained since [before] that is this load's: defined by its own loader [own], or by a loader that is no
+     * plugin's (the bridge's) and not already held by another loaded plugin ([held] reads that plugin's list).
+     */
+    private fun <T : Any> mine(list: AtomicList<T>, before: Set<T>, own: ClassLoader?, pluginId: String, held: (Loaded) -> List<T>): List<T> {
+        val others = identitySet(loaded.filterKeys { it != pluginId }.values.flatMap(held))
+        return list.withLock { list.filter { it !in before }.toList() }.filter { item ->
+            val cl = item.javaClass.classLoader
+            when {
+                own != null && cl === own -> true
+                cl != null && cl in pluginLoaders -> false // another plugin's own class
+                else -> item !in others
+            }
         }
     }
 
@@ -301,7 +369,6 @@ class PluginRegistry(
     }
 
     private fun <T> snapshot(list: AtomicList<T>): Set<T> = identitySet(list.withLock { list.toList() })
-    private fun <T> added(list: AtomicList<T>, before: Set<T>): List<T> = list.withLock { list.filter { it !in before }.toList() }
     private fun <T> identitySet(items: Collection<T>): MutableSet<T> = Collections.newSetFromMap(IdentityHashMap<T, Boolean>()).apply { addAll(items) }
 
     private fun copyHashing(input: InputStream, out: File): String {
@@ -395,6 +462,8 @@ class PluginRegistry(
         const val CRASHES_TO_DISABLE = 2
         /** The longest a remove or update waits on a plugin's `beforeUnload()`. */
         const val BEFORE_UNLOAD_MS = 2_000L
+        /** How often a wait for a plugin's lock checks whether its op is over. */
+        private const val LOCK_SLICE_MS = 100L
         private val SHA256 = Regex("^[0-9a-f]{64}$")
     }
 }

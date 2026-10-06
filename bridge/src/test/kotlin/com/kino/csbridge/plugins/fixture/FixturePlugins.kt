@@ -73,3 +73,27 @@ class BlockingPlugin : Plugin() {
         fun reset() { entered = java.util.concurrent.CountDownLatch(1); release = java.util.concurrent.CountDownLatch(1); unloads.set(0) }
     }
 }
+
+/**
+ * Two of these load at once (each from its own class loader, as two .cs3 do): both register a provider while the other
+ * is still inside load(), so each registration falls inside both registration windows.
+ */
+class OverlapPlugin : Plugin() {
+    override fun load(context: Context) {
+        val gates = com.kino.csbridge.plugins.OverlapGates
+        gates.barrier.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        registerMainAPI(FixtureApi())
+        gates.barrier.await(5, java.util.concurrent.TimeUnit.SECONDS)
+    }
+}
+
+/** A provider whose getter throws while Kino's answer is built. */
+class ThrowingGetterApi : MainAPI() {
+    override var name = "Getter"
+    override var mainUrl = "https://getter.example"
+    override val mainPage: List<com.lagradost.cloudstream3.MainPageData> get() = error("getter")
+}
+
+class ThrowingGetterPlugin : Plugin() {
+    override fun load(context: Context) { registerMainAPI(ThrowingGetterApi()) }
+}

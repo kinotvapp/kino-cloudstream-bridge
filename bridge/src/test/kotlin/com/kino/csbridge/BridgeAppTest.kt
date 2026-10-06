@@ -126,6 +126,28 @@ class BridgeAppTest {
         assertEquals(null, asPlugin(OTHER) { app.getSharedPreferences("Ext", 0).getString("token", null) })
     }
 
+    @Test fun `a plugin prefs name with a slash or NUL never reaches another name's namespace`() {
+        asPlugin {
+            app.getDefaultSharedPrefs().edit().putString("k", "default").commit()
+            // Android refuses these names; here they are valid, so they must not alias the default prefs or each other.
+            app.getSharedPreferences("/default", 0).edit().putString("k", "slash").commit()
+            app.getSharedPreferences("a/b", 0).edit().putString("k", "ab").commit()
+            app.getSharedPreferences("a\u0000b", 0).edit().putString("k", "nul").commit()
+            app.getSharedPreferences("a", 0).edit().putString("b\u0000k", "forged").commit()
+            assertEquals("default", app.getDefaultSharedPrefs().getString("k", null))
+            assertEquals("slash", app.getSharedPreferences("/default", 0).getString("k", null))
+            assertEquals("ab", app.getSharedPreferences("a/b", 0).getString("k", null))
+            assertEquals("nul", app.getSharedPreferences("a\u0000b", 0).getString("k", null))
+            assertEquals(mapOf("b\u0000k" to "forged"), app.getSharedPreferences("a", 0).all)
+            // As on Android (ContextImpl: null.xml), a null name is the name "null".
+            app.getSharedPreferences(null, 0).edit().putString("k", "null").commit()
+            assertEquals("null", app.getSharedPreferences("null", 0).getString("k", null))
+        }
+        val keys = kino.stores[PLUGIN]!!.keys
+        assertEquals(keys.size, keys.toSet().size)
+        assertEquals(6, keys.size)
+    }
+
     @Test fun `deleteSharedPreferences clears that name only, moveSharedPreferencesFrom moves nothing`() {
         asPlugin {
             app.getSharedPreferences("a", 0).edit().putString("k", "1").commit()

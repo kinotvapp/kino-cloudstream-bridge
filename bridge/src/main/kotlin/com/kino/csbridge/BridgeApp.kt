@@ -13,7 +13,7 @@ import java.util.concurrent.ConcurrentHashMap
 /**
  * Never a CloudStreamApp (see [initForBridge]). Owns where CloudStream code keeps state: every SharedPreferences name
  * lives in Kino, in the calling plugin's `kino.storage` ([HostStore], [HostPrefs]). DataStore's `rebuild_preference`
- * keys are stored as they are; the default prefs are the name "/default" (no real name has a "/"); any other name is its own namespace. No
+ * keys are stored as they are; the default prefs are the namespace "/default"; any other name is its own namespace ([namespaceOf]). No
  * preference file is ever written in the bridge's data dir.
  *
  * Only this Context is routed. A ContextImpl reached another way (`baseContext`, `createConfigurationContext`,
@@ -25,11 +25,18 @@ class BridgeApp : Application() {
     internal val prefsStore by lazy { HostStore({ Ops.registry(this).ids() }) }
     private val views = ConcurrentHashMap<String, HostPrefs>()
 
-    /** Null for `rebuild_preference`, "/default" for the default prefs, else the name itself. */
-    private fun namespaceOf(name: String?): String? = when (name) {
+    /**
+     * Null for `rebuild_preference`, "/default" for the default prefs, else the name itself, except names Android would
+     * refuse: one with a "/" (a path separator) or a NUL. Nothing stops a plugin passing one here, and as they are
+     * "/default" would alias the default prefs and a NUL would let one name forge another's keys (HostPrefs keys are
+     * NUL + namespace + NUL + key). Those become "/" + the name with "%" and NUL escaped: every such namespace starts with
+     * "/", none is "/default", and two names never share one. A null name is "null", as on Android (null.xml).
+     */
+    internal fun namespaceOf(name: String?): String? = when (name) {
         PREFERENCES_NAME -> null
         "${packageName}_preferences" -> DEFAULT_NAMESPACE
-        else -> name.toString()
+        null -> "null"
+        else -> if ('/' in name || '\u0000' in name) "/" + name.replace("%", "%25").replace("\u0000", "%00") else name
     }
 
     private fun view(name: String?): HostPrefs {
@@ -54,7 +61,7 @@ class BridgeApp : Application() {
     }
 
     private companion object {
-        /** Android refuses "/" in a prefs name, so no plugin-chosen name can ever be this one. */
+        /** No plugin-chosen name maps here: [namespaceOf] moves every name with a "/" under "/" + escaped name. */
         const val DEFAULT_NAMESPACE = "/default"
         /** Map key of the rebuild_preference view: a NUL can never be a namespace the views map gets from a name. */
         const val REBUILD_KEY = "\u0000rebuild"
