@@ -15,7 +15,7 @@ Kino decides what reaches the network. The fork follows upstream closely: everyt
 [BRIDGE.md](BRIDGE.md).
 
 **License and source.** GPL-3.0, like upstream (see [LICENSE](LICENSE)). The complete corresponding source of every
-bridge APK Kino distributes is this repository at the tag matching the APK's `versionName`. Exception: `bridge-contract/`
+bridge APK Kino distributes is this repository at the tag `bridge-v<versionName>` of that APK. Exception: `bridge-contract/`
 (the AIDL interfaces and wire protocol shared with Kino) is Apache-2.0, full text in
 [bridge-contract/LICENSE](bridge-contract/LICENSE).
 
