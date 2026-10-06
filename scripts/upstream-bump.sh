@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # GPL-3.0 (this fork). Moves this fork onto a newer upstream CloudStream commit, on a NEW local branch in its own
-# worktree, then runs every gate and prints what changed. It never touches the base branch, never pushes, never signs
-# and never publishes: a person reads the report and decides (BRIDGE.md "Keeping up with upstream").
+# worktree, then runs every gate and prints what changed. It never pushes, never changes an existing branch or remote
+# (it only adds an `upstream` fetch remote when there is none, and fetching updates refs/remotes/upstream/*), never
+# signs and never publishes: a person reads the report and decides (BRIDGE.md "Keeping up with upstream").
 #
 #   scripts/upstream-bump.sh [options] <upstream-ref>
 #
@@ -16,17 +17,22 @@
 # UPSTREAM_URL (default https://github.com/recloudstream/cloudstream.git, used when no `upstream` remote exists).
 #
 # What it does:
-#   1. fetches <upstream-ref> without blobs (git fetch --filter=blob:none upstream <ref>);
+#   1. fetches <upstream-ref> without blobs (git fetch --filter=blob:none upstream <ref>); refuses a ref whose merge base
+#      with the base branch is not exactly the pin (a downgrade, another line, or upstream commits merged past the pin);
 #   2. replays every commit of the fork since its pin onto it (git rebase --onto <new> <old pin>): the settings include,
 #      `compat: restore removed plugin ABI`, the README section and everything under bridge/, bridge-contract/, scripts/,
-#      .github/ and BRIDGE.md. Upstream editing a workflow file the fork deleted is resolved by keeping it deleted; any
-#      other conflict aborts the rebase, removes the worktree and the branch, and lists the files;
+#      .github/ and BRIDGE.md. Upstream editing a workflow or issue template the fork deleted is resolved by keeping it
+#      deleted, and an issue template both changed takes the fork's side; any other conflict aborts the rebase, removes
+#      the worktree and the branch, and lists the files. rebase.updateRefs and rebase.autoStash are forced off, so no
+#      other branch moves;
 #   3. moves the pin (bridge/build.gradle.kts upstreamCommit, BRIDGE.md) and removes workflows upstream added since;
-#   4. gates: script tests, :bridge:testDebugUnitTest, CompatAbiTest, :bridge:symbolCoverage, :bridge:assembleRelease
-#      (which runs verifyPluginAbiRelease), unsigned (KINO_* signing variables are dropped);
-#   5. report: upstream commits touching the plugin API, oracle symbols lost/gained against the allowlist, the compat
+#   4. gates: script tests, :bridge:check (testDebugUnitTest, symbolCoverage, lintDebug), CompatAbiTest (read from the
+#      unit-test results), :bridge:assembleRelease (which runs verifyPluginAbiRelease), unsigned (KINO_* dropped);
+#   5. report: the Kotlin version, upstream commits touching the plugin API / build / fork-edited files, oracle symbols lost/gained against the allowlist, the compat
 #      targets' primary constructors old vs new, version catalog changes, upstream edits outside the named exceptions.
-# Exit: 0 every gate passed; 1 a gate failed (branch kept for a person to fix); 2 usage or refused input; 3 conflict.
+# Exit: 0 every gate passed and nothing needs a person; 1 a gate failed or the report needs a person (a changed compat
+# constructor, an unexpected upstream edit, an oracle that did not finish; branch kept); 2 usage or refused input;
+# 3 conflict; 4 internal error before the gates (the branch and worktree are removed).
 set -euo pipefail
 
 die() { echo "upstream-bump: $2" >&2; exit "$1"; }
@@ -67,6 +73,10 @@ else
 fi
 NEW="$(g rev-parse "$NEW^{commit}")"
 g merge-base --is-ancestor "$OLD_PIN" "$NEW" || die 2 "$NEW does not descend from the pin $OLD_PIN (a downgrade or another line)"
+# The replay is `rebase --onto NEW OLD_PIN`: correct only when the fork branched off upstream exactly at the pin. A base
+# that already holds upstream commits past its pin would have them re-applied (and fail with a misleading conflict).
+FORK_POINT="$(g merge-base "$BASE" "$NEW")"
+[ "$FORK_POINT" = "$OLD_PIN" ] || die 2 "$BASE holds upstream commits past its pin ${OLD_PIN:0:9} (merge base with $NEW is ${FORK_POINT:0:9}); move the pin first"
 SHORT="$(g rev-parse --short=9 "$NEW")"
 BRANCH="${BRANCH:-upstream-bump/$SHORT}"
 [ "$BRANCH" != "$BASE" ] || die 2 "the new branch cannot be the base branch"
@@ -79,27 +89,54 @@ g worktree add -q -b "$BRANCH" "$DIR" "$BASE"
 [ -f "$REPO/local.properties" ] && cp "$REPO/local.properties" "$DIR/local.properties"
 w() { git -C "$DIR" "$@"; }
 cleanup_branch() { git -C "$REPO" worktree remove --force "$DIR" || true; git -C "$REPO" branch -q -D "$BRANCH" || true; }
+# Until the gates start, any unexpected failure removes what this run created and exits 4 (never 1, which means "a gate
+# failed, branch kept").
+on_exit() {
+  local rc=$?
+  [ "$rc" = 0 ] && return
+  w rebase --abort >/dev/null 2>&1 || true
+  cleanup_branch
+  echo "upstream-bump: internal error (exit $rc) before the gates; branch and worktree removed" >&2
+  exit 4
+}
+trap on_exit EXIT
+# The script's own commits: no hooks, no signing prompt (the identity is the repository's).
+wcommit() { w -c commit.gpgsign=false commit --no-verify -q "$@"; }
+# Never move another branch (rebase.updateRefs) or stash anything (rebase.autoStash), whatever the git config says.
+wrebase() { w -c rebase.updateRefs=false -c rebase.autoStash=false rebase "$@"; }
 
 # ---- 2. replay the fork's commits ----
 export GIT_EDITOR=true
-if ! w rebase -q --onto "$NEW" "$OLD_PIN" >/dev/null 2>&1; then
+# During a rebase "theirs" is the fork's commit being replayed. Porcelain: UD = the fork deletes a file upstream changed,
+# DU = upstream deleted a file the fork changed, UU/AA = both changed it.
+resolve() { # resolve <path> <status>: 0 when it is one of the fork's own upstream edits, settled in the fork's favour
+  case "$1" in
+    .github/workflows/*) [ "$2" = UD ] && w rm -q -- "$1" ;;
+    .github/ISSUE_TEMPLATE/*)
+      case "$2" in
+        UD) w rm -q -- "$1" ;;
+        DU) w add -- "$1" ;;
+        UU|AA) w checkout -q --theirs -- "$1" && w add -- "$1" ;;
+        *) return 1 ;;
+      esac ;;
+    *) return 1 ;;
+  esac
+}
+if ! wrebase --no-update-refs -q --onto "$NEW" "$OLD_PIN" >/dev/null 2>&1; then
   while :; do
     bad=""; resolved=0
-    for p in $(w diff --name-only --diff-filter=U); do
+    while IFS= read -r -d '' p; do
       st="$(w status --porcelain -- "$p" | cut -c1-2)"
-      # UD: the fork's commit deletes a file upstream modified. Only upstream workflows are deleted on purpose.
-      case "$p" in
-        .github/workflows/*) if [ "$st" = "UD" ]; then w rm -q -- "$p"; resolved=1; continue; fi ;;
-      esac
-      bad="$bad $p($st)"
-    done
+      if resolve "$p" "$st"; then resolved=1; else bad="$bad $p($st)"; fi
+    done < <(w diff -z --name-only --diff-filter=U)
     if [ -n "$bad" ] || [ "$resolved" = 0 ]; then
       stopped="$(w log -1 --format='%h %s' REBASE_HEAD 2>/dev/null || true)"
+      trap - EXIT
       w rebase --abort || true
       cleanup_branch
       die 3 "conflict replaying ${stopped:-a commit} onto $SHORT:${bad:- (no unmerged path; see git status)}. Nothing was changed."
     fi
-    w rebase --continue >/dev/null 2>&1 && break
+    wrebase --continue >/dev/null 2>&1 && break
   done
 fi
 
@@ -108,19 +145,20 @@ if [ "$NEW" != "$OLD_PIN" ]; then
   $PY set-pin "$DIR/bridge/build.gradle.kts" "$NEW"
   sed -i.bak "s/$OLD_PIN/$NEW/g" "$DIR/BRIDGE.md" && rm -f "$DIR/BRIDGE.md.bak"
   w add bridge/build.gradle.kts BRIDGE.md
-  w commit -q -m "Bridge: pin upstream $SHORT" -m "Rebased by scripts/upstream-bump.sh from ${OLD_PIN:0:9}."
+  wcommit -m "Bridge: pin upstream $SHORT" -m "Rebased by scripts/upstream-bump.sh from ${OLD_PIN:0:9}."
 fi
 FOREIGN=""
-for f in $(w ls-tree --name-only HEAD .github/workflows/); do
+while IFS= read -r -d '' f; do
   case "$(basename "$f")" in kino-ci.yml|upstream-watch.yml) ;; *.yml|*.yaml) FOREIGN="$FOREIGN,$(basename "$f")"; w rm -q -- "$f" ;; esac
-done
+done < <(w ls-tree -z --name-only HEAD .github/workflows/)
 FOREIGN="${FOREIGN#,}"
 if [ -n "$FOREIGN" ]; then
-  w commit -q -m "Bridge: drop upstream workflows added since ${OLD_PIN:0:9} ($FOREIGN)" \
+  wcommit -m "Bridge: drop upstream workflows added since ${OLD_PIN:0:9} ($FOREIGN)" \
     -m "They run with upstream's secrets and repositories; this fork runs only kino-ci.yml and upstream-watch.yml."
 fi
 
 # ---- 4. gates ----
+trap - EXIT # from here the branch is kept: a person reads the report and the logs
 OUT="$DIR/build/upstream-bump"; mkdir -p "$OUT"
 GATES="$OUT/gates.tsv"; : > "$GATES"
 gate() { # gate <name> <command...>: runs it in the worktree, logs to $OUT, records PASS/FAIL
@@ -138,16 +176,16 @@ if [ "$SKIP_BUILD" = 0 ]; then
   read -r -a G <<< "${GRADLE_CMD:-./gradlew}"
   unsigned() { env -u KINO_KEYSTORE_PATH -u KINO_KEYSTORE_PASSWORD -u KINO_KEY_ALIAS -u KINO_KEY_PASSWORD "$@"; }
   gate "script tests" sh -c 'python3 scripts/test_symbol_coverage.py && python3 scripts/test_upstream_bump.py'
-  gate ":bridge:testDebugUnitTest" unsigned "${G[@]}" :bridge:testDebugUnitTest
+  # :bridge:check = testDebugUnitTest + symbolCoverage (and its self-test) + lintDebug.
+  gate ":bridge:check (unit tests, symbolCoverage, lint)" unsigned "${G[@]}" :bridge:check
   gate "CompatAbiTest" compat_ok
-  gate ":bridge:symbolCoverage" unsigned "${G[@]}" :bridge:symbolCoverage
   gate ":bridge:assembleRelease (verifyPluginAbiRelease)" sh -c \
     'env -u KINO_KEYSTORE_PATH -u KINO_KEYSTORE_PASSWORD -u KINO_KEY_ALIAS -u KINO_KEY_PASSWORD "$@" :bridge:assembleRelease && test -s bridge/build/verifyPluginAbi/release.txt' \
     _ "${G[@]}"
   CP="$DIR/bridge/build/symbol-coverage/debug-classpath.txt"
   if [ -s "$CP" ]; then
     MISSING="$OUT/oracle-missing.txt"
-    (cd "$DIR" && python3 scripts/symbol-coverage.py --symbols bridge/src/test/resources/cs3-symbols.tsv --classpath-file "$CP") >"$MISSING" 2>&1 || true
+    (cd "$DIR" && python3 scripts/symbol-coverage.py --symbols bridge/src/test/resources/cs3-symbols.tsv --classpath-file "$CP") >"$MISSING" 2>"$OUT/oracle-missing.err" || true
   fi
 fi
 

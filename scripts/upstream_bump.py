@@ -73,6 +73,14 @@ def parse_allowlist(text):
     return out
 
 
+def parse_oracle(text):
+    """(missing rows, ok): ok only when the oracle printed its `missing (not allowlisted): N` summary and N equals the
+    MISSING rows parsed (so a crash that printed nothing, or half, is never read as 'nothing missing')."""
+    missing = parse_missing(text)
+    m = re.search(r'^missing \(not allowlisted\): (\d+)', text, re.M)
+    return missing, bool(m) and int(m.group(1)) == len(missing)
+
+
 def symbol_delta(allow_before, missing_after):
     """lost: oracle symbols missing now and not allowlisted before (most Spanish plugins first), as (symbol, row);
     gained: allowlist rows that resolve now (stale rows to delete)."""
@@ -275,30 +283,51 @@ def foreign_workflows(names):
     return [n for n in names if n.endswith(('.yml', '.yaml')) and n not in OUR_WORKFLOWS]
 
 
+# Upstream paths that matter besides the plugin API: the toolchain and dependency versions (a Kotlin bump can change
+# plugin binary compatibility), the root build, and the upstream files the fork edits (a change there makes the next
+# replay conflict). The compat files are under library/ already.
+WATCHED_EXTRA = ['gradle/', 'settings.gradle.kts', 'build.gradle.kts', 'README.md', '.github/ISSUE_TEMPLATE/']
+
+
 def watched_paths(app_sources_text):
-    """What the plugin API is upstream: all of :library (extractors included) and the :app files :bridge compiles."""
+    """What the watcher follows upstream: all of :library (extractors included), the :app files :bridge compiles, and
+    WATCHED_EXTRA."""
     files = [s.strip() for s in app_sources_text.splitlines()]
-    return ['library/'] + ['app/src/main/java/' + s for s in files if s and not s.startswith('#')]
+    return ['library/'] + ['app/src/main/java/' + s for s in files if s and not s.startswith('#')] + WATCHED_EXTRA
+
+
+def kotlin_version(versions):
+    return versions.get('kotlinGradlePlugin') or versions.get('kotlin')
+
+
+def commit_line(c):
+    """`<sha> <subject>` as a markdown list item that cannot mention anyone or link an issue of this repository."""
+    sha, _, subject = c.partition(' ')
+    return f"- {sha} `{subject.replace('`', chr(39))}`"
 
 
 # ---- report --------------------------------------------------------------------------------------------------------
 def render_report(*, old_pin, new_pin, branch, commits, lost, gained, versions, compat, unexpected, settings_ok,
-                  compat_commits, foreign, gates, oracle_ran):
+                  compat_commits, foreign, gates, oracle_ran, oracle_ok=True, kotlin=(None, None)):
     compat_changed = [c for c, d in compat.items() if d is None or not d['same']]
     changes = (old_pin != new_pin) + len(lost) + len(gained) + len(versions) + len(compat_changed) + len(unexpected) \
         + (not settings_ok) + (compat_commits != 1) + len(foreign)
     L = [f'# Upstream bump {old_pin[:9]} -> {new_pin[:9]}', '',
          f'Branch: `{branch}` (local; nothing pushed, `kino-bridge` untouched).', '',
-         f'Changes: {changes}', '']
+         f'Changes: {changes}', '',
+         f'Kotlin: {kotlin[0]} -> {kotlin[1]}' if kotlin[0] != kotlin[1] else f'Kotlin: {kotlin[1]} (unchanged)', '']
     L += ['## Gates', '', '| gate | result |', '|---|---|']
     L += [f'| {g} | {r} |' for g, r in gates] or ['| (none run) | - |']
-    L += ['', f'## Upstream commits touching the plugin API ({len(commits)})', '']
-    L += [f'- {c}' for c in commits[:200]] or ['- none']
+    L += ['', f'## Upstream commits touching the plugin API, the build or a fork-edited file ({len(commits)})', '']
+    L += [commit_line(c) for c in commits[:200]] or ['- none']
     if len(commits) > 200:
         L.append(f'- ... and {len(commits) - 200} more')
     L += ['', '## Symbol oracle', '']
     if not oracle_ran:
         L.append('Oracle not run (build skipped or failed before the classpath was written).')
+    elif not oracle_ok:
+        L.append('Oracle FAILED: no summary line, or its count disagrees with the MISSING rows (see oracle-missing.txt '
+                 'and oracle-missing.err); lost/gained unknown.')
     else:
         L.append(f'Lost (missing now, not allowlisted; restore through compat or add allowlist rows): {len(lost)}')
         L += [f'- `{s}` [{r["kind"]}] plugins={r["plugins"]} es={r["es"]}' for s, r in lost]
@@ -338,6 +367,7 @@ def _show(repo, ref, path):
 
 
 def watched_commits(repo, old, new, ref_for_sources='HEAD'):
+    """Newest first (git log order): the watcher uses the first line as its dedup key."""
     paths = watched_paths(_show(repo, ref_for_sources, 'bridge/app-sources.txt') or '')
     out = _git(repo, 'log', '--no-merges', '--format=%h %s', f'{old}..{new}', '--', *paths)
     return [x for x in out.splitlines() if x]
@@ -345,21 +375,27 @@ def watched_commits(repo, old, new, ref_for_sources='HEAD'):
 
 def report_ok(report):
     """False when the replay itself is wrong: an upstream edit outside the exceptions, settings.gradle.kts differing by
-    more than the include, the compat commit missing / duplicated, or a compat target gone upstream (gates are judged by upstream-bump.sh)."""
+    more than the include, the compat commit missing / duplicated, a compat target gone or CHANGED upstream (its hidden
+    constructors may now delegate wrongly even if everything compiles: a person re-checks them), or an oracle run that
+    did not finish (gates are judged by upstream-bump.sh)."""
     return ('unexpected upstream edit:' not in report and 'UNEXPECTED DIFF' not in report
-            and '(expected 1)' not in report and 'NOT FOUND at the new pin' not in report)
+            and '(expected 1)' not in report and 'NOT FOUND at the new pin' not in report
+            and ': CHANGED' not in report and 'Oracle FAILED' not in report)
 
 
 def build_report(a):
     repo = a.repo
     allow = parse_allowlist(_show(repo, a.base, 'bridge/symbol-allowlist.txt') or '')
     oracle_ran = bool(a.missing and os.path.exists(a.missing))
-    lost, gained = ([], [])
+    lost, gained, oracle_ok = [], [], True
     if oracle_ran:
         with open(a.missing, encoding='utf-8') as f:
-            lost, gained = symbol_delta(allow, parse_missing(f.read()))
+            missing, oracle_ok = parse_oracle(f.read())
+        if oracle_ok:
+            lost, gained = symbol_delta(allow, missing)
     toml = 'gradle/libs.versions.toml'
-    versions = version_delta(parse_versions(_show(repo, a.old_pin, toml) or ''), parse_versions(_show(repo, a.new_pin, toml) or ''))
+    old_v, new_v = parse_versions(_show(repo, a.old_pin, toml) or ''), parse_versions(_show(repo, a.new_pin, toml) or '')
+    versions = version_delta(old_v, new_v)
     compat = {}
     for path, classes in COMPAT_TARGETS.items():
         old_src, new_src = _show(repo, a.old_pin, path) or '', _show(repo, a.new_pin, path) or ''
@@ -380,7 +416,7 @@ def build_report(a):
         lost=lost, gained=gained, versions=versions, compat=compat, unexpected=unexpected_edits(changes),
         settings_ok=settings_ok, compat_commits=subjects.count(COMPAT_SUBJECT),
         foreign=removed + [w for w in foreign_workflows([os.path.basename(w) for w in wf]) if w not in removed],
-        gates=gates, oracle_ran=oracle_ran)
+        gates=gates, oracle_ran=oracle_ran, oracle_ok=oracle_ok, kotlin=(kotlin_version(old_v), kotlin_version(new_v)))
 
 
 def main(argv=None):

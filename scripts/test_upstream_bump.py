@@ -110,6 +110,15 @@ class OracleTest(unittest.TestCase):
         self.assertEqual(len(a), 3)
         self.assertEqual(a['com.lagradost.cloudstream3.extractors.GMPlayer'], 'extractor class absent [1/0]')
 
+    def test_parse_oracle_needs_a_consistent_summary(self):
+        m, ok = ub.parse_oracle(ORACLE_OUT)
+        self.assertTrue(ok)
+        self.assertEqual(len(m), 3)
+        self.assertEqual(ub.parse_oracle('Traceback (most recent call last):\n  boom\n'), ({}, False))
+        cut = ORACLE_OUT.replace('missing (not allowlisted): 3', 'missing (not allowlisted): 4')
+        self.assertFalse(ub.parse_oracle(cut)[1])
+        self.assertFalse(ub.parse_oracle(ORACLE_OUT.split('missing (not')[0])[1])
+
     def test_delta_lost_and_gained(self):
         lost, gained = ub.symbol_delta(ub.parse_allowlist(ALLOWLIST), ub.parse_missing(ORACLE_OUT))
         self.assertEqual([s for s, _ in lost], ['com.lagradost.cloudstream3.NewThing.go()V'])
@@ -201,7 +210,17 @@ class EditsTest(unittest.TestCase):
 class WatchTest(unittest.TestCase):
     def test_watched_paths(self):
         src = '# comment\n\ncom/a/B.kt\n  com/c/D.kt  \n'
-        self.assertEqual(ub.watched_paths(src), ['library/', 'app/src/main/java/com/a/B.kt', 'app/src/main/java/com/c/D.kt'])
+        self.assertEqual(ub.watched_paths(src), ['library/', 'app/src/main/java/com/a/B.kt', 'app/src/main/java/com/c/D.kt',
+                                                 'gradle/', 'settings.gradle.kts', 'build.gradle.kts', 'README.md',
+                                                 '.github/ISSUE_TEMPLATE/'])
+
+    def test_commit_line_cannot_mention_or_link(self):
+        self.assertEqual(ub.commit_line('abc1234 Fix @someone\'s `thing` (#3204)'),
+                         "- abc1234 `Fix @someone's 'thing' (#3204)`")
+
+    def test_kotlin_version(self):
+        self.assertEqual(ub.kotlin_version(ub.parse_versions(TOML)), '2.4.0')
+        self.assertEqual(ub.kotlin_version({'kotlin': '2.1.0'}), '2.1.0')
 
 
 class ReportTest(unittest.TestCase):
@@ -210,6 +229,7 @@ class ReportTest(unittest.TestCase):
                              versions=[], compat={'Episode': {'same': True}}, unexpected=[], settings_ok=True,
                              compat_commits=1, foreign=[], gates=[('unit tests', 'PASS')], oracle_ran=True)
         self.assertIn('Changes: 0', r)
+        self.assertIn('Kotlin: None (unchanged)', r)
         self.assertIn('| unit tests | PASS |', r)
         self.assertNotIn('FAIL', r)
 
@@ -231,12 +251,27 @@ class ReportTest(unittest.TestCase):
                              oracle_ran=False)
         self.assertIn('not run', r)
 
+    def test_kotlin_always_printed(self):
+        kw = dict(old_pin=PIN, new_pin=PIN, branch='x', commits=[], lost=[], gained=[], versions=[], compat={},
+                  unexpected=[], settings_ok=True, compat_commits=1, foreign=[], gates=[], oracle_ran=True)
+        self.assertIn('Kotlin: 2.4.0 (unchanged)', ub.render_report(**kw, kotlin=('2.4.0', '2.4.0')))
+        self.assertIn('Kotlin: 2.4.0 -> 2.5.0', ub.render_report(**kw, kotlin=('2.4.0', '2.5.0')))
+
+    def test_oracle_failed_is_said_and_fails_the_report(self):
+        r = ub.render_report(old_pin=PIN, new_pin=PIN, branch='x', commits=[], lost=[], gained=[], versions=[],
+                             compat={}, unexpected=[], settings_ok=True, compat_commits=1, foreign=[], gates=[],
+                             oracle_ran=True, oracle_ok=False)
+        self.assertIn('Oracle FAILED', r)
+        self.assertNotIn('Gained', r)
+        self.assertFalse(ub.report_ok(r))
+
     def test_report_ok(self):
         self.assertTrue(ub.report_ok('- settings.gradle.kts: only `include(":bridge")`\n- commits on the branch: 1\n'))
         self.assertFalse(ub.report_ok('- unexpected upstream edit: M app/x.kt\n'))
         self.assertFalse(ub.report_ok('- settings.gradle.kts: UNEXPECTED DIFF\n'))
         self.assertFalse(ub.report_ok('commits on the branch: 0 (expected 1)\n'))
         self.assertFalse(ub.report_ok('- Episode: NOT FOUND at the new pin (compat commit needs rework)\n'))
+        self.assertFalse(ub.report_ok('- Episode: CHANGED (parameters reordered)\n'))
 
 
 class BumpScriptTest(unittest.TestCase):
@@ -274,6 +309,8 @@ class BumpScriptTest(unittest.TestCase):
             ub.MAIN_API: MAIN_OLD, ub.EXTRACTOR_API: 'open class ExtractorLink(val a: Int)\n',
             'gradle/libs.versions.toml': TOML, 'README.md': '# Upstream\n',
             '.github/workflows/prerelease.yml': 'name: pre\n', 'app/src/main/java/com/a/B.kt': 'class B\n',
+            '.github/ISSUE_TEMPLATE/application-bug.yml': 'name: app bug\n',
+            '.github/ISSUE_TEMPLATE/config.yml': 'blank_issues_enabled: false\n',
             'library/src/commonMain/kotlin/com/lagradost/cloudstream3/Other.kt': 'class Other\n'})
         subprocess.run(['git', 'clone', '-q', '-o', 'upstream', self.up, self.fork], check=True)
         self.git(self.fork, 'config', 'user.name', 'fixture'); self.git(self.fork, 'config', 'user.email', 'fixture@example.invalid')
@@ -285,8 +322,11 @@ class BumpScriptTest(unittest.TestCase):
             'BRIDGE.md': f'pinned at upstream commit `{self.pin}`\n'})
         self.commit(self.fork, ub.COMPAT_SUBJECT, {ub.MAIN_API: MAIN_OLD + '\n// compat: hidden constructors\n'})
         self.commit(self.fork, 'readme: Kino bridge fork', {'README.md': '# Kino bridge fork\n\n# Upstream\n'})
-        self.base = self.commit(self.fork, 'Bridge: CI', {'.github/workflows/kino-ci.yml': 'name: ci\n'},
-                                delete=['.github/workflows/prerelease.yml'])
+        self.commit(self.fork, 'Bridge: CI', {'.github/workflows/kino-ci.yml': 'name: ci\n'},
+                    delete=['.github/workflows/prerelease.yml'])
+        self.base = self.commit(self.fork, 'Bridge: issue templates', {
+            '.github/ISSUE_TEMPLATE/config.yml': 'kino: true\n', '.github/ISSUE_TEMPLATE/bridge-bug.yml': 'name: bridge\n'},
+            delete=['.github/ISSUE_TEMPLATE/application-bug.yml'])
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -312,9 +352,10 @@ class BumpScriptTest(unittest.TestCase):
             '.github/workflows/new_upstream.yml': 'name: new\n'})
         self.assertTrue(upstream_wf_edit)
         r, d = self.run_bump('master')
-        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        # A changed compat constructor needs a person even though the replay is clean: exit 1, branch kept.
+        self.assertEqual(r.returncode, 1, r.stderr + r.stdout)
         self.assertEqual(self.git(self.fork, 'rev-parse', 'kino-bridge'), self.base)
-        self.assertEqual(self.git(d, 'rev-parse', 'HEAD~6'), new)  # 4 fork commits + pin + workflow drop
+        self.assertEqual(self.git(d, 'rev-parse', 'HEAD~7'), new)  # 5 fork commits + pin + workflow drop
         with open(os.path.join(d, 'bridge/build.gradle.kts')) as f:
             self.assertEqual(ub.read_pin(f.read()), new)
         with open(os.path.join(d, ub.MAIN_API)) as f:
@@ -323,10 +364,59 @@ class BumpScriptTest(unittest.TestCase):
         self.assertIn('airDate', main)
         self.assertEqual(sorted(os.listdir(os.path.join(d, '.github/workflows'))), ['kino-ci.yml'])
         for s in ('Episode: CHANGED', 'added `var airDate: Long? = null`', 'kotlinGradlePlugin: 2.4.0 -> 2.5.0',
+                  'Kotlin: 2.4.0 -> 2.5.0',
                   'lib: Episode gains airDate', 'new_upstream.yml', 'Oracle not run'):
             self.assertIn(s, r.stdout)
         self.assertNotIn('ci: tweak prerelease', r.stdout)  # not the plugin API
         self.assertNotIn('unexpected upstream edit', r.stdout)
+
+    def upstream_change(self):
+        return self.commit(self.up, 'lib: Other grows', {
+            'library/src/commonMain/kotlin/com/lagradost/cloudstream3/Other.kt': 'class Other { fun y() = 2 }\n'})
+
+    def test_base_never_moves_with_update_refs_and_hooks_never_block(self):
+        new = self.upstream_change()
+        self.git(self.fork, 'checkout', '-q', '-b', 'elsewhere', self.pin)  # kino-bridge not checked out anywhere
+        self.git(self.fork, 'config', 'rebase.updateRefs', 'true')
+        self.git(self.fork, 'config', 'rebase.autoStash', 'true')
+        hooks = os.path.join(self.tmp.name, 'hooks')
+        self.write(hooks, 'pre-commit', '#!/bin/sh\nexit 1\n')
+        os.chmod(os.path.join(hooks, 'pre-commit'), 0o755)
+        self.git(self.fork, 'config', 'core.hooksPath', hooks)
+        r, d = self.run_bump('master')
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(self.git(self.fork, 'rev-parse', 'kino-bridge'), self.base)
+        self.assertEqual(self.git(d, 'rev-parse', 'HEAD~6'), new)  # 5 fork commits + pin
+        self.assertIn('lib: Other grows', r.stdout)
+
+    def test_issue_templates_resolve_in_the_forks_favour(self):
+        self.commit(self.up, 'templates: tweak', {'.github/ISSUE_TEMPLATE/application-bug.yml': 'name: app bug 2\n',
+                                                  '.github/ISSUE_TEMPLATE/config.yml': 'blank_issues_enabled: true\n'})
+        r, d = self.run_bump('master')
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+        self.assertEqual(sorted(os.listdir(os.path.join(d, '.github/ISSUE_TEMPLATE'))), ['bridge-bug.yml', 'config.yml'])
+        with open(os.path.join(d, '.github/ISSUE_TEMPLATE/config.yml')) as f:
+            self.assertEqual(f.read(), 'kino: true\n')
+        self.assertIn('templates: tweak', r.stdout)  # watched: a fork-edited upstream file
+
+    def test_internal_failure_before_the_gates_cleans_up_with_exit_4(self):
+        self.base = self.commit(self.fork, 'Bridge: no BRIDGE.md', delete=['BRIDGE.md'])  # the pin's sed then fails
+        self.upstream_change()
+        r, d = self.run_bump('master', '--branch', 'broken')
+        self.assertEqual(r.returncode, 4, r.stderr + r.stdout)
+        self.assertIn('internal error', r.stderr)
+        self.assertFalse(os.path.exists(d))
+        self.assertEqual(self.git(self.fork, 'branch', '--list', 'broken'), '')
+        self.assertEqual(self.git(self.fork, 'rev-parse', 'kino-bridge'), self.base)
+
+    def test_refuses_a_base_holding_upstream_commits_past_its_pin(self):
+        self.upstream_change()
+        self.git(self.fork, 'fetch', '-q', 'upstream')
+        self.git(self.fork, 'merge', '-q', '--no-edit', 'upstream/master')
+        self.commit(self.up, 'lib: more', {'library/x.kt': 'x\n'})
+        r, _ = self.run_bump('master')
+        self.assertEqual(r.returncode, 2, r.stderr + r.stdout)
+        self.assertIn('past its pin', r.stderr)
 
     def test_conflict_aborts_and_leaves_nothing(self):
         self.commit(self.up, 'settings: new module', {
