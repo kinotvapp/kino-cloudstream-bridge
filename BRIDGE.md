@@ -19,9 +19,12 @@ Everything we add lives only in `bridge/`, `bridge-contract/`, `scripts/`, `.git
 - the "Kino bridge fork" section at the top of `README.md` (upstream's text kept below it);
 - upstream's GitHub workflows, deleted (`build_to_archive`, `prerelease`, `update_locales`, `generate_dokka`,
   `pull_request`, `instrumented-tests`): they use upstream's secrets, apps and repositories. Only
-  `.github/workflows/kino-ci.yml` and `upstream-watch.yml` run here.
+  `.github/workflows/kino-ci.yml` and `upstream-watch.yml` run here;
+- upstream's issue forms (`.github/ISSUE_TEMPLATE/application-bug.yml`, `feature-request.yml`), deleted, and its
+  `config.yml` replaced: this repository takes Kino bridge bugs only (`bridge-bug.yml`), and `config.yml` points
+  CloudStream app bugs to recloudstream/cloudstream and extension bugs to their own repositories.
 
-## Compat ABI (the one upstream edit)
+## Compat ABI (upstream edit)
 
 Many published extensions were compiled against older CloudStream and call constructors upstream
 has since removed, so stock CloudStream at our pin refuses them too. The commit
@@ -49,8 +52,8 @@ stay in `bridge/symbol-allowlist.txt`; an extension that needs them is refused, 
 
 ## License
 
-GPL-3.0, like upstream (see `LICENSE`). Source for any APK: this repository at the tag matching
-the APK's `versionName`.
+GPL-3.0, like upstream (see `LICENSE`). Source for any APK: this repository at the tag `bridge-v<versionName>`
+of that APK (the same name as the Kino release that carries it), pushed before the APK is published.
 
 Exception: `bridge-contract/` (the AIDL and wire protocol shared with Kino) is Apache-2.0, full text in
 `bridge-contract/LICENSE`.
@@ -86,23 +89,80 @@ published by a person on the Mac with `:bridge:assembleRelease`, which runs `ver
 only from a successful `assembleRelease` run, never from a bare `packageRelease` (it writes the APK before the check
 that is attached to it as a finalizer).
 
+`:bridge:check` is `testDebugUnitTest`, `symbolCoverage` (with its self-test) and `lintDebug`: about 1.5 minutes warm on
+the Mac. There is no `testReleaseUnitTest` in it.
+
+## Releasing
+
+1. On `kino-bridge`, with every gate green: `./gradlew :bridge:assembleRelease -PbridgeVersionCode=N
+   -PbridgeVersionName=X.Y.Z` with the `KINO_*` signing variables set (on the Mac only).
+2. Tag that commit `bridge-vX.Y.Z` and push the tag (`git push origin bridge-vX.Y.Z`) **before** publishing the APK:
+   the tag is the GPL source offer, and Kino's release for the APK uses the same name.
+3. Publish through Kino (`scripts/publish-release-github.sh --bridge <apk>` in the Kino repository).
+
+## Publishing this repo
+
+- Create it as a standalone repository on the kinotvapp account, **not** with GitHub's Fork button: on forks, Issues
+  and scheduled workflows are off by default, so the watcher's issue and its schedule would silently do nothing. If a
+  fork is unavoidable, enable both by hand.
+- Push only `kino-bridge` and the `bridge-v*` tags. Never push `master`, `upstream/*` or the `pre-release` tag: upstream's
+  workflows still exist on those commits, and a push to `master` (or a PR against it) would run them.
+- Set `kino-bridge` as the default branch: scheduled workflows only run from the default branch, and the watcher takes
+  it as the base of the replay.
+- GitHub pauses a public repository's scheduled workflows after 60 days without activity: check now and then that
+  "Upstream watch" is still enabled (Actions tab), and re-enable it if not.
+
 ## Keeping up with upstream
 
-`scripts/upstream-bump.sh <upstream-ref>` fetches the ref without blobs, replays every commit of this fork since the pin
-onto it on a **new local branch** in its own worktree (default `upstream-bump/<short sha>`; `kino-bridge` and every
-remote are left alone), moves the pin (`upstreamCommit` in `bridge/build.gradle.kts`, the line at the top of this
-file), deletes workflows upstream added since, then runs the script tests, `:bridge:testDebugUnitTest`, `CompatAbiTest`,
-`:bridge:symbolCoverage` and an unsigned `:bridge:assembleRelease` (with `verifyPluginAbiRelease`). Its report lists:
-upstream commits touching the plugin API, oracle symbols lost (missing now and not allowlisted: restore through compat
-or add allowlist rows) and gained (allowlist rows to delete), each compat target's primary constructor old vs new, version
-catalog changes, and any upstream file that differs outside the exceptions above. A conflict aborts and leaves nothing
-(an upstream edit to a workflow we deleted stays deleted). Exit 0 all gates passed, 1 a gate failed, 2 refused input, 3
-conflict. `GRADLE_CMD` replaces `./gradlew` (e.g. a wrapper that limits concurrent builds). Run against the current pin
-it reproduces `kino-bridge`'s tree exactly and reports `Changes: 0`.
+`scripts/upstream-bump.sh <upstream-ref>` fetches the ref without blobs and replays every commit of this fork since the
+pin onto it, on a **new local branch** in its own worktree (default `upstream-bump/<short sha>`). It never pushes and
+never changes an existing branch or remote: it only adds an `upstream` fetch remote when there is none (fetching
+updates `refs/remotes/upstream/*`), and it forces `rebase.updateRefs` and `rebase.autoStash` off so `kino-bridge` cannot
+move. It refuses a ref unless the merge base of `kino-bridge` and the ref is exactly the pin. It moves the pin
+(`upstreamCommit` in `bridge/build.gradle.kts`, the line at the top of this file) and deletes workflows upstream added
+since, in commits of its own that skip hooks and signing. Then it runs the gates: the script tests, `:bridge:check`,
+`CompatAbiTest` (read from the unit-test results) and an unsigned `:bridge:assembleRelease` (with
+`verifyPluginAbiRelease`).
 
-`.github/workflows/upstream-watch.yml` runs it daily (and by hand) in GitHub Actions when upstream has commits touching
-`library/` or a file in `bridge/app-sources.txt`, and opens (or updates) one `[upstream-watch]` issue with the report.
-It uses only the default `GITHUB_TOKEN` (issues: write) and never pushes. A person decides to bump: review the branch,
-fix what the report asks, merge into `kino-bridge`, bump `bridgeVersionCode`, sign on the Mac and publish through Kino.
+Its report lists the Kotlin version (always), upstream commits touching watched paths (as code: no mentions, no links),
+oracle symbols lost (missing now and not allowlisted: restore through compat or add allowlist rows) and gained
+(allowlist rows to delete), each compat target's primary constructor old vs new, version catalog changes, and any
+upstream file that differs outside the exceptions above. An oracle run without a consistent summary is reported as
+FAILED, never as "nothing missing". A conflict aborts and leaves nothing; upstream edits to a workflow or issue form we
+deleted stay deleted, and our `config.yml` wins.
+
+Exit codes:
+
+- 0: every gate passed and nothing needs a person;
+- 1: a gate failed, or the report needs a person (a CHANGED compat constructor, whose hidden constructors may now
+  delegate wrongly even if everything compiles; an unexpected upstream edit; a failed oracle). The branch is kept;
+- 2: refused input;
+- 3: conflict;
+- 4: internal error before the gates (branch and worktree removed).
+
+`GRADLE_CMD` replaces `./gradlew` (e.g. a wrapper that limits concurrent builds). Run against the current pin it
+reproduces `kino-bridge`'s tree exactly and reports `Changes: 0`.
+
+The plugin sample is not re-measured here. `bridge/src/test/resources/cs3-symbols.tsv` is refreshed by hand from Kino's
+private research folder, and only aggregated counts are committed. An upstream bump changes what the bridge exports,
+which the oracle checks against the new classpath. Re-measuring plugins tracks the plugin ecosystem, has nothing to do
+with upstream, and would download third-party plugins and publish plugin-repository URLs in a public repository.
+
+`.github/workflows/upstream-watch.yml` runs it **weekly** (and by hand) in GitHub Actions. It watches upstream commits
+touching `library/`, a file in `bridge/app-sources.txt`, `gradle/`, the root `build.gradle.kts` / `settings.gradle.kts`,
+`README.md` or `.github/ISSUE_TEMPLATE/`. It reports each newest watched commit once (open or closed issue), in one
+`[upstream-watch]` issue that later reports comment on while it is open. It uses only the default `GITHUB_TOKEN`
+(issues: write) and never pushes.
+
+A person decides to bump. The bump branch is a rebased copy of the whole fork, so it **replaces** `kino-bridge`; never
+merge it in, because that would double the history and the next bump would count two compat commits.
+
+1. Review the branch and fix what the report asks, as new commits on it.
+2. Make sure the current release is tagged (`bridge-v<versionName>`, see "Releasing") so its sources stay reachable.
+3. `git branch -f kino-bridge upstream-bump/<sha>`.
+4. `git push --force-with-lease origin kino-bridge`.
+5. Bump `bridgeVersionCode`, then release as above.
+
+The public `kino-bridge` is rewritten on every bump; the `bridge-v*` tags are what stays.
 
 Tests of the script's parsing, report and git replay (on throwaway repositories): `python3 scripts/test_upstream_bump.py`.
