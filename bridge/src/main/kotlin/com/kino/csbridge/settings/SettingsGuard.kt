@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 object SettingsGuard {
     /** Tests turn the loop guard off: Robolectric's main looper runs on the test thread, which `Looper.loop()` would block. */
     @Volatile internal var loopGuard = true
-    /** True once the loop guard runs (tests set it to exercise the main-thread report path). */
+    /** True once the loop guard is running, set from inside it (tests set it to exercise the main-thread report path). */
     @Volatile internal var mainGuarded = false
     private val installed = AtomicBoolean()
 
@@ -53,8 +53,10 @@ object SettingsGuard {
         if (current !is Wrapper) Thread.setDefaultUncaughtExceptionHandler(Wrapper(current))
         if (!installed.compareAndSet(false, true)) return
         if (loopGuard) {
-            mainGuarded = true
             Handler(Looper.getMainLooper()).post {
+                // Only now does a main-thread throwable meet the guard first; before this, one that unwound the loop must
+                // still crash cleanly (never be absorbed by the default handler on a dead main thread).
+                mainGuarded = true
                 while (true) {
                     try {
                         Looper.loop()

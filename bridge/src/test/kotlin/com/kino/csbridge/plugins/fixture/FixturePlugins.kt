@@ -136,8 +136,8 @@ class SettingsPlugin : Plugin() {
     class TeardownFragment : androidx.fragment.app.DialogFragment() {
         override fun onCreateDialog(savedInstanceState: android.os.Bundle?): android.app.Dialog =
             android.app.AlertDialog.Builder(requireContext()).setMessage("settings").create()
+        // Touches its binding before super (which would dismiss the dialog): the dialog is still up when it throws.
         override fun onDestroyView() {
-            super.onDestroyView()
             throw UninitializedPropertyAccessException("binding https://x.example/p?token=secret")
         }
     }

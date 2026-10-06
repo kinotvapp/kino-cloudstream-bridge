@@ -416,7 +416,7 @@ class PluginSettingsActivityTest {
         assertFalse(SettingsGuard.absorb(e, onMainThread = false))
     }
 
-    @Test fun `a throw from the plugin's fragment teardown is absorbed, even after the plugin was removed`() {
+    @Test fun `a throw from the plugin's fragment teardown is contained in onDestroy, even after the plugin was removed`() {
         install("cloudstream-a", SettingsPlugin::class.java)
         SettingsPlugin.mode = SettingsPlugin.Mode.TEARDOWN_THROW
         val c = launch()
@@ -424,13 +424,24 @@ class PluginSettingsActivityTest {
         registry.remove("cloudstream-a"); idle() // its live classes are unregistered; the screen kept its own copy
         assertNull(com.kino.csbridge.plugins.PluginFrames.claim("cloudstream-a"))
         assertTrue(c.get().isFinishing)
+        // The destroy completes (the framework then removes the token's windows): nothing escapes it.
         val e = runCatching { c.pause(); c.stop(); c.destroy() }.exceptionOrNull()
-        assertTrue("teardown threw", e != null)
-        // Still inside the session: its end runs after onDestroy.
-        assertEquals("cloudstream-a", SettingsSession.pluginId())
-        assertTrue(SettingsGuard.absorb(e!!, onMainThread = true))
+        assertNull(e)
+        assertTrue(c.get().isDestroyed)
+        assertEquals(CsWire.Err.CANCELLED, c.error())
         idle()
         assertNull(SettingsSession.pluginId())
+    }
+
+    @Test fun `a teardown throw that is not the plugin's still escapes onDestroy`() {
+        install("cloudstream-a", SettingsPlugin::class.java)
+        SettingsPlugin.mode = SettingsPlugin.Mode.TEARDOWN_THROW
+        val c = launch()
+        c.windowFocusChanged(false)
+        SettingsSession.clearForTest() // no open session: nothing is the screen's plugin's to absorb
+        c.get().finish(); idle()
+        val e = runCatching { c.pause(); c.stop(); c.destroy() }.exceptionOrNull()
+        assertTrue(e != null)
     }
 
     @Test fun `a Dispatchers Main coroutine throw reported to the main thread's handler is absorbed when the loop is guarded`() {

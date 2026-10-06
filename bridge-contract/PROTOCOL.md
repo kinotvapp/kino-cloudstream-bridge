@@ -217,8 +217,9 @@ a television; the bridge refuses there anyway). Constants: `CsWire.Settings`.
   entry is not a crash when the result was `plugin_error`.
 - **Release gate** (manual, every bridge release that changes the settings screen or `SettingsGuard`): on one physical
   phone, a fixture plugin whose settings button throws, whose `Dispatchers.Main` coroutine throws, and whose fragment
-  throws in `onDestroyView` each give `plugin_error`, no "keeps stopping" dialog, no ANR, and a resolve or playback in
-  progress in Kino that survives.
+  throws in `onDestroyView` (before calling `super`) each give `plugin_error` (or the close's own result), no "keeps
+  stopping" dialog, no ANR, no plugin window left over Kino with Kino taking touches at once, and a resolve or playback
+  in progress in Kino that survives.
 - **Result**: `RESULT_OK` (no data, no extras) when the screen ran and closed. The plugin may have changed its values:
   Kino reloads whatever it shows from the plugin (its next op sees the new values). `RESULT_CANCELED` with the String
   extra `com.kino.csbridge.extra.ERROR` (`CsWire.Settings.EXTRA_ERROR`):

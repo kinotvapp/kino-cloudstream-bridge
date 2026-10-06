@@ -220,7 +220,15 @@ class PluginSettingsActivity : AppCompatActivity() {
         runCatching { supportFragmentManager.unregisterFragmentLifecycleCallbacks(fragmentWatcher) }
         registry?.removeUnloadListener(unloaded)
         session?.let { token -> Handler(Looper.getMainLooper()).post { SettingsSession.end(token) } }
-        super.onDestroy()
+        // A plugin fragment throwing in its teardown (onDestroyView / onDismiss) is contained HERE, so the framework still
+        // completes the destroy: Activity.onDestroy already set mCalled, the windows of this token (the plugin's dialogs
+        // included) are removed and the destroy is reported, so no plugin window stays over Kino. Anything not the
+        // plugin's is rethrown as before.
+        try {
+            super.onDestroy()
+        } catch (t: Throwable) {
+            if (!SettingsGuard.absorb(t, onMainThread = false)) throw t
+        }
     }
 
     // The plugin may keep this Context: its prefs go where the app's go (Kino), never to a file in this data dir.
