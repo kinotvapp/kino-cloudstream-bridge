@@ -1,14 +1,16 @@
-# GPL-3.0 (this fork). Watches upstream CloudStream for commits that touch the plugin API (all of :library, extractors
-# included, and the :app files :bridge compiles, bridge/app-sources.txt). When there are new ones, it replays this fork
-# onto them with scripts/upstream-bump.sh in the runner (build and checks, unsigned, nothing pushed) and opens one
-# issue in this repository with the report: oracle symbols lost/gained, compat targets, gates. One rolling issue: a
-# later upstream commit updates the open one instead of opening another.
+# GPL-3.0 (this fork). Weekly, watches upstream CloudStream for commits that touch the plugin API (all of :library,
+# extractors included, and the :app files :bridge compiles, bridge/app-sources.txt), the version catalog and root build,
+# or an upstream file this fork edits (scripts/upstream_bump.py watched_paths). When there are new ones, it replays this
+# fork onto upstream with scripts/upstream-bump.sh in the runner (build and checks, unsigned, nothing pushed) and opens
+# one issue in this repository with the report: oracle symbols lost/gained, compat targets, gates. Each newest watched
+# commit is reported once (open or closed issue); while an issue is open, later reports go to it as comments.
 # Only the default GITHUB_TOKEN is used (issues: write). It never pushes, tags, signs or publishes; a person decides.
+# Scheduled runs use the default branch (must be kino-bridge) and GitHub pauses them after 60 days without activity.
 name: Upstream watch
 
 on:
   schedule:
-    - cron: "23 5 * * *"
+    - cron: "23 5 * * 1"
   workflow_dispatch:
     inputs:
       ref:
@@ -38,7 +40,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Look for upstream commits touching the plugin API
+      - name: Look for new upstream commits on watched paths
         id: check
         env:
           REF: ${{ inputs.ref || 'master' }}
@@ -53,17 +55,24 @@ jobs:
           pin="$(python3 scripts/upstream_bump.py pin)"
           python3 scripts/upstream_bump.py watched-commits --old "$pin" --new "$new" > "$RUNNER_TEMP/commits.txt"
           count="$(grep -c . "$RUNNER_TEMP/commits.txt" || true)"
-          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "\"$TITLE_PREFIX\" in:title" \
-            --json number,title --jq "map(select(.title | startswith(\"$TITLE_PREFIX\")))[0] // empty | \"\(.number) \(.title)\"")"
-          run=true
+          # The dedup key is the newest watched commit (first line), not the moving upstream head.
+          key="$(grep -m 1 . "$RUNNER_TEMP/commits.txt" | cut -d' ' -f1 || true)"
+          run=true; issue=""
           if [ "$count" = 0 ]; then
-            echo "No upstream commit since ${pin:0:9} touches the plugin API."; run=false
-          elif printf '%s' "$issue" | grep -q "$short"; then
-            echo "Already reported in #${issue%% *}."; run=false
+            echo "No upstream commit since ${pin:0:9} touches a watched path."; run=false
+          else
+            seen="$(gh issue list --repo "$GITHUB_REPOSITORY" --state all --limit 100 --search "$key in:title" \
+              --json number,title --jq "map(select(.title | startswith(\"$TITLE_PREFIX\") and contains(\"$key\")))[0].number // empty")"
+            if [ -n "$seen" ]; then
+              echo "Upstream $key already reported in #$seen."; run=false
+            else
+              issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 100 --search "upstream-watch in:title" \
+                --json number,title --jq "map(select(.title | startswith(\"$TITLE_PREFIX\")))[0].number // empty")"
+            fi
           fi
           {
-            echo "new=$new"; echo "short=$short"; echo "count=$count"; echo "run=$run"
-            echo "issue=${issue%% *}"
+            echo "new=$new"; echo "short=$short"; echo "key=$key"; echo "count=$count"; echo "run=$run"
+            echo "issue=$issue"
           } >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK 17
@@ -92,6 +101,7 @@ jobs:
             --report "$RUNNER_TEMP/report.md" "$NEW" 2> "$RUNNER_TEMP/bump.err" || rc=$?
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           tail -n 40 "$RUNNER_TEMP/bump.err"
+          [ ! -s "$RUNNER_TEMP/report.md" ] || cat "$RUNNER_TEMP/report.md"
 
       - name: Open or update the issue
         if: steps.check.outputs.run == 'true'
@@ -99,6 +109,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           NEW: ${{ steps.check.outputs.new }}
           SHORT: ${{ steps.check.outputs.short }}
+          KEY: ${{ steps.check.outputs.key }}
           COUNT: ${{ steps.check.outputs.count }}
           ISSUE: ${{ steps.check.outputs.issue }}
           RC: ${{ steps.bump.outputs.rc }}
@@ -106,27 +117,34 @@ jobs:
           set -euo pipefail
           case "$RC" in
             0) verdict="replays cleanly, every gate passed" ;;
-            1) verdict="replays, but a gate or check FAILED" ;;
+            1) verdict="replays, but a gate failed or the report needs a person" ;;
             3) verdict="does NOT replay: conflict" ;;
+            4) verdict="the bump script hit an internal error" ;;
             *) verdict="the bump script stopped (exit $RC)" ;;
           esac
+          # GitHub caps a body at 65536 characters: cut on a character boundary, well under it.
+          cap() {
+            python3 -c 'import sys; t = sys.stdin.read(); n = int(sys.argv[1]); sys.stdout.write(t if len(t) <= n else t[:n] + "\n\n(truncated; the full report is in the run log)\n")' "$1"
+          }
           body="$RUNNER_TEMP/body.md"
           {
-            echo "Upstream \`$NEW\` has $COUNT new commit(s) touching the plugin API: $verdict."
+            echo "Upstream \`$NEW\` has $COUNT new watched commit(s), newest $KEY: $verdict."
             echo
             echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. Nothing was pushed; to bump, run"
             echo "\`scripts/upstream-bump.sh $NEW\` locally and follow BRIDGE.md \"Keeping up with upstream\"."
             echo
             if [ -s "$RUNNER_TEMP/report.md" ]; then
-              head -c 55000 "$RUNNER_TEMP/report.md"
+              # The report writes upstream subjects as code: no @mention pings, no (#123) links to this repository.
+              cap 45000 < "$RUNNER_TEMP/report.md"
             else
-              echo '```'; tail -n 40 "$RUNNER_TEMP/bump.err" | head -c 20000; echo '```'
+              echo '```'; tail -n 40 "$RUNNER_TEMP/bump.err" | cap 10000; echo '```'
+              echo
+              echo "Upstream commits:"
+              python3 -c 'import sys; sys.path.insert(0, "scripts"); import upstream_bump as u; print("\n".join(u.commit_line(l.rstrip("\n")) for l in list(sys.stdin)[:100] if l.strip()))' \
+                < "$RUNNER_TEMP/commits.txt" | cap 10000
             fi
-            echo
-            echo "Upstream commits:"
-            sed 's/^/- /' "$RUNNER_TEMP/commits.txt" | head -n 100
           } > "$body"
-          title="$TITLE_PREFIX upstream $SHORT changes the plugin API ($COUNT commits): $verdict"
+          title="$TITLE_PREFIX upstream $KEY (head $SHORT, $COUNT watched commits): $verdict"
           if [ -n "$ISSUE" ]; then
             gh issue edit "$ISSUE" --repo "$GITHUB_REPOSITORY" --title "$title"
             gh issue comment "$ISSUE" --repo "$GITHUB_REPOSITORY" --body-file "$body"

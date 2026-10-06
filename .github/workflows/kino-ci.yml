@@ -1,4 +1,4 @@
-# GPL-3.0 (this fork). Kino bridge CI: script tests, unit tests, the symbol oracle, the debug APK and an UNSIGNED
+# GPL-3.0 (this fork). Kino bridge CI: script tests, :bridge:check (unit tests, symbol oracle, lint), the debug APK and an UNSIGNED
 # release APK with its plugin-ABI check (verifyPluginAbiRelease), on every push and pull request.
 # Nothing is published or uploaded as an APK from here, and no secret is read: a release is signed and published by a
 # person on the Mac (BRIDGE.md "Build"), with :bridge:assembleRelease, which runs verifyPluginAbiRelease first.
@@ -43,8 +43,8 @@ jobs:
           python3 scripts/test_symbol_coverage.py
           python3 scripts/test_upstream_bump.py
 
-      - name: Unit tests and symbol oracle
-        run: ./gradlew :bridge:testDebugUnitTest :bridge:symbolCoverage
+      - name: Unit tests, symbol oracle and lint
+        run: ./gradlew :bridge:check
 
       - name: Debug APK
         run: ./gradlew :bridge:assembleDebug
