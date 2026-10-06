@@ -66,7 +66,7 @@ class IpcInterceptor(
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val call = chain.call()
-        val ctx = CallCapture.of(call) ?: CallContext.current() ?: throw IOException("bridge: request outside a Kino call")
+        val ctx = CallCapture.of(call) ?: CallContext.current() ?: throw QuietIOException("bridge: request outside a Kino call")
         val client = RedirectFlag.clientOf(call)
         val follow = client?.followRedirects ?: true
         val downstream = client?.let { downstreamOf(it) }.orEmpty()
@@ -151,7 +151,7 @@ class IpcInterceptor(
 
     /** One IPC: [req] to Kino, its answer back as an OkHttp response streaming from the sink pipe. */
     private fun exchange(req: Request, call: Call, ctx: CallContext, follow: Boolean, explicitMs: Int): Response {
-        if (ctx.isOver()) throw IOException("bridge: the Kino call is over (cancelled or past its deadline)")
+        if (ctx.isOver()) throw QuietIOException("bridge: the Kino call is over (cancelled or past its deadline)")
         val h = host() ?: throw IOException("bridge: Kino is not connected")
 
         val body = req.body?.let { readCapped(it) }
@@ -180,6 +180,9 @@ class IpcInterceptor(
 
         val replyJson = try {
             awaitReply(waiter, ctx, call, h)
+        } catch (e: QuietIOException) {
+            closeQuietly(sink[0])
+            throw e // the op is over: Kino already knows, nothing to log
         } catch (e: IOException) {
             closeQuietly(sink[0])
             fail(req.url, e.message ?: "no reply", null)
@@ -193,9 +196,9 @@ class IpcInterceptor(
         try {
             while (true) {
                 waiter.reply?.let { return it }
-                if (ctx.job?.isActive == false || call.isCanceled()) throw IOException("cancelled")
+                if (ctx.job?.isActive == false || call.isCanceled()) throw QuietIOException("bridge: cancelled")
                 val left = ctx.remainingMs()
-                if (left == 0L) throw IOException("deadline reached waiting for Kino")
+                if (left == 0L) throw QuietIOException("bridge: deadline reached waiting for Kino")
                 if (!h.asBinder().isBinderAlive) throw IOException("Kino died")
                 waiter.await(minOf(left, POLL_MS))
             }
@@ -208,7 +211,8 @@ class IpcInterceptor(
         val r = runCatching { JSONObject(replyJson) }.getOrNull()
         CsWire.errorOf(replyJson)?.let { (code, msg) ->
             closeQuietly(read)
-            fail(req.url, "Kino refused the request: $code ${scrubUrls(msg).take(160)}", null)
+            if (code == CsWire.Err.CANCELLED) throw QuietIOException("bridge: cancelled")
+            fail(req.url, failureText(code, msg), null)
         }
         val status = r?.optInt("status", -1) ?: -1
         if (r == null || status !in 100..999) { closeQuietly(read); fail(req.url, "malformed reply", null) }
@@ -335,6 +339,22 @@ class IpcInterceptor(
             }
         }
 
+        /**
+         * How Kino's error answer is logged and thrown: a failure of the request itself (network, timeout, size, Kino
+         * stopping) says what failed; "refused" is kept for Kino's gates (refused, blocked, not_allowed, bad_request,
+         * budget). Kino's message is an exception class or a short reason; URLs in it are scrubbed anyway.
+         */
+        internal fun failureText(code: String, msg: String): String {
+            val m = scrubUrls(msg).take(160)
+            return when (code) {
+                CsWire.Err.NETWORK -> "network error: $m"
+                CsWire.Err.TIMEOUT -> "timed out: $m"
+                CsWire.Err.TOO_LARGE -> "too large: $m"
+                CsWire.Err.UNAVAILABLE -> "Kino unavailable: $m"
+                else -> "Kino refused the request: $code $m"
+            }
+        }
+
         private fun log(msg: String) { runCatching { Log.w(TAG, msg) } }
         private fun closeQuietly(pfd: ParcelFileDescriptor?) { runCatching { pfd?.close() } }
     }
@@ -373,4 +393,14 @@ object NetworkShim {
         app.baseClient = c
         insecureApp.baseClient = c
     }
+}
+
+/**
+ * The op this request served is over (cancelled, past its deadline) or there never was one. Expected and already known
+ * to Kino, so it carries no stack trace: upstream's `logError` (and plugins' own catch blocks) call `printStackTrace()`
+ * on whatever a request throws, and a cancelled `loadLinks` would otherwise print a full stack per pending request.
+ * Printed, it is one line.
+ */
+class QuietIOException(message: String) : IOException(message) {
+    override fun fillInStackTrace(): Throwable = this
 }

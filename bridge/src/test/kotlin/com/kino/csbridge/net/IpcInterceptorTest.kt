@@ -198,7 +198,35 @@ class IpcInterceptorTest {
         // Blocking OkHttp from the op's thread: the interceptor itself must notice the cancellation.
         val e = assertIo { inCall(ctx) { okhttp().newCall(Request.Builder().url("https://a.example/silent").build()).execute() } }
         assertTrue(e.message!!.contains("cancel"))
+        // Expected, so quiet: no stack trace (upstream's logError prints one per request), one line when printed.
+        assertTrue(e is QuietIOException)
+        val printed = java.io.StringWriter().also { e.printStackTrace(java.io.PrintWriter(it)) }.toString().trim()
+        assertEquals(1, printed.lines().size)
         assertTrue("took ${ms(t0)} ms", ms(t0) < 3_000)
+    }
+
+    @Test fun `a network failure in Kino is worded as a network error, not a refusal`() {
+        serve("https://a.example/n" to Route(error = CsWire.Err.NETWORK))
+        val e = assertIo { inCall { app.get("https://a.example/n") } }
+        assertTrue(e.message!!, e.message!!.startsWith("bridge: network error: "))
+        assertFalse(e.message!!.contains("refused"))
+        assertFalse(e.message!!.contains("secret"))
+    }
+
+    @Test fun `only Kino's gates read as refused`() {
+        assertEquals("network error: SocketException", IpcInterceptor.failureText(CsWire.Err.NETWORK, "SocketException"))
+        assertEquals("timed out: SocketTimeoutException", IpcInterceptor.failureText(CsWire.Err.TIMEOUT, "SocketTimeoutException"))
+        assertEquals("Kino unavailable: host stopped", IpcInterceptor.failureText(CsWire.Err.UNAVAILABLE, "host stopped"))
+        for (gate in listOf(CsWire.Err.REFUSED, CsWire.Err.BLOCKED, CsWire.Err.NOT_ALLOWED, CsWire.Err.BAD_REQUEST, CsWire.Err.BUDGET)) {
+            assertTrue(IpcInterceptor.failureText(gate, "x").startsWith("Kino refused the request: $gate"))
+        }
+        assertEquals("network error: at https://h.example/a", IpcInterceptor.failureText(CsWire.Err.NETWORK, "at https://h.example/a/b?token=s"))
+    }
+
+    @Test fun `Kino cancelling the request is quiet`() {
+        serve("https://a.example/c" to Route(error = CsWire.Err.CANCELLED))
+        val e = assertIo { inCall { app.get("https://a.example/c") } }
+        assertTrue(e is QuietIOException)
     }
 
     @Test fun `Kino error reply is an IOException without the query`() {
