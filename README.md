@@ -1,3 +1,28 @@
+# Kino bridge fork
+
+This is a fork of [recloudstream/cloudstream](https://github.com/recloudstream/cloudstream) kept by the Kino project
+on branch `kino-bridge`. It is **not** the CloudStream app and is not affiliated with the CloudStream developers;
+please do not report CloudStream issues here.
+
+**What it is.** A headless Android application, the `:bridge` module (`com.kino.csbridge`), that runs CloudStream
+extensions (`.cs3` plugins) for [Kino](https://github.com/kinotvapp/kino-light), an Android video app. It has no UI.
+
+**Why it exists.** Kino lets people use CloudStream extensions without giving third-party plugin code the network or
+Kino's own process: the bridge is a separate, sandboxed plugin host that holds **no network permission** (no
+`INTERNET`, `ACCESS_NETWORK_STATE` or `ACCESS_WIFI_STATE`). Every request a plugin makes goes to Kino over IPC, and
+Kino decides what reaches the network. The fork follows upstream closely: everything it adds lives in `bridge/`,
+`bridge-contract/`, `scripts/`, `.github/` and `BRIDGE.md`, plus a few named upstream edits. Details in
+[BRIDGE.md](BRIDGE.md).
+
+**License and source.** GPL-3.0, like upstream (see [LICENSE](LICENSE)). The complete corresponding source of every
+bridge APK Kino distributes is this repository at the tag matching the APK's `versionName`. Exception: `bridge-contract/`
+(the AIDL interfaces and wire protocol shared with Kino) is Apache-2.0, full text in
+[bridge-contract/LICENSE](bridge-contract/LICENSE).
+
+Upstream's README follows, unchanged.
+
+---
+
 # CloudStream
 
 **⚠️ Warning: By default, this app doesn't provide any video sources; you have to install extensions to add functionality to the app.**
