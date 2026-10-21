@@ -16,7 +16,7 @@ import kotlin.system.exitProcess
 /** The platform's own classes (the UI a plugin's settings dialog is made of) are never linked on the desktop: not checked. */
 internal fun isPlatformOwner(desc: String): Boolean =
     desc.startsWith("Landroid/") || desc.startsWith("Landroidx/") || desc.startsWith("Ldalvik/") ||
-        desc.startsWith("Lcom/google/android/")
+        desc.startsWith("Lcom/google/android/") || desc.startsWith("Lorg/xmlpull/")
 
 fun main(args: Array<String>) {
     val dataDir = args.firstOrNull { it.startsWith("--data-dir=") }?.removePrefix("--data-dir=")

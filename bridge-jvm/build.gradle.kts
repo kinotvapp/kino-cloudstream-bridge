@@ -70,7 +70,16 @@ dependencies {
     implementation("me.xdrop:fuzzywuzzy:1.4.0")
     implementation("com.android.tools.smali:smali-dexlib2:3.0.9")
     implementation("de.femtopedia.dex2jar:dex-translator:2.4.38")
+    implementation("org.ow2.asm:asm:9.10.1")
+    implementation("org.ow2.asm:asm-commons:9.10.1")
+    // org.xmlpull.v1 is part of the Android platform; plugins parse XML with it.
+    implementation("xmlpull:xmlpull:1.1.3.1")
     testImplementation(libs.junit)
 }
 
-application { mainClass.set("com.kino.csbridge.desktop.MainKt") }
+application {
+    mainClass.set("com.kino.csbridge.desktop.MainKt")
+    // Plugin classes come from a dex translator and reference Android classes the desktop only defines on demand: the
+    // JVM must not verify them (it would load every referenced class, and the platform ones are empty shells).
+    applicationDefaultJvmArgs = listOf("-XX:+UnlockDiagnosticVMOptions", "-XX:-BytecodeVerificationRemote", "-Xss2m")
+}

@@ -122,6 +122,8 @@ class SymbolChecker(
                 if (key in def.members) return true
                 queue += def.supertypes
             } else {
+                // A member inherited from a platform class (a plugin's DialogFragment subclass calling getDialog()) is the platform's.
+                if (platformOwner(t)) return true
                 val c = load(t) ?: continue
                 val ms = membersOf(c)
                 if (key in ms || (polymorphicKey != null && polymorphicKey in ms)) return true
