@@ -7,8 +7,7 @@ GPL-3.0, like the rest of this fork (`bridge-contract/` stays Apache-2.0).
 Every request a plugin makes, and every value it stores, goes back to Kino through the host (`IHost`), exactly as on Android.
 
 ```
-./gradlew :bridge-jvm:installDist        # build/install/bridge-jvm/{bin,lib}
-java -XX:+UnlockDiagnosticVMOptions -XX:-BytecodeVerificationRemote -cp "lib/*" \
+java -Xss2m -cp "lib/*" com.kino.csbridge.desktop.MainKt --data-dir=<folder>
      com.kino.csbridge.desktop.MainKt --data-dir=<folder>
 ```
 
