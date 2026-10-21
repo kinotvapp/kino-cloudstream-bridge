@@ -9,7 +9,7 @@ object Census {
     @JvmStatic fun main(a: Array<String>) {
         val files = File(a[2]).listFiles { f -> f.name.endsWith(".cs3") }!!.sortedBy { it.name }
         var ok = 0
-        FakeKino(File(a[0]), File(a[1])).use { k ->
+        FakeKino(File(a[0]), File(a[1]), System.getProperty("kino.java") ?: File(System.getProperty("java.home"), "bin/java").path).use { k ->
             k.hello()
             for (f in files) {
                 val bytes = f.readBytes()

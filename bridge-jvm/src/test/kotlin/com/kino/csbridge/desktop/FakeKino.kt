@@ -126,7 +126,7 @@ class FakeKino(libDir: File, dataDir: File, java: String = File(System.getProper
         @JvmStatic fun main(a: Array<String>) {
             val cs3 = File(a[2]).readBytes()
             val pluginId = "cloudstream-" + File(a[2]).nameWithoutExtension.lowercase()
-            FakeKino(File(a[0]), File(a[1])).use { k ->
+            FakeKino(File(a[0]), File(a[1]), System.getProperty("kino.java") ?: File(System.getProperty("java.home"), "bin/java").path).use { k ->
                 println("hello: " + k.hello().toString().take(200))
                 val inst = k.call("installPlugin", pluginId, JSONObject().put("sha256", sha256(cs3)).put("fileName", File(a[2]).name), cs3).first
                 println("install: " + inst.toString().take(400))

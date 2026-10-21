@@ -1,5 +1,7 @@
 // GPL-3.0 (this fork). The CloudStream bridge for a plain JVM (Windows desktop): the same ops and protocol as :bridge,
 // run as a child process of Kino over stdin/stdout. See bridge-jvm/README.md.
+import java.security.MessageDigest
+
 plugins {
     alias(libs.plugins.kotlin.jvm)
     alias(libs.plugins.kotlin.serialization)
@@ -81,4 +83,26 @@ application {
     mainClass.set("com.kino.csbridge.desktop.MainKt")
     // Plugin code recurses deeply (Jsoup, Jackson); the default 512 KB-1 MB stack is thin for some.
     applicationDefaultJvmArgs = listOf("-Xss2m")
+}
+
+// The archive Kino downloads on the desktop (`bridge` entry of its desktop.json): only the jars, in lib/. There is nothing to run by itself: Kino
+// starts them with its own Java and checks every file against the hashes it writes when it unpacks them. Reproducible, with its sha256 beside it.
+//   ./gradlew :bridge-jvm:desktopZip -PbridgeVersionName=1.0.0   ->   bridge-jvm/build/desktop-release/kino-cloudstream-bridge-1.0.0.zip
+tasks.register<Zip>("desktopZip") {
+    group = "distribution"
+    val version = (project.findProperty("bridgeVersionName") as String?) ?: "0.1.0"
+    archiveFileName.set("kino-cloudstream-bridge-$version.zip")
+    destinationDirectory.set(layout.buildDirectory.dir("desktop-release"))
+    into("lib") {
+        from(configurations.runtimeClasspath)
+        from(tasks.named("jar"))
+    }
+    isReproducibleFileOrder = true
+    isPreserveFileTimestamps = false
+    doLast {
+        val f = archiveFile.get().asFile
+        val sha = MessageDigest.getInstance("SHA-256").digest(f.readBytes()).joinToString("") { "%02x".format(it) }
+        File(f.parentFile, f.name + ".sha256").writeText("$sha  ${f.name}\n")
+        println("${f.name}: ${f.length()} bytes, sha256 $sha")
+    }
 }
