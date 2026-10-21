@@ -260,6 +260,42 @@ a television; the bridge refuses there anyway). Constants: `CsWire.Settings`.
 `doneStream`), `streams_busy` (both stream slots busy), and, for `IHost.webView` and the plugin settings result only,
 `busy` plus the codes listed there.
 
+## Desktop transport (additive)
+
+On the desktop the bridge is a child process of Kino, not a bound service: the same JSON travels as frames on its stdin
+(Kino to bridge) and stdout (bridge to Kino); stderr is free for logs, and anything a plugin prints is sent there. Nothing
+else in this document changes: ops, shapes, limits, errors and `hello` are the same. The codec is
+`bridge-contract/desktop/StdioFrames.kt`, copied verbatim into Kino like the rest of this folder.
+
+A frame is `u32 length | u8 kind | u32 id | u32 jsonLength | json (UTF-8) | body`, big-endian; `length` counts everything after
+it, at most 40 MiB. `id` ties frames of one exchange together; whoever starts an exchange numbers it.
+
+| kind | direction | id | json | body |
+|---|---|---|---|---|
+| 1 `HELLO` | Kino to bridge | any | `{"v":2}` | |
+| 101 `HELLO_REPLY` | bridge to Kino | the HELLO's | the `hello` answer above | |
+| 2 `CALL` | Kino to bridge | the call's | the `call` request JSON | `installPlugin`'s `.cs3` |
+| 102 `EVENT` | bridge to Kino | the call's | a `link` or `subtitle` event | |
+| 103 `DONE` | bridge to Kino | the call's | the result; always inline, up to `MAX_STREAM_RESULT_BYTES`, else `too_large` | |
+| 3 `CANCEL` | Kino to bridge | | `{"callId":"..."}` | |
+| 111 `HTTP_REQUEST` | bridge to Kino | the request's | `IHost.request` meta | the request body |
+| 11 `HTTP_META` | Kino to bridge | the request's | the `IHttpReply.response` JSON | |
+| 12 `HTTP_BODY` | Kino to bridge | the request's | | a chunk of the response body |
+| 13 `HTTP_END` | Kino to bridge | the request's | | the body ended (the sink pipe's OK close) |
+| 14 `HTTP_FAIL` | Kino to bridge | the request's | `{"message":"..."}` | the body failed (`closeWithError`) |
+| 112 `WEBVIEW` | bridge to Kino | the request's | `IHost.webView` request | |
+| 15 `WEBVIEW_EVENT`, 16 `WEBVIEW_DONE` | Kino to bridge | the request's | `IReply.event` / `done` | |
+| 113 `STORAGE` | bridge to Kino | the request's | `IHost.storage` op | |
+| 17 `STORAGE_REPLY` | Kino to bridge | the request's | the answer | |
+
+* Exactly one `DONE` per `CALL`, after its `EVENT`s; there is no `doneStream` (nothing needs a pipe), so the 100 000-char inline
+  limit does not apply, only the 8 MiB result cap. A second `CALL` with a `callId` still running is `bad_request`.
+* After `HTTP_META` Kino sends the body chunks and then `HTTP_END`, or `HTTP_FAIL`; an error `HTTP_META` is followed by `HTTP_END`.
+* The bridge answers every host exchange's absence the way it answers a dead Binder: when stdin closes it stops, and a plugin's
+  pending request fails. `IHost.storage` waits at most 30 s for its reply.
+* There is no caller check: the process Kino started is the only one that can reach its stdin. Kino still verifies the
+  bridge's files (sha256 from its manifest) before it ever starts them.
+
 ## Distribution (Kino's OTA manifest)
 
 Kino offers the bridge APK through its own `latest.json` (the one `OtaManifest` parses, served by GitHub Releases
