@@ -79,7 +79,6 @@ dependencies {
 
 application {
     mainClass.set("com.kino.csbridge.desktop.MainKt")
-    // Plugin classes come from a dex translator and reference Android classes the desktop only defines on demand: the
-    // JVM must not verify them (it would load every referenced class, and the platform ones are empty shells).
-    applicationDefaultJvmArgs = listOf("-XX:+UnlockDiagnosticVMOptions", "-XX:-BytecodeVerificationRemote", "-Xss2m")
+    // Plugin code recurses deeply (Jsoup, Jackson); the default 512 KB-1 MB stack is thin for some.
+    applicationDefaultJvmArgs = listOf("-Xss2m")
 }

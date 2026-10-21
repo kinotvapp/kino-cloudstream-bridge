@@ -29,33 +29,42 @@ import java.util.zip.ZipOutputStream
 class PathClassLoader(dexPath: String, parent: ClassLoader) : URLClassLoader(arrayOf(translated(File(dexPath))), parent) {
 
     override fun findClass(name: String): Class<*> {
-        val path = name.replace('.', '/') + ".class"
-        val bytes = findResource(path)?.openStream()?.use { it.readBytes() } ?: throw ClassNotFoundException(name)
+        val internal = name.replace('.', '/')
+        val resource = findResource("$internal.class")
+        if (resource == null) {
+            if (isPlatform(internal)) return defineShell(internal)
+            throw ClassNotFoundException(name)
+        }
+        val bytes = resource.openStream().use { it.readBytes() }
+        // The kind of a platform supertype the table does not know is what this class declares it as.
         val reader = ClassReader(bytes)
-        reader.superName?.let { ensurePlatformType(it, isInterface = false) }
-        reader.interfaces.forEach { ensurePlatformType(it, isInterface = true) }
+        reader.interfaces.forEach { if (isPlatform(it)) interfaceHints += it }
         return defineClass(name, bytes, 0, bytes.size)
     }
 
-    /** Defines [internalName] empty in this loader when it is a platform class nobody provides. */
-    private fun ensurePlatformType(internalName: String, isInterface: Boolean) {
-        if (PLATFORM_PREFIXES.none { internalName.startsWith(it) }) return
+    /** Platform names a plugin class implements: interfaces, even where the table has no entry for them. */
+    private val interfaceHints: MutableSet<String> = java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
+
+    /**
+     * Defines [internalName] (a platform class nobody provides) with no members but its real kind and supertypes, from
+     * [HIERARCHY]; unknown to the table it is an empty class, or an interface when a plugin class implements it.
+     */
+    private fun defineShell(internalName: String): Class<*> {
         val binary = internalName.replace('/', '.')
         synchronized(getClassLoadingLock(binary)) {
-            if (findLoadedClass(binary) != null) return
-            try {
-                parent.loadClass(binary)
-                return
-            } catch (_: ClassNotFoundException) {
-            }
+            findLoadedClass(binary)?.let { return it }
+            val known = HIERARCHY[internalName]
+            val isInterface = known?.isInterface ?: (internalName in interfaceHints)
+            val superName = if (isInterface) "java/lang/Object" else known?.superName?.takeIf { it.isNotEmpty() } ?: "java/lang/Object"
+            val interfaces = known?.interfaces.orEmpty().toTypedArray()
             val w = ClassWriter(0)
             val access = Opcodes.ACC_PUBLIC or if (isInterface) Opcodes.ACC_INTERFACE or Opcodes.ACC_ABSTRACT else Opcodes.ACC_SUPER
-            w.visit(Opcodes.V1_8, access, internalName, null, "java/lang/Object", null)
+            w.visit(Opcodes.V1_8, access, internalName, null, superName, interfaces)
             if (!isInterface) {
                 w.visitMethod(Opcodes.ACC_PUBLIC, "<init>", "()V", null, null).apply {
                     visitCode()
                     visitVarInsn(Opcodes.ALOAD, 0)
-                    visitMethodInsn(Opcodes.INVOKESPECIAL, "java/lang/Object", "<init>", "()V", false)
+                    visitMethodInsn(Opcodes.INVOKESPECIAL, superName, "<init>", "()V", false)
                     visitInsn(Opcodes.RETURN)
                     visitMaxs(1, 1)
                     visitEnd()
@@ -63,12 +72,30 @@ class PathClassLoader(dexPath: String, parent: ClassLoader) : URLClassLoader(arr
             }
             w.visitEnd()
             val shell = w.toByteArray()
-            defineClass(binary, shell, 0, shell.size)
+            return defineClass(binary, shell, 0, shell.size)
         }
     }
 
     companion object {
         private val PLATFORM_PREFIXES = listOf("android/", "androidx/", "dalvik/", "com/google/android/", "org/xmlpull/")
+
+        private fun isPlatform(internalName: String) = PLATFORM_PREFIXES.any { internalName.startsWith(it) }
+
+        private class PlatformClass(val isInterface: Boolean, val superName: String, val interfaces: List<String>)
+
+        /** `platform-hierarchy.tsv` (tools/gen_platform_hierarchy.py): every public Android / AndroidX / Material class's supertypes. */
+        private val HIERARCHY: Map<String, PlatformClass> by lazy {
+            val out = HashMap<String, PlatformClass>()
+            PathClassLoader::class.java.getResourceAsStream("/platform-hierarchy.tsv")?.bufferedReader(Charsets.UTF_8)?.useLines { lines ->
+                for (line in lines) {
+                    if (line.isEmpty() || line[0] == '#') continue
+                    val f = line.split('	')
+                    if (f.size < 3) continue
+                    out[f[0]] = PlatformClass(f[1] == "I", f[2], f.getOrNull(3).orEmpty().split(',').filter { it.isNotEmpty() })
+                }
+            }
+            out
+        }
 
         /** Kotlin inline classes whose D8-renamed members the translated code calls (`name_impl`, really `name-impl`). */
         private val INLINE_OWNERS = setOf(

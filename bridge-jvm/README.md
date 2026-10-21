@@ -29,11 +29,15 @@ Three small, additive edits live in `:bridge` (defaults leave Android unchanged)
 optional `platformOwner` (Android classes are not checked on the desktop), and the registry's index write retries after
 deleting the old file (Windows will not rename over an existing one).
 
-## JVM flags
+## Bytecode verification stays on
 
-`-XX:+UnlockDiagnosticVMOptions -XX:-BytecodeVerificationRemote` is required: translated plugin code references Android classes
-that are empty shells here, and verifying it would load every one of them. The bridge already runs plugin code with the process's
-full rights (there is no sandbox on either platform), so this removes no isolation.
+Translated plugin code names Android classes that do not exist on a JVM. The class loader defines each such class empty, with
+its real superclass and interfaces taken from `src/main/resources/platform-hierarchy.tsv` (every public class of `android.jar`
+and of the AndroidX and Material libraries plugins extend; regenerate with `tools/gen_platform_hierarchy.py <android.jar>`), so the
+verifier can check assignments between them. A class the table lacks is defined with no supertypes.
+
+The non-UI classes plugins really call are implemented for real in `src/shim/java`: `Uri`, `Base64`, `Handler`/`Looper`/`Message`,
+`SystemClock`, `Bundle`, `SharedPreferences`, `webkit.CookieManager`.
 
 ## What is measured
 

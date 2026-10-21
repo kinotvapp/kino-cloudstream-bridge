@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Writes bridge-jvm/src/main/resources/platform-hierarchy.tsv: for every public class of the Android platform (android.jar)
+and of the few AndroidX / Material libraries plugins extend, its kind and supertypes. Facts only (names), no code.
+
+The desktop bridge defines a platform class a plugin names but nobody provides as an empty shell; this table gives the shell the
+real superclass and interfaces, so the JVM's verifier can check assignments between them (a TextView passed where a View is
+expected) and bytecode verification can stay on.
+
+    python gen_platform_hierarchy.py <android.jar> [cache-dir]
+
+Run it again when a census finds platform classes the table lacks.
+"""
+import io
+import os
+import struct
+import sys
+import urllib.request
+import zipfile
+
+AARS = [  # Google Maven: group/artifact/version. Only the class hierarchy is read, so the exact versions do not matter.
+    ("androidx/fragment", "fragment", "1.8.5"),
+    ("androidx/appcompat", "appcompat", "1.7.0"),
+    ("androidx/appcompat", "appcompat-resources", "1.7.0"),
+    ("androidx/activity", "activity", "1.9.3"),
+    ("androidx/core", "core", "1.15.0"),
+    ("androidx/lifecycle", "lifecycle-viewmodel", "2.8.7"),
+    ("androidx/lifecycle", "lifecycle-runtime", "2.8.7"),
+    ("androidx/lifecycle", "lifecycle-common", "2.8.7"),
+    ("androidx/preference", "preference", "1.2.1"),
+    ("androidx/recyclerview", "recyclerview", "1.3.2"),
+    ("androidx/constraintlayout", "constraintlayout", "2.1.4"),
+    ("androidx/viewpager2", "viewpager2", "1.1.0"),
+    ("com/google/android/material", "material", "1.12.0"),
+]
+MAVEN = "https://dl.google.com/dl/android/maven2"
+ACC_PUBLIC, ACC_INTERFACE = 0x0001, 0x0200
+
+
+def header(data):
+    """(this, super, [interfaces], access) of a class file, from its constant pool and the fixed fields after it."""
+    n = struct.unpack(">H", data[8:10])[0]
+    cp = [None] * n
+    p, i = 10, 1
+    while i < n:
+        t = data[p]
+        p += 1
+        if t == 1:
+            l = struct.unpack(">H", data[p:p + 2])[0]
+            cp[i] = ("u", data[p + 2:p + 2 + l].decode("utf8", "replace"))
+            p += 2 + l
+        elif t in (3, 4):
+            p += 4
+        elif t in (5, 6):
+            p += 8
+            i += 1
+        elif t == 7:
+            cp[i] = ("c", struct.unpack(">H", data[p:p + 2])[0])
+            p += 2
+        elif t in (8, 16, 19, 20):
+            p += 2
+        elif t in (9, 10, 11, 12, 17, 18):
+            p += 4
+        elif t == 15:
+            p += 3
+        else:
+            raise ValueError("constant pool tag %d" % t)
+        i += 1
+
+    def name(idx):
+        return cp[cp[idx][1]][1]
+
+    access, this, sup, ni = struct.unpack(">HHHH", data[p:p + 8])
+    ifaces = [name(struct.unpack(">H", data[p + 8 + 2 * k:p + 10 + 2 * k])[0]) for k in range(ni)]
+    return name(this), (name(sup) if sup else None), ifaces, access
+
+
+def read_jar(z, out):
+    for entry in z.namelist():
+        if not entry.endswith(".class") or entry.startswith("META-INF") or entry in ("module-info.class",):
+            continue
+        try:
+            this, sup, ifaces, access = header(z.read(entry))
+        except Exception:
+            continue
+        if not (access & ACC_PUBLIC) or this.startswith("com/android/internal/"):
+            continue
+        out[this] = ("I" if access & ACC_INTERFACE else "C", sup or "", ",".join(ifaces))
+
+
+def main():
+    android_jar = sys.argv[1]
+    cache = sys.argv[2] if len(sys.argv) > 2 else os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache")
+    os.makedirs(cache, exist_ok=True)
+    table = {}
+    with zipfile.ZipFile(android_jar) as z:
+        read_jar(z, table)
+    for group, artifact, version in AARS:
+        got = False
+        for ext in ("aar", "jar"):
+            path = os.path.join(cache, "%s-%s.%s" % (artifact, version, ext))
+            if not os.path.isfile(path):
+                try:
+                    urllib.request.urlretrieve("%s/%s/%s/%s/%s-%s.%s" % (MAVEN, group, artifact, version, artifact, version, ext), path)
+                except urllib.error.HTTPError:
+                    continue
+            with zipfile.ZipFile(path) as pkg:
+                if ext == "aar":
+                    if "classes.jar" in pkg.namelist():
+                        with zipfile.ZipFile(io.BytesIO(pkg.read("classes.jar"))) as z:
+                            read_jar(z, table)
+                else:
+                    read_jar(pkg, table)
+            got = True
+            break
+        if not got:
+            print("skipped (not on Google Maven as .aar or .jar): %s:%s:%s" % (group, artifact, version))
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "main", "resources", "platform-hierarchy.tsv")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w", encoding="utf-8", newline="\n") as f:
+        f.write("# internal name TAB I (interface) or C (class) TAB superclass TAB comma-separated interfaces. Generated by tools/gen_platform_hierarchy.py\n")
+        for k in sorted(table):
+            kind, sup, ifs = table[k]
+            f.write("%s\t%s\t%s\t%s\n" % (k, kind, sup, ifs))
+    print("%d classes, %d bytes" % (len(table), os.path.getsize(out)))
+
+
+if __name__ == "__main__":
+    main()
