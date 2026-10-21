@@ -26,7 +26,11 @@ import java.util.zip.ZipFile
  * [missing] returns what does not resolve, sorted: `Lowner;->name(params)ret`, `Lowner;->name:type` or `Ltype;`.
  * A member whose owner class is itself missing is reported only as the class.
  */
-class SymbolChecker(private val loader: ClassLoader) {
+class SymbolChecker(
+    private val loader: ClassLoader,
+    /** Descriptors (`Lowner;`) the host platform provides and the checker takes as linked: the JVM bridge's Android UI classes. */
+    private val platformOwner: (String) -> Boolean = { false },
+) {
     private val classes = HashMap<String, Class<*>?>()
     private val members = HashMap<Class<*>, Set<String>>()
 
@@ -70,11 +74,11 @@ class SymbolChecker(private val loader: ClassLoader) {
         val out = sortedSetOf<String>()
         for (t in types) if (!typeOk(t, own)) out += t
         for (m in methods) {
-            if (!typeOk(m.owner, own)) continue
+            if (!typeOk(m.owner, own) || platformOwner(m.owner)) continue
             if (!resolves(m.owner, "${m.name}(${m.params})${m.ret}", "${m.name}(*)", own)) out += "${m.owner}->${m.name}(${m.params})${m.ret}"
         }
         for (f in fields) {
-            if (!typeOk(f.owner, own)) continue
+            if (!typeOk(f.owner, own) || platformOwner(f.owner)) continue
             if (!resolves(f.owner, "${f.name}:${f.type}", null, own)) out += "${f.owner}->${f.name}:${f.type}"
         }
         return out.toList()
@@ -95,6 +99,7 @@ class SymbolChecker(private val loader: ClassLoader) {
         return when {
             e.length == 1 -> e in PRIMITIVES
             e in defs -> true
+            platformOwner(e) -> true
             else -> load(e) != null
         }
     }

@@ -66,6 +66,8 @@ class PluginRegistry(
     private val parentLoader: ClassLoader = PluginRegistry::class.java.classLoader!!,
     private val loaderFactory: (File, ClassLoader) -> ClassLoader = { f, parent -> PathClassLoader(f.absolutePath, parent) },
     private val maxBytes: Long = MAX_CS3_BYTES,
+    /** [SymbolChecker]'s `platformOwner`: classes the host platform provides without being checked. */
+    private val platformOwner: (String) -> Boolean = { false },
 ) {
     class RegistryException(val code: String, message: String) : Exception(message)
 
@@ -159,7 +161,7 @@ class PluginRegistry(
         try {
             if (copyHashing(cs3, tmp) != sha256) throw RegistryException(CsWire.Err.BAD_REQUEST, "sha256 mismatch")
             val manifest = readManifest(tmp)
-            val missing = try { SymbolChecker(parentLoader).missing(tmp) } catch (e: IllegalArgumentException) {
+            val missing = try { SymbolChecker(parentLoader, platformOwner).missing(tmp) } catch (e: IllegalArgumentException) {
                 throw RegistryException(CsWire.Err.BAD_REQUEST, "not a .cs3")
             }
             val displayName = manifest.name ?: pluginId
@@ -261,7 +263,7 @@ class PluginRegistry(
             val f = File(dir, e.file)
             val manifest = try { readManifest(f) } catch (x: RegistryException) { throw RegistryException(CsWire.Err.INCOMPATIBLE, "manifest") }
             // The bridge may have been updated since the install: check again before running its code.
-            val missing = try { SymbolChecker(parentLoader).missing(f) } catch (x: IllegalArgumentException) { listOf("not a .cs3") }
+            val missing = try { SymbolChecker(parentLoader, platformOwner).missing(f) } catch (x: IllegalArgumentException) { listOf("not a .cs3") }
             if (missing.isNotEmpty()) throw RegistryException(CsWire.Err.INCOMPATIBLE, "missing ${missing.size}: ${missing.first()}")
             loadLocked(pluginId, f, manifest).providers
         }
@@ -367,7 +369,7 @@ class PluginRegistry(
      * class the bridge has (kotlin, kotlinx.coroutines, OkHttp) never runs, so its frames are never this plugin's.
      */
     private fun onlyPluginClasses(file: File): Set<String> =
-        SymbolChecker(parentLoader).definedClasses(file).filterTo(HashSet()) { name ->
+        SymbolChecker(parentLoader, platformOwner).definedClasses(file).filterTo(HashSet()) { name ->
             try { Class.forName(name, false, parentLoader); false } catch (_: Throwable) { true }
         }
 
@@ -486,7 +488,8 @@ class PluginRegistry(
         index.values.forEach { a.put(JSONObject().put("pluginId", it.pluginId).put("file", it.file).put("sha256", it.sha256).put("crashes", it.crashes)) }
         val tmp = File(dir, "${TMP}index-${UUID.randomUUID()}.json")
         tmp.writeText(a.toString())
-        if (!tmp.renameTo(indexFile)) { tmp.delete(); throw IOException("index write failed") }
+        // Android replaces the file in place; Windows (the JVM bridge) refuses to rename over an existing one.
+        if (!tmp.renameTo(indexFile) && !(indexFile.delete() && tmp.renameTo(indexFile))) { tmp.delete(); throw IOException("index write failed") }
         published = index.values.map { CsWire.HelloPlugin(it.pluginId, it.sha256) }
     }
 

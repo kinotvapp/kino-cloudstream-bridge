@@ -33,6 +33,8 @@ val sharedFromBridge by tasks.registering(Sync::class) {
             "com/kino/csbridge/BridgeApp.kt", "com/kino/csbridge/BridgeService.kt", "com/kino/csbridge/CallerCheck.kt",
             "com/kino/csbridge/ResultStream.kt", "com/kino/csbridge/settings/PluginSettingsActivity.kt", "com/kino/csbridge/settings/SettingsGuard.kt",
             "com/kino/csbridge/stubs/AppContextUtils.kt", "com/kino/csbridge/stubs/ImageModuleCoil.kt", "com/kino/csbridge/stubs/UIHelper.kt",
+            // On the JVM the library already has com.lagradost.api.ContextHelper_jvmKt (the Android build names it _androidKt).
+            "com/kino/csbridge/stubs/ContextHelper.jvm.kt",
         )
     }
     into(layout.buildDirectory.dir("bridge-shared-src"))
@@ -42,6 +44,7 @@ sourceSets {
     main {
         java.srcDir("src/shim/java")
         kotlin.srcDir("../bridge-contract/kotlin")
+        kotlin.srcDir("../bridge-contract/desktop")
         kotlin.srcDir(upstreamAppSrc)
         kotlin.srcDir(layout.buildDirectory.dir("bridge-shared-src"))
     }
