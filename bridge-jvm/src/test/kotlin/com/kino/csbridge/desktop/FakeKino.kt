@@ -24,7 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class FakeKino(libDir: File, dataDir: File, java: String = File(System.getProperty("java.home"), "bin/java").path) : AutoCloseable {
     private val process: Process = ProcessBuilder(
-        java, "-XX:+UnlockDiagnosticVMOptions", "-XX:-BytecodeVerificationRemote", "-Xss2m", "-cp", File(libDir, "*").path, "com.kino.csbridge.desktop.MainKt", "--data-dir=${dataDir.path}",
+        java, *(if (System.getProperty("kino.verify") != null) arrayOf("-Xss2m") else arrayOf("-XX:+UnlockDiagnosticVMOptions", "-XX:-BytecodeVerificationRemote", "-Xss2m")), "-cp", File(libDir, "*").path, "com.kino.csbridge.desktop.MainKt", "--data-dir=${dataDir.path}",
     ).redirectError(ProcessBuilder.Redirect.INHERIT).start()
     private val out: OutputStream = process.outputStream
     private val ids = AtomicInteger(1)
